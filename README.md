@@ -9,6 +9,9 @@ bear call spread on a bearish one — both defined-risk from the moment they
 open, sized and gated by explicit code-level rules the LLM decision layer
 cannot override.
 
+**Live dashboard**: https://alpaca-agent-dashboard.vercel.app (also opens
+as a Telegram Mini App via [@Alpaca_alejdro_bot](https://t.me/Alpaca_alejdro_bot) — same page, same code, either way).
+
 ## Why this design
 
 - **Screening/signals**: vendored, unmodified, from a real trading system
