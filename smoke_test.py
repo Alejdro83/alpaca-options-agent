@@ -1,9 +1,14 @@
-"""Run this FIRST against the real, funded hackathon account, before ever
-enabling the cron job — confirms (1) the MCP server actually starts and
-authenticates, (2) options data comes back in the shape spread_builder.py
-assumes, (3) the account's options trading level is actually enabled (the
-one dependency this whole project has on a step only the account owner can
-do — see plan Day 0 item 1).
+"""Run this against the real, funded hackathon account before ever enabling
+the cron job — this exact script (an earlier version of it) is what
+surfaced every real bug fixed on 2026-08-26: `mcp_client.py`'s `isError` vs
+`is_error`, `get_option_chain` vs `get_option_contracts` for structural
+chain data, the nested `data.snapshots[symbol].latestQuote.{bp,ap}` response
+shape, the total absence of broker-supplied Greeks without a paid Algo
+Trader Plus subscription, `open_interest` coming back null even for liquid
+SPY strikes, `qty`/`ratio_qty` needing to be strings, and `position_intent`
+being required for correct open/close semantics on multi-leg orders. Keep
+running this after any change to mcp_client.py/spread_builder.py/
+executor_mcp.py — it's cheap insurance against exactly this class of bug.
 
 Usage: python smoke_test.py SPY
 """
@@ -17,42 +22,50 @@ from mcp_client import AlpacaMCP
 
 
 async def main(ticker: str) -> None:
+    from alpaca_client import AlpacaClient
+    client = AlpacaClient()
+
+    print("--- get_account ---")
+    account = client.get_account()
+    print(json.dumps(account, indent=2))
+    if abs(account["equity"] - 100_000) > 1:
+        print(f"\n!! Account equity is ${account['equity']:,.2f}, not $100,000 — "
+              "confirm this is really the fresh, dedicated hackathon account "
+              "before trading on it.")
+
+    print("\n--- get_clock ---")
+    clock = client.get_clock()
+    print(json.dumps(clock, indent=2, default=str))
+    if not clock.get("is_open"):
+        print("Market is closed right now — any test order will sit unfilled "
+              "(status 'pending_new'/'new'); that's expected, not a bug. "
+              "Cancel test orders afterward with AlpacaClient().cancel_order(id).")
+
     async with AlpacaMCP() as mcp:
-        print(f"--- get_option_chain({ticker}) ---")
-        chain = await mcp.call("get_option_chain", {"underlying_symbol": ticker})
-        contracts = chain if isinstance(chain, list) else chain.get("contracts", chain.get("option_contracts", chain))
-        print(f"Got {len(contracts) if isinstance(contracts, list) else '?'} contracts. First one:")
-        print(json.dumps(contracts[0] if isinstance(contracts, list) and contracts else contracts, indent=2)[:1500])
+        print(f"\n--- get_option_contracts({ticker}) ---")
+        contracts_result = await mcp.call(
+            "get_option_contracts",
+            {"underlying_symbols": ticker, "status": "active", "limit": 3},
+        )
+        contracts = contracts_result.get("data", {}).get("option_contracts", [])
+        print(f"Got {len(contracts)} contracts. First one:")
+        print(json.dumps(contracts[0] if contracts else contracts_result, indent=2)[:1500])
+        if contracts and contracts[0].get("open_interest") is None:
+            print("\nNote: open_interest is null (a known gap on this account/feed — "
+                  "spread_builder._passes_liquidity() only enforces it when present).")
 
-        if isinstance(contracts, list) and contracts:
-            symbol = contracts[0].get("symbol")
-            print(f"\n--- get_option_snapshot([{symbol}]) ---")
-            snap = await mcp.call("get_option_snapshot", {"symbols": [symbol]})
-            print(json.dumps(snap, indent=2)[:1500])
-            has_greeks = "greeks" in json.dumps(snap)
-            print(f"\nGreeks present in snapshot: {has_greeks}")
-            if not has_greeks:
-                print("!! spread_builder.py's delta_of() will return None for everything — "
-                      "check the real field name/path here and fix spread_builder.py before "
-                      "wiring the cron job.")
-            snap_obj = snap if isinstance(snap, dict) and "open_interest" in snap else (
-                snap.get(symbol, {}) if isinstance(snap, dict) else (snap[0] if isinstance(snap, list) and snap else {})
+        if contracts:
+            symbol = contracts[0]["symbol"]
+            print(f"\n--- get_option_snapshot([{symbol}], feed=indicative) ---")
+            snap_result = await mcp.call(
+                "get_option_snapshot", {"symbols": symbol, "feed": "indicative"}
             )
-            has_oi = "open_interest" in json.dumps(snap)
-            print(f"open_interest present: {has_oi} (value: {snap_obj.get('open_interest')})")
-            if not has_oi:
-                print("!! spread_builder.py's _passes_liquidity() will reject every contract — "
-                      "check the real field name/path for open interest and fix "
-                      "spread_builder.py before wiring the cron job.")
-
-        print("\n--- get_account (via alpaca_client, sanity check) ---")
-        from alpaca_client import AlpacaClient
-        account = AlpacaClient().get_account()
-        print(json.dumps(account, indent=2))
-        if abs(account["equity"] - 100_000) > 1:
-            print(f"\n!! Account equity is ${account['equity']:,.2f}, not $100,000 — "
-                  "confirm this is really the fresh, dedicated hackathon account "
-                  "before trading on it.")
+            snapshots = snap_result.get("data", {}).get("snapshots", {})
+            print(json.dumps(snapshots, indent=2)[:1500])
+            has_greeks = "greeks" in json.dumps(snapshots)
+            print(f"\nGreeks present: {has_greeks} (expected: False on this account — "
+                  "delta is computed via black_scholes.bs_delta instead, see its "
+                  "module docstring for why)")
 
 
 if __name__ == "__main__":

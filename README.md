@@ -20,9 +20,17 @@ cannot override.
   an equity order.
 - **Options execution — 100% via [Alpaca's official MCP
   server](https://github.com/alpacahq/alpaca-mcp-server)** (`mcp_client.py`,
-  `spread_builder.py`, `executor_mcp.py`) — every chain lookup, Greeks
-  snapshot, and order placement goes through MCP tool calls, never the raw
-  SDK.
+  `spread_builder.py`, `executor_mcp.py`) — every chain lookup, quote, and
+  order placement goes through MCP tool calls, never the raw SDK.
+- **Delta computed in-process, not broker-supplied** (`black_scholes.py`)
+  — verified live against the real account that real-time OPRA options
+  data (needed for Alpaca's own Greeks) requires a paid Algo Trader Plus
+  subscription; the free/paper `indicative` feed returns quotes with no
+  Greeks at all. Rather than degrade to picking strikes by a fixed dollar
+  distance, delta is computed with a standard closed-form Black-Scholes
+  formula, using the same realized-volatility estimate the entry filter
+  already computes as the implied-vol proxy — labeled as a proxy
+  throughout, not overclaiming real IV.
 - **Risk gates** (`risk_gate.py`) — hard, deterministic, code-level checks
   applied *before* any candidate reaches the LLM: a daily-loss circuit
   breaker, a max-concurrent-spreads cap, a max-loss-per-spread cap as % of
@@ -61,8 +69,9 @@ equities bot).
 | File | Role |
 |---|---|
 | `bot.py` | Main cycle: manage open spreads → screen → risk-gate → LLM decide → execute |
-| `spread_builder.py` | Signal → concrete strikes/expiration via MCP option chain + Greeks |
-| `risk_gate.py` | Hard, non-negotiable risk checks |
+| `spread_builder.py` | Signal → concrete strikes/expiration via MCP option contracts + quotes |
+| `black_scholes.py` | Self-computed delta (no broker Greeks available — see below) |
+| `risk_gate.py` | Hard, non-negotiable risk checks, incl. force-close-by-contest-end |
 | `llm_reasoner.py` | The autonomous decision step among risk-approved candidates |
 | `executor_mcp.py` | Opens/closes spreads, exclusively via Alpaca's MCP server |
 | `mcp_client.py` | Thin async wrapper spawning `alpaca-mcp-server` over stdio |
@@ -72,11 +81,23 @@ equities bot).
 
 ## Honest scope notes
 
-- Field names in `spread_builder.py`'s parsing of MCP responses are written
-  against Alpaca's documented schema but were not yet exercised against a
-  live response as of this commit — `smoke_test.py` is the first thing to
-  run against the real account, and this note will be removed once
-  verified.
+- **No broker-supplied Greeks.** Verified live against the real hackathon
+  account: `feed=opra` 403s with "OPRA agreement is not signed" (real-time
+  OPRA data needs Alpaca's paid Algo Trader Plus plan), and the free
+  `indicative` feed's snapshot has no `greeks` key at all. Delta is
+  computed via `black_scholes.py` using a realized-volatility proxy for
+  implied vol — a standard, well-understood substitution, not hidden
+  anywhere in the code or this document.
+- **`open_interest` is frequently `null`** on this account/feed, even for
+  genuinely liquid near-the-money SPY strikes (verified directly) — the
+  liquidity gate enforces it only when a real value comes back, leaning on
+  the bid-ask-spread check (which does return real, usable data) as the
+  effective liquidity signal.
+- Every field-name and parameter-shape assumption in this codebase (MCP
+  response nesting, `qty`/`ratio_qty` as strings, `position_intent`
+  requirements) has been verified directly against the real account's
+  actual responses, not just Alpaca's docs — several initial guesses were
+  wrong and are visible in git history alongside their fixes.
 - The LLM reasoning step can choose *not* to trade a risk-approved
   candidate; it can never trade one that failed the gate. That asymmetry is
   intentional.

@@ -10,17 +10,26 @@ underlying stays flat or falls). Both are defined-risk: max loss is fixed
 at (width - credit received) the moment the spread opens, which is exactly
 what risk_gate.check_new_spread checks against.
 
-NOTE ON FIELD NAMES: Alpaca's `get_option_chain`/`get_option_snapshot` MCP
-tools return contract data with strike/expiration/greeks fields — the exact
-key names here (`strike_price`, `expiration_date`, `greeks.delta`,
-`latest_quote.bid_price`/`ask_price`, and now also `open_interest` for the
-liquidity gate) match Alpaca's documented options schema, but this has NOT
-yet been smoke-tested against a live response (blocked on the hackathon's
-dedicated account existing — see plan step "MCP smoke test" before wiring
-this into the cron job). Treat the parsing helpers here as the first thing
-to verify, not as already-proven — `smoke_test.py` should be extended to
-print `open_interest` specifically alongside greeks once real credentials
-exist.
+REAL API SHAPES (verified against the live account 2026-08-26, replacing an
+earlier version's guessed field names — see git history for what was wrong):
+- `get_option_contracts` (NOT get_option_chain) is the structural chain
+  listing: response is `{"data": {"option_contracts": [...], "next_page_token": ...}}`,
+  each contract a dict with STRING-typed `strike_price`/`open_interest`
+  (nullable), plus `symbol`, `expiration_date`, `type` ("call"/"put").
+  Param name is `underlying_symbols` (plural, comma-separated string),
+  unlike get_option_chain's `underlying_symbol` (singular) — a real,
+  easy-to-miss inconsistency in Alpaca's own tool schemas.
+- `get_option_snapshot` response is `{"data": {"snapshots": {symbol: {...}}}}`
+  — one level deeper than assumed originally — and each snapshot's quote is
+  under camelCase `latestQuote: {bp, ap, bs, as, ...}` (bid/ask price/size),
+  NOT `latest_quote.bid_price`/`ask_price`.
+- NO GREEKS AVAILABLE on this account on any feed: `feed=opra` 403s with
+  "OPRA agreement is not signed" (real-time OPRA data requires Alpaca's
+  paid Algo Trader Plus subscription — confirmed via Alpaca's own forum,
+  not just this account's error message), and `feed=indicative` (the free
+  tier) returns a quote with no `greeks` key at all. Delta is computed
+  in-process instead — see black_scholes.py's module docstring for why
+  this is a reasonable proxy, not a hack.
 """
 from __future__ import annotations
 
@@ -28,6 +37,7 @@ import logging
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
+from black_scholes import bs_delta
 from config import config
 from mcp_client import AlpacaMCP
 
@@ -47,96 +57,124 @@ class SpreadPlan:
     max_loss: float
 
 
-def _mid(quote: dict) -> float | None:
-    bid = quote.get("bid_price")
-    ask = quote.get("ask_price")
+def _mid_from_snapshot(snap: dict) -> float | None:
+    quote = snap.get("latestQuote")
+    if not quote:
+        return None
+    bid, ask = quote.get("bp"), quote.get("ap")
     if bid is None or ask is None:
         return None
     return (float(bid) + float(ask)) / 2
 
 
-def _passes_liquidity(snap: dict) -> bool:
+def _passes_liquidity(contract: dict, snap: dict) -> bool:
     """Per-contract liquidity gate (2026-08-26 research pass) — equity-level
     liquidity (ScreeningFilters.min_avg_volume) is a poor proxy for options
-    liquidity specifically; a heavily-traded stock can still have a thin
-    market on a given strike/expiration. Checked on every leg individually,
-    never averaged across a spread — one illiquid leg makes the whole
-    spread hard to exit cleanly regardless of how liquid the other leg is.
+    liquidity specifically. Checked on every leg individually, never
+    averaged across a spread.
+
+    `open_interest` enforced only when the API actually returns a value —
+    verified directly against the live account that Alpaca's free/paper
+    tier returns `open_interest: null` for real, currently-liquid contracts
+    (confirmed on near-the-money SPY weekly puts with tight, tradeable
+    spreads) — evidently a data-availability gap on this feed, not a
+    genuine liquidity signal. Treating null as "reject" would silently
+    reject nearly everything, including the most liquid instrument that
+    exists; treating it as "unknown, don't penalize" and leaning on the
+    bid-ask spread check — which the same live test showed DOES return
+    real, usable values — is the honest choice here. The threshold still
+    applies whenever a real number comes back.
     """
-    open_interest = snap.get("open_interest")
-    if open_interest is None or int(open_interest) < config.risk.min_open_interest:
+    oi_raw = contract.get("open_interest")
+    if oi_raw is not None and int(oi_raw) < config.risk.min_open_interest:
         return False
-    quote = snap.get("latest_quote", {})
-    mid = _mid(quote)
+    mid = _mid_from_snapshot(snap)
     if mid is None or mid <= 0:
         return False
-    bid, ask = float(quote["bid_price"]), float(quote["ask_price"])
+    quote = snap["latestQuote"]
+    bid, ask = float(quote["bp"]), float(quote["ap"])
     spread_pct = (ask - bid) / mid
     return spread_pct <= config.risk.max_bid_ask_spread_pct
 
 
-async def build_spread(mcp: AlpacaMCP, ticker: str, signal_direction: str) -> SpreadPlan | None:
+async def _fetch_contracts(mcp: AlpacaMCP, ticker: str, option_type: str, min_exp: date, max_exp: date) -> list[dict]:
+    result = await mcp.call(
+        "get_option_contracts",
+        {
+            "underlying_symbols": ticker,
+            "type": option_type,
+            "status": "active",
+            "expiration_date_gte": min_exp.isoformat(),
+            "expiration_date_lte": max_exp.isoformat(),
+            "limit": 100,
+        },
+    )
+    return (result or {}).get("data", {}).get("option_contracts", [])
+
+
+async def _fetch_snapshots(mcp: AlpacaMCP, symbols: list[str]) -> dict[str, dict]:
+    if not symbols:
+        return {}
+    result = await mcp.call(
+        "get_option_snapshot",
+        {"symbols": ",".join(symbols), "feed": "indicative"},
+    )
+    return (result or {}).get("data", {}).get("snapshots", {})
+
+
+async def build_spread(
+    mcp: AlpacaMCP,
+    ticker: str,
+    signal_direction: str,
+    spot_price: float,
+    realized_vol: float,
+) -> SpreadPlan | None:
     """signal_direction is the vendored Signal's own 'long'/'short' field.
-    Returns None (never a half-built spread) if the chain doesn't have a
-    clean expiration/strike pair in the configured windows — a skipped
-    cycle is always safer than a guessed one.
+    `spot_price` is the underlying's current mid quote, `realized_vol` the
+    annualized realized-vol estimate (see black_scholes.realized_vol_from_bars)
+    used as the IV proxy for delta. Returns None (never a half-built spread)
+    if the chain doesn't have a clean, liquid expiration/strike pair in the
+    configured windows — a skipped cycle is always safer than a guessed one.
     """
     limits = config.risk
     today = datetime.now().date()
     min_exp = today + timedelta(days=limits.min_dte)
     max_exp = today + timedelta(days=limits.max_dte)
 
-    chain = await mcp.call(
-        "get_option_chain",
-        {
-            "underlying_symbol": ticker,
-            "expiration_date_gte": min_exp.isoformat(),
-            "expiration_date_lte": max_exp.isoformat(),
-        },
-    )
-    contracts = chain if isinstance(chain, list) else chain.get("contracts", chain.get("option_contracts", []))
-    if not contracts:
-        logger.info("No option contracts for %s in [%s, %s]", ticker, min_exp, max_exp)
-        return None
-
     is_bull_put = signal_direction == "long"
     option_type = "put" if is_bull_put else "call"
 
-    # Group by expiration, prefer the nearest one inside the window (more
-    # theta decay realized within the judged period).
-    same_type = [c for c in contracts if c.get("type", c.get("option_type", "")).lower() == option_type]
-    if not same_type:
+    contracts = await _fetch_contracts(mcp, ticker, option_type, min_exp, max_exp)
+    if not contracts:
+        logger.info("No %s contracts for %s in [%s, %s]", option_type, ticker, min_exp, max_exp)
         return None
-    same_type.sort(key=lambda c: c.get("expiration_date", ""))
-    chosen_expiration = same_type[0].get("expiration_date")
-    exp_contracts = [c for c in same_type if c.get("expiration_date") == chosen_expiration]
 
-    # Fetch snapshots (greeks + quotes) for this expiration's strikes to find
-    # the one nearest the target short-leg delta.
-    symbols = [c["symbol"] for c in exp_contracts if c.get("symbol")]
-    snapshots = await mcp.call("get_option_snapshot", {"symbols": symbols})
-    snap_by_symbol = snapshots if isinstance(snapshots, dict) else {s["symbol"]: s for s in snapshots}
+    # Prefer the nearest expiration inside the window (more theta decay
+    # realized within the judged period).
+    contracts.sort(key=lambda c: c.get("expiration_date", ""))
+    chosen_expiration = contracts[0]["expiration_date"]
+    exp_contracts = [c for c in contracts if c.get("expiration_date") == chosen_expiration]
+    dte_days = (datetime.strptime(chosen_expiration, "%Y-%m-%d").date() - today).days
 
-    def delta_of(symbol: str) -> float | None:
-        snap = snap_by_symbol.get(symbol, {})
-        greeks = snap.get("greeks", {})
-        d = greeks.get("delta")
-        return abs(float(d)) if d is not None else None
+    symbols = [c["symbol"] for c in exp_contracts]
+    snap_by_symbol = await _fetch_snapshots(mcp, symbols)
 
-    candidates = [(c, delta_of(c["symbol"])) for c in exp_contracts]
-    candidates = [(c, d) for c, d in candidates if d is not None]
-    if not candidates:
-        logger.warning("No greeks available for %s %s chain, skipping", ticker, chosen_expiration)
-        return None
+    def delta_of(contract: dict) -> float:
+        strike = float(contract["strike_price"])
+        return abs(bs_delta(
+            spot=spot_price, strike=strike, dte_days=dte_days,
+            volatility=realized_vol, option_type=option_type,
+        ))
 
     liquid_candidates = [
-        (c, d) for c, d in candidates if _passes_liquidity(snap_by_symbol.get(c["symbol"], {}))
+        (c, delta_of(c)) for c in exp_contracts
+        if _passes_liquidity(c, snap_by_symbol.get(c["symbol"], {}))
     ]
     if not liquid_candidates:
         logger.info(
             "%s %s chain has %d strikes but none pass the liquidity gate "
             "(min OI %d, max spread %.0f%%), skipping",
-            ticker, chosen_expiration, len(candidates),
+            ticker, chosen_expiration, len(exp_contracts),
             limits.min_open_interest, limits.max_bid_ask_spread_pct * 100,
         )
         return None
@@ -149,9 +187,9 @@ async def build_spread(mcp: AlpacaMCP, ticker: str, signal_direction: str) -> Sp
     # short strike — lower strike for a put spread (further OTM = lower),
     # higher strike for a call spread (further OTM = higher).
     target_long_strike = (
-        short_strike - config.risk.spread_width_dollars
+        short_strike - limits.spread_width_dollars
         if is_bull_put
-        else short_strike + config.risk.spread_width_dollars
+        else short_strike + limits.spread_width_dollars
     )
     same_exp_by_strike = {float(c["strike_price"]): c for c in exp_contracts}
     if target_long_strike not in same_exp_by_strike:
@@ -160,17 +198,18 @@ async def build_spread(mcp: AlpacaMCP, ticker: str, signal_direction: str) -> Sp
         closest_strike = min(same_exp_by_strike, key=lambda k: abs(k - target_long_strike))
         target_long_strike = closest_strike
     long_contract = same_exp_by_strike[target_long_strike]
-    if not _passes_liquidity(snap_by_symbol.get(long_contract["symbol"], {})):
+
+    long_snap = snap_by_symbol.get(long_contract["symbol"], {})
+    if not _passes_liquidity(long_contract, long_snap):
         # Reject outright rather than silently walking to the next strike —
         # a silently-substituted long leg changes the spread's actual width
-        # and max loss from what was reasoned about (2026-08-26 research pass).
+        # and max loss from what was reasoned about.
         logger.info("%s long leg (%s) fails the liquidity gate, skipping", ticker, long_contract["symbol"])
         return None
 
-    short_quote = snap_by_symbol.get(short_contract["symbol"], {}).get("latest_quote", {})
-    long_quote = snap_by_symbol.get(long_contract["symbol"], {}).get("latest_quote", {})
-    short_mid = _mid(short_quote)
-    long_mid = _mid(long_quote)
+    short_snap = snap_by_symbol.get(short_contract["symbol"], {})
+    short_mid = _mid_from_snapshot(short_snap)
+    long_mid = _mid_from_snapshot(long_snap)
     if short_mid is None or long_mid is None:
         logger.warning("Missing quotes for %s spread legs, skipping", ticker)
         return None

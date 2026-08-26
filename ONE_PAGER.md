@@ -38,9 +38,11 @@ with something real and verifiable.*
   day away, or the contest deadline is within 2 hours, closes unconditionally
   regardless of profit/loss — added specifically so a late-week entry can't
   end the contest open and undemonstrated.
-- Per-contract liquidity gate: both legs require open interest ≥100 and a
-  bid-ask spread ≤12% of mid — equity-level liquidity isn't a reliable proxy
-  for options-market liquidity, so this is checked independently.
+- Per-contract liquidity gate: both legs require a bid-ask spread ≤12% of
+  mid, and open interest ≥100 whenever the API actually reports a value
+  (confirmed live: Alpaca's free/paper tier returns `open_interest: null`
+  even for genuinely liquid, near-the-money SPY contracts — enforced only
+  when present rather than silently rejecting almost everything).
 - **Known, accepted limitation**: the shared equity screening universe skews
   toward large-cap tech, so several concurrent spreads could end up
   correlated in a broad market move rather than truly diversified — not
@@ -49,9 +51,14 @@ with something real and verifiable.*
 ## Alpaca infrastructure
 
 - 100% of options reads/orders via [Alpaca's official MCP
-  server](https://github.com/alpacahq/alpaca-mcp-server) — `get_option_chain`,
-  `get_option_snapshot`, `place_option_order`. Never the raw SDK for
-  anything options-related.
+  server](https://github.com/alpacahq/alpaca-mcp-server) —
+  `get_option_contracts`, `get_option_snapshot`, `place_option_order`.
+  Never the raw SDK for anything options-related.
+- No broker-supplied Greeks are available on this account without a paid
+  Algo Trader Plus subscription (confirmed live: `feed=opra` 403s with
+  "OPRA agreement is not signed"; the free `indicative` feed has no
+  `greeks` field at all) — delta is computed in-process via closed-form
+  Black-Scholes, using realized volatility as the implied-vol proxy.
 - Screening/signal generation reuses a real, independently-running
   equities trading system's tested code (400+ prior live paper cycles),
   translated to an options structure for this project.

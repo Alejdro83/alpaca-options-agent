@@ -3,10 +3,11 @@ place in this project that calls `place_option_order`, so the "did this
 actually go through MCP" question has one obvious answer for judges reading
 the code.
 
-NOTE: `place_option_order`'s exact multi-leg parameter shape (Alpaca's
-mlgeg/legs array format) is documented but not yet exercised against a real
-response — first thing to verify in the MCP smoke test (see plan), before
-this is ever called from the live cron job.
+Schema verified directly against the real account 2026-08-26 (via
+`session.list_tools()`, not guessed): `legs` is correct for multi-leg, but
+`qty` is STRING-typed in the tool's own schema (not int) — passed as
+`str(contracts)` here accordingly. `ratio_qty` per leg follows the same
+string convention.
 """
 from __future__ import annotations
 
@@ -16,6 +17,25 @@ from mcp_client import AlpacaMCP
 from spread_builder import SpreadPlan
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_order_ids(result) -> list[str]:
+    """Defensive against exactly the mistake this project already made once:
+    an earlier version assumed `place_option_order` returns either a bare
+    `{"id": ...}` or a list of those — verified live 2026-08-26 that the
+    real response is wrapped in `{"data": {...}}` like every other tool
+    here. Handles the wrapped shape first, falls back to the unwrapped
+    guess, and logs the raw result rather than silently returning []  if
+    neither matches, so a future schema change surfaces immediately instead
+    of quietly losing the order id.
+    """
+    payload = result.get("data", result) if isinstance(result, dict) else result
+    if isinstance(payload, dict) and "id" in payload:
+        return [payload["id"]]
+    if isinstance(payload, list):
+        return [o["id"] for o in payload if isinstance(o, dict) and "id" in o]
+    logger.warning("Could not extract order id(s) from place_option_order result: %s", result)
+    return []
 
 
 async def open_spread(mcp: AlpacaMCP, plan: SpreadPlan, contracts: int = 1) -> list[str]:
@@ -29,18 +49,16 @@ async def open_spread(mcp: AlpacaMCP, plan: SpreadPlan, contracts: int = 1) -> l
         "place_option_order",
         {
             "legs": [
-                {"symbol": plan.short_symbol, "side": "sell", "ratio_qty": 1},
-                {"symbol": plan.long_symbol, "side": "buy", "ratio_qty": 1},
+                {"symbol": plan.short_symbol, "side": "sell", "ratio_qty": "1", "position_intent": "sell_to_open"},
+                {"symbol": plan.long_symbol, "side": "buy", "ratio_qty": "1", "position_intent": "buy_to_open"},
             ],
-            "qty": contracts,
+            "qty": str(contracts),
             "order_class": "mleg",
             "type": "market",
             "time_in_force": "day",
         },
     )
-    order_ids = [result["id"]] if isinstance(result, dict) and "id" in result else (
-        [o["id"] for o in result] if isinstance(result, list) else []
-    )
+    order_ids = _extract_order_ids(result)
     logger.info("Opened %s %s: orders %s", plan.underlying, plan.direction, order_ids)
     return order_ids
 
@@ -53,32 +71,37 @@ async def close_spread(mcp: AlpacaMCP, short_symbol: str, long_symbol: str, cont
         "place_option_order",
         {
             "legs": [
-                {"symbol": short_symbol, "side": "buy", "ratio_qty": 1},
-                {"symbol": long_symbol, "side": "sell", "ratio_qty": 1},
+                {"symbol": short_symbol, "side": "buy", "ratio_qty": "1", "position_intent": "buy_to_close"},
+                {"symbol": long_symbol, "side": "sell", "ratio_qty": "1", "position_intent": "sell_to_close"},
             ],
-            "qty": contracts,
+            "qty": str(contracts),
             "order_class": "mleg",
             "type": "market",
             "time_in_force": "day",
         },
     )
-    order_ids = [result["id"]] if isinstance(result, dict) and "id" in result else (
-        [o["id"] for o in result] if isinstance(result, list) else []
-    )
+    order_ids = _extract_order_ids(result)
     logger.info("Closed spread (%s / %s): orders %s", short_symbol, long_symbol, order_ids)
     return order_ids
 
 
 async def get_spread_mark(mcp: AlpacaMCP, short_symbol: str, long_symbol: str) -> float | None:
-    """Current cost to close (debit), for risk_gate.should_close."""
-    snapshots = await mcp.call("get_option_snapshot", {"symbols": [short_symbol, long_symbol]})
-    snap_by_symbol = snapshots if isinstance(snapshots, dict) else {s["symbol"]: s for s in snapshots}
-    short_q = snap_by_symbol.get(short_symbol, {}).get("latest_quote", {})
-    long_q = snap_by_symbol.get(long_symbol, {}).get("latest_quote", {})
+    """Current cost to close (debit), for risk_gate.should_close. Real
+    response shape: `{"data": {"snapshots": {symbol: {"latestQuote": {"bp":
+    ..., "ap": ...}}}}}` — verified against the live account 2026-08-26,
+    same camelCase/nested shape spread_builder.py's `_mid_from_snapshot` uses.
+    """
+    result = await mcp.call(
+        "get_option_snapshot",
+        {"symbols": f"{short_symbol},{long_symbol}", "feed": "indicative"},
+    )
+    snap_by_symbol = (result or {}).get("data", {}).get("snapshots", {})
+    short_q = snap_by_symbol.get(short_symbol, {}).get("latestQuote", {})
+    long_q = snap_by_symbol.get(long_symbol, {}).get("latestQuote", {})
     if not short_q or not long_q:
         return None
-    short_ask = short_q.get("ask_price")
-    long_bid = long_q.get("bid_price")
+    short_ask = short_q.get("ap")
+    long_bid = long_q.get("bp")
     if short_ask is None or long_bid is None:
         return None
     return round((float(short_ask) - float(long_bid)) * 100, 2)

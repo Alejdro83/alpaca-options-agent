@@ -39,6 +39,7 @@ from signals.indicators import compute_atr
 from signals.swing import generate_swing_signals
 from signals.trend_filter import TrendFilter
 
+import black_scholes
 import db
 import executor_mcp
 import llm_reasoner
@@ -90,26 +91,39 @@ def _fetch_daily_bars(client: AlpacaClient, ticker: str) -> pd.DataFrame:
     return pd.DataFrame(bars)
 
 
-def _apply_trend_and_volatility_filters(client: AlpacaClient, signals: list) -> list:
+def _apply_trend_and_volatility_filters(client: AlpacaClient, signals: list) -> list[tuple]:
+    """Returns (signal, realized_vol) pairs for survivors — realized_vol is
+    the annualized estimate `spread_builder.build_spread` feeds into
+    `black_scholes.bs_delta` as the IV proxy, computed here (not re-fetched
+    later) since this is already pulling the daily bars it needs.
+    """
     trend_filter = TrendFilter()
     kept = []
     for sig in signals:
         try:
             bars_df = _fetch_daily_bars(client, sig.ticker)
+        except Exception:
+            logger.exception("Failed to fetch bars for %s, skipping", sig.ticker)
+            continue
+
+        try:
             trend_result = trend_filter.check(bars_df, sig.direction)
+            trend_allowed = trend_result.allowed
         except Exception:
             logger.exception("Trend filter failed for %s, allowing", sig.ticker)
-            kept.append(sig)
+            trend_allowed = True
+        if not trend_allowed:
             continue
-        if not trend_result.allowed:
-            continue
+
         try:
             if not _passes_volatility_filter(bars_df):
                 logger.info("%s rejected: realized vol below the configured percentile", sig.ticker)
                 continue
         except Exception:
             logger.exception("Volatility filter failed for %s, allowing", sig.ticker)
-        kept.append(sig)
+
+        realized_vol = black_scholes.realized_vol_from_bars(bars_df)
+        kept.append((sig, realized_vol))
     return kept
 
 
@@ -169,13 +183,15 @@ async def find_candidates(mcp: AlpacaMCP, client: AlpacaClient, account: dict, o
     filtered = filter_universe(universe, client)
     tickers = [c.symbol for c in filtered]
     signals = generate_swing_signals(tickers, client)
-    signals = _apply_trend_and_volatility_filters(client, signals)
+    signals_with_vol = _apply_trend_and_volatility_filters(client, signals)
 
     today = datetime.now(timezone.utc).date()
     candidates = []
-    for sig in signals:
+    for sig, realized_vol in signals_with_vol:
         try:
-            plan = await build_spread(mcp, sig.ticker, sig.direction)
+            spot = client.get_latest_quote(sig.ticker)
+            spot_mid = (spot["ask_price"] + spot["bid_price"]) / 2
+            plan = await build_spread(mcp, sig.ticker, sig.direction, spot_price=spot_mid, realized_vol=realized_vol)
         except Exception:
             logger.exception("Failed to build spread for %s", sig.ticker)
             continue

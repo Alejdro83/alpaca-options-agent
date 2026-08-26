@@ -63,7 +63,7 @@ class AlpacaMCP:
         assert self.session is not None, "call() used outside `async with`"
         logger.info("MCP call: %s(%s)", tool, arguments)
         result = await self.session.call_tool(tool, arguments)
-        if result.isError:
+        if result.is_error:
             text = "; ".join(getattr(c, "text", str(c)) for c in result.content)
             raise RuntimeError(f"Alpaca MCP tool '{tool}' failed: {text}")
         texts = [c.text for c in result.content if getattr(c, "text", None)]
