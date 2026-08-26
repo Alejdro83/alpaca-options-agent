@@ -13,11 +13,14 @@ what risk_gate.check_new_spread checks against.
 NOTE ON FIELD NAMES: Alpaca's `get_option_chain`/`get_option_snapshot` MCP
 tools return contract data with strike/expiration/greeks fields — the exact
 key names here (`strike_price`, `expiration_date`, `greeks.delta`,
-`latest_quote.bid_price`/`ask_price`) match Alpaca's documented options
-schema, but this has NOT yet been smoke-tested against a live response
-(blocked on the hackathon's dedicated account existing — see
-plan step "MCP smoke test" before wiring this into the cron job). Treat the
-parsing helpers here as the first thing to verify, not as already-proven.
+`latest_quote.bid_price`/`ask_price`, and now also `open_interest` for the
+liquidity gate) match Alpaca's documented options schema, but this has NOT
+yet been smoke-tested against a live response (blocked on the hackathon's
+dedicated account existing — see plan step "MCP smoke test" before wiring
+this into the cron job). Treat the parsing helpers here as the first thing
+to verify, not as already-proven — `smoke_test.py` should be extended to
+print `open_interest` specifically alongside greeks once real credentials
+exist.
 """
 from __future__ import annotations
 
@@ -50,6 +53,26 @@ def _mid(quote: dict) -> float | None:
     if bid is None or ask is None:
         return None
     return (float(bid) + float(ask)) / 2
+
+
+def _passes_liquidity(snap: dict) -> bool:
+    """Per-contract liquidity gate (2026-08-26 research pass) — equity-level
+    liquidity (ScreeningFilters.min_avg_volume) is a poor proxy for options
+    liquidity specifically; a heavily-traded stock can still have a thin
+    market on a given strike/expiration. Checked on every leg individually,
+    never averaged across a spread — one illiquid leg makes the whole
+    spread hard to exit cleanly regardless of how liquid the other leg is.
+    """
+    open_interest = snap.get("open_interest")
+    if open_interest is None or int(open_interest) < config.risk.min_open_interest:
+        return False
+    quote = snap.get("latest_quote", {})
+    mid = _mid(quote)
+    if mid is None or mid <= 0:
+        return False
+    bid, ask = float(quote["bid_price"]), float(quote["ask_price"])
+    spread_pct = (ask - bid) / mid
+    return spread_pct <= config.risk.max_bid_ask_spread_pct
 
 
 async def build_spread(mcp: AlpacaMCP, ticker: str, signal_direction: str) -> SpreadPlan | None:
@@ -106,8 +129,20 @@ async def build_spread(mcp: AlpacaMCP, ticker: str, signal_direction: str) -> Sp
         logger.warning("No greeks available for %s %s chain, skipping", ticker, chosen_expiration)
         return None
 
-    candidates.sort(key=lambda cd: abs(cd[1] - limits.short_leg_target_delta))
-    short_contract, _ = candidates[0]
+    liquid_candidates = [
+        (c, d) for c, d in candidates if _passes_liquidity(snap_by_symbol.get(c["symbol"], {}))
+    ]
+    if not liquid_candidates:
+        logger.info(
+            "%s %s chain has %d strikes but none pass the liquidity gate "
+            "(min OI %d, max spread %.0f%%), skipping",
+            ticker, chosen_expiration, len(candidates),
+            limits.min_open_interest, limits.max_bid_ask_spread_pct * 100,
+        )
+        return None
+
+    liquid_candidates.sort(key=lambda cd: abs(cd[1] - limits.short_leg_target_delta))
+    short_contract, _ = liquid_candidates[0]
     short_strike = float(short_contract["strike_price"])
 
     # Long leg: `spread_width_dollars` further out-of-the-money than the
@@ -125,6 +160,12 @@ async def build_spread(mcp: AlpacaMCP, ticker: str, signal_direction: str) -> Sp
         closest_strike = min(same_exp_by_strike, key=lambda k: abs(k - target_long_strike))
         target_long_strike = closest_strike
     long_contract = same_exp_by_strike[target_long_strike]
+    if not _passes_liquidity(snap_by_symbol.get(long_contract["symbol"], {})):
+        # Reject outright rather than silently walking to the next strike —
+        # a silently-substituted long leg changes the spread's actual width
+        # and max loss from what was reasoned about (2026-08-26 research pass).
+        logger.info("%s long leg (%s) fails the liquidity gate, skipping", ticker, long_contract["symbol"])
+        return None
 
     short_quote = snap_by_symbol.get(short_contract["symbol"], {}).get("latest_quote", {})
     long_quote = snap_by_symbol.get(long_contract["symbol"], {}).get("latest_quote", {})

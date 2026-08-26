@@ -17,11 +17,17 @@ Gates, in order, any one of which blocks the trade:
 4. DTE window — rejects anything outside [min_dte, max_dte], since the
    entire judged window is ~5 trading days and this keeps every position's
    fate resolved on a timescale the judges can actually see.
+
+`should_force_close` is a separate, unconditional exit trigger (not part of
+the entry gate above): a spread opened late in the week could otherwise
+still be open, unrealized, and undemonstrated when the contest ends — this
+closes it regardless of profit/loss once expiration or the contest deadline
+is imminent (2026-08-26 research pass; see ONE_PAGER.md).
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 
 from config import config
 
@@ -90,4 +96,30 @@ def should_close(
             f"stop hit: cost to close (${current_mark:.2f}) reached "
             f"{limits.stop_loss_multiple}x credit received (${credit_received:.2f})"
         )
+    return False, None
+
+
+def should_force_close(
+    *,
+    expiration: date,
+    now_utc: datetime | None = None,
+) -> tuple[bool, str] | tuple[bool, None]:
+    """Unconditional exit — fires independent of should_close's profit/loss
+    checks. Two triggers, either sufficient on its own:
+    1. Expiration is tomorrow or sooner (assignment/pin risk on American-
+       style equity options isn't worth carrying into the final session).
+    2. The contest deadline itself is within 2 hours — nothing should still
+       be open, undemonstrated, when judging starts.
+    """
+    now_utc = now_utc or datetime.now(timezone.utc)
+    today = now_utc.date()
+
+    dte = (expiration - today).days
+    if dte <= 1:
+        return True, f"force-close: only {dte} day(s) to expiration"
+
+    contest_end = datetime.fromisoformat(config.risk.contest_end_utc)
+    if now_utc >= contest_end - timedelta(hours=2):
+        return True, "force-close: contest deadline is within 2 hours"
+
     return False, None

@@ -10,7 +10,17 @@ with something real and verifiable.*
 - Underlying selection: [screening/signals summary — liquid universe size,
   which horizon(s) used, trend-filter pass rate this week]
 - Options structure: credit vertical spreads (bull put / bear call),
-  ~20-30 delta short strike, $5-wide, 7-14 DTE.
+  ~16-18 delta short strike, $5-wide, 10-21 DTE. Delta and DTE were both
+  tuned down from more common textbook values (25-30 delta, 30-45 DTE)
+  specifically for a ~5-trading-day judged window: research shows 25-30
+  delta's higher expected value only plays out over hundreds of trades,
+  while a handful of trades in one week is dominated by variance, and 30-45
+  DTE resolves well past the contest entirely.
+- Entry additionally requires a realized-volatility-percentile filter (a
+  proxy for true IV rank — see `config.py`'s `VolatilityFilter` docstring
+  for why it's a proxy, not the real thing): only sells premium when the
+  underlying's current 20-day ATR% sits at/above the 40th percentile of its
+  own trailing year.
 - Autonomous decision layer: [N] LLM decision calls this week, [N] resulted
   in a trade, [N] in a deliberate skip — include 2-3 real `reasoning`
   strings pulled from the `cycles` table as examples.
@@ -24,6 +34,17 @@ with something real and verifiable.*
   the judging window.
 - [Any gate that actually fired this week — a rejected candidate is good
   evidence the gates are real, not decorative]
+- Force-close-by-contest-end: any spread still open once expiration is ≤1
+  day away, or the contest deadline is within 2 hours, closes unconditionally
+  regardless of profit/loss — added specifically so a late-week entry can't
+  end the contest open and undemonstrated.
+- Per-contract liquidity gate: both legs require open interest ≥100 and a
+  bid-ask spread ≤12% of mid — equity-level liquidity isn't a reliable proxy
+  for options-market liquidity, so this is checked independently.
+- **Known, accepted limitation**: the shared equity screening universe skews
+  toward large-cap tech, so several concurrent spreads could end up
+  correlated in a broad market move rather than truly diversified — not
+  addressed with a hard code change given the timeline, named here instead.
 
 ## Alpaca infrastructure
 

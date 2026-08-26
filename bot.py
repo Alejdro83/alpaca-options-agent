@@ -35,6 +35,7 @@ from alpaca_client import AlpacaClient
 from config import config
 from screening.universe import get_universe
 from screening.filters import filter_universe
+from signals.indicators import compute_atr
 from signals.swing import generate_swing_signals
 from signals.trend_filter import TrendFilter
 
@@ -54,42 +55,87 @@ logger = logging.getLogger(__name__)
 TREND_FILTER_LOOKBACK_DAYS = 400
 
 
-def _apply_trend_filter(client: AlpacaClient, signals: list) -> list:
-    trend_filter = TrendFilter()
+def _passes_volatility_filter(bars_df: pd.DataFrame) -> bool:
+    """Realized-volatility-percentile proxy for true IV rank (2026-08-26
+    research pass — see config.VolatilityFilter's docstring for why a proxy,
+    not the real thing). Reuses the same ~400-day daily bars the trend
+    filter already fetched, no extra API calls: ranks today's N-day ATR%
+    against its own trailing-year distribution, and requires it to sit at or
+    above the configured percentile before entering a NEW credit spread —
+    elevated realized vol is a reasonable stand-in for "premium is rich
+    relative to its own recent history," which is what actually matters for
+    a premium seller.
+    """
+    vol_cfg = config.volatility
+    if not vol_cfg.enabled:
+        return True
+    atr = compute_atr(bars_df["high"], bars_df["low"], bars_df["close"], period=vol_cfg.lookback_window)
+    atr_pct = (atr / bars_df["close"]).dropna()
+    if len(atr_pct) < vol_cfg.lookback_window * 2:
+        # Not enough history to rank meaningfully — fail open rather than
+        # silently blocking every candidate for a newly-listed or thin name.
+        return True
+    percentile = atr_pct.rank(pct=True).iloc[-1]
+    return percentile >= vol_cfg.min_percentile
+
+
+def _fetch_daily_bars(client: AlpacaClient, ticker: str) -> pd.DataFrame:
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=TREND_FILTER_LOOKBACK_DAYS)
+    bars = client.get_bars(
+        ticker, TimeFrame.Day,
+        start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"),
+        limit=300,
+    )
+    return pd.DataFrame(bars)
+
+
+def _apply_trend_and_volatility_filters(client: AlpacaClient, signals: list) -> list:
+    trend_filter = TrendFilter()
     kept = []
     for sig in signals:
         try:
-            bars = client.get_bars(
-                sig.ticker, TimeFrame.Day,
-                start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"),
-                limit=300,
-            )
-            result = trend_filter.check(pd.DataFrame(bars), sig.direction)
+            bars_df = _fetch_daily_bars(client, sig.ticker)
+            trend_result = trend_filter.check(bars_df, sig.direction)
         except Exception:
             logger.exception("Trend filter failed for %s, allowing", sig.ticker)
             kept.append(sig)
             continue
-        if result.allowed:
-            kept.append(sig)
+        if not trend_result.allowed:
+            continue
+        try:
+            if not _passes_volatility_filter(bars_df):
+                logger.info("%s rejected: realized vol below the configured percentile", sig.ticker)
+                continue
+        except Exception:
+            logger.exception("Volatility filter failed for %s, allowing", sig.ticker)
+        kept.append(sig)
     return kept
 
 
 async def manage_open_spreads(mcp: AlpacaMCP) -> list[str]:
     notes = []
     for spread in db.get_open_spreads():
+        expiration = datetime.strptime(str(spread["expiration"]), "%Y-%m-%d").date()
+        force_close, force_reason = risk_gate.should_force_close(expiration=expiration)
+
         try:
             mark = await executor_mcp.get_spread_mark(mcp, spread["short_symbol"], spread["long_symbol"])
         except Exception:
             logger.exception("Failed to get mark for spread %s", spread["id"])
+            if not force_close:
+                continue
+            mark = None
+
+        if force_close:
+            should_close, reason = True, force_reason
+        elif mark is None:
             continue
-        if mark is None:
-            continue
-        should_close, reason = risk_gate.should_close(
-            credit_received=float(spread["credit_received"]),
-            current_mark=mark,
-        )
+        else:
+            should_close, reason = risk_gate.should_close(
+                credit_received=float(spread["credit_received"]),
+                current_mark=mark,
+            )
         if not should_close:
             continue
         try:
@@ -99,9 +145,19 @@ async def manage_open_spreads(mcp: AlpacaMCP) -> list[str]:
                 long_symbol=spread["long_symbol"],
                 contracts=spread["contracts"],
             )
-            realized_pnl = float(spread["credit_received"]) - mark
-            db.record_spread_close(spread["id"], "closed_profit" if realized_pnl > 0 else "closed_stop", realized_pnl)
-            notes.append(f"Closed {spread['underlying']} {spread['direction']}: {reason} (P&L ${realized_pnl:+.2f})")
+            if mark is None:
+                # Force-closed without ever getting a fresh mark (quote fetch
+                # failed) — still worth closing out ahead of expiration/the
+                # contest deadline, but the realized P&L is genuinely unknown
+                # until the fill confirms, not silently reported as $0.
+                realized_pnl = None
+                status = "closed_expiry"
+                notes.append(f"Force-closed {spread['underlying']} {spread['direction']}: {reason} (P&L unknown, mark unavailable)")
+            else:
+                realized_pnl = float(spread["credit_received"]) - mark
+                status = "closed_expiry" if force_close else ("closed_profit" if realized_pnl > 0 else "closed_stop")
+                notes.append(f"Closed {spread['underlying']} {spread['direction']}: {reason} (P&L ${realized_pnl:+.2f})")
+            db.record_spread_close(spread["id"], status, realized_pnl)
         except Exception as exc:
             logger.exception("Failed to close spread %s", spread["id"])
             notes.append(f"ERROR closing {spread['underlying']}: {exc}")
@@ -113,7 +169,7 @@ async def find_candidates(mcp: AlpacaMCP, client: AlpacaClient, account: dict, o
     filtered = filter_universe(universe, client)
     tickers = [c.symbol for c in filtered]
     signals = generate_swing_signals(tickers, client)
-    signals = _apply_trend_filter(client, signals)
+    signals = _apply_trend_and_volatility_filters(client, signals)
 
     today = datetime.now(timezone.utc).date()
     candidates = []

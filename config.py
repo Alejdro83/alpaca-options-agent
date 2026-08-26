@@ -83,19 +83,30 @@ class OptionsRiskLimits:
         default_factory=lambda: _env_int("MAX_CONCURRENT_SPREADS", 5)
     )
     min_dte: int = field(
-        # Minimum days-to-expiration at entry — avoids gamma risk from
-        # entering something that expires before the judging window even
-        # gives it room to work.
-        default_factory=lambda: _env_int("MIN_DTE", 7)
+        # 10-21 days, not the textbook 30-45 — the contest window itself is
+        # only ~5 trading days, so full alignment with "enter at 30-45,
+        # manage out by 21" isn't available to us. This range is deliberately
+        # pulled *out* of the highest-gamma stretch (widened from an earlier
+        # 7-14, which sat entirely inside the zone convention says to have
+        # already exited by), while still resolving close enough to the
+        # judging window for `account_snapshots`' daily mark-to-market to
+        # show real, meaningful movement even on positions that never fully
+        # close (2026-08-26 research pass, see ONE_PAGER.md).
+        default_factory=lambda: _env_int("MIN_DTE", 10)
     )
     max_dte: int = field(
-        default_factory=lambda: _env_int("MAX_DTE", 14)
+        default_factory=lambda: _env_int("MAX_DTE", 21)
     )
     short_leg_target_delta: float = field(
-        # ~25-delta short strike is the standard "high-probability" credit
-        # spread convention — roughly a 75% mechanical probability of
-        # expiring worthless, before considering the underlying signal at all.
-        default_factory=lambda: _env_float("SHORT_LEG_TARGET_DELTA", 0.25)
+        # 16-18 delta, not 25 — published large-sample studies (tastytrade,
+        # ~85% win rate at 15-delta vs ~71% at 30-delta) argue 25-30 delta is
+        # fine in EXPECTED VALUE over hundreds of trades, but we only get a
+        # handful of trades in a ~5-day judged window, where variance (one
+        # loss in a 3-trade sample) dominates what judges actually see over
+        # long-run expectancy. 16-delta is separately cited as close to the
+        # theta-per-day sweet spot, so this isn't purely a win-rate-over-EV
+        # trade-off for our case (2026-08-26 research pass).
+        default_factory=lambda: _env_float("SHORT_LEG_TARGET_DELTA", 0.17)
     )
     spread_width_dollars: float = field(
         # Distance between short and long strikes. $5 wide is a clean,
@@ -110,8 +121,57 @@ class OptionsRiskLimits:
     )
     stop_loss_multiple: float = field(
         # Close if the spread's mark-to-market loss reaches this multiple of
-        # credit received (e.g. 2x credit received = stop out).
+        # credit received (e.g. 2x credit received = stop out). Within the
+        # commonly-cited 1.5-2x professional range — kept as-is, no evidence
+        # this needs to move for our situation (2026-08-26 research pass).
         default_factory=lambda: _env_float("STOP_LOSS_MULTIPLE", 2.0)
+    )
+    min_open_interest: int = field(
+        # Per-contract liquidity gate, applied to BOTH legs — equity-level
+        # liquidity (ScreeningFilters.min_avg_volume) is a poor proxy for
+        # options liquidity specifically; a heavily-traded stock can still
+        # have a thin market on a given strike/expiration. Rejects rather
+        # than silently widening the spread search (2026-08-26 research pass).
+        default_factory=lambda: _env_int("MIN_OPEN_INTEREST", 100)
+    )
+    max_bid_ask_spread_pct: float = field(
+        # Max (ask - bid) / mid on a single leg's quote. 12% sits in the
+        # commonly-cited 10-15% "tradeable" band for single-name equity
+        # options (index/ETF options are usually much tighter, but this
+        # screening universe is single names).
+        default_factory=lambda: _env_float("MAX_BID_ASK_SPREAD_PCT", 0.12)
+    )
+    contest_end_utc: str = field(
+        # Hard close-out deadline, independent of profit/loss — added
+        # specifically because should_close() previously only fired on
+        # profit-target/stop-loss, so a spread opened late in the week could
+        # still be open and undemonstrated at judging time. See
+        # risk_gate.should_force_close().
+        default_factory=lambda: _env("CONTEST_END_UTC", "2026-09-04T15:00:00+00:00")
+    )
+
+
+@dataclass(frozen=True)
+class VolatilityFilter:
+    """A realized-volatility-percentile proxy for true IV rank — research
+    (tastytrade, 595-symbol study) shows entering credit spreads only when
+    IV rank/percentile is elevated lifts win rate materially (48.2% ->
+    56.8% in that study), but true IV rank needs a 52-week implied-vol
+    history this project doesn't have wired up. `_apply_trend_filter` in
+    bot.py already pulls ~400 days of daily bars for the EMA/ADX trend
+    check — this reuses that same data to rank current realized volatility
+    (20-day ATR%) against its own trailing year, no new API calls. This is
+    a REALIZED-vol proxy, not implied-vol rank, and is labeled as such
+    everywhere it's surfaced (dashboard reasoning, ONE_PAGER.md) rather than
+    overclaiming (2026-08-26 research pass).
+    """
+    enabled: bool = field(default_factory=lambda: _env("VOL_FILTER_ENABLED", "true").lower() == "true")
+    lookback_window: int = field(default_factory=lambda: _env_int("VOL_LOOKBACK_ATR_WINDOW", 20))
+    min_percentile: float = field(
+        # Require current 20-day ATR% to be at/above this percentile of its
+        # own trailing-year range — "elevated realized vol" as a cheap stand-
+        # in for "elevated IV rank."
+        default_factory=lambda: _env_float("VOL_MIN_PERCENTILE", 0.40)
     )
 
 
@@ -136,6 +196,7 @@ class AppConfig:
     alpaca: AlpacaConfig = field(default_factory=AlpacaConfig)
     screening: ScreeningFilters = field(default_factory=ScreeningFilters)
     risk: OptionsRiskLimits = field(default_factory=OptionsRiskLimits)
+    volatility: VolatilityFilter = field(default_factory=VolatilityFilter)
     supabase: SupabaseConfig = field(default_factory=SupabaseConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
 

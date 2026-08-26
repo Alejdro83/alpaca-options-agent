@@ -35,6 +35,15 @@ async def main(ticker: str) -> None:
                 print("!! spread_builder.py's delta_of() will return None for everything — "
                       "check the real field name/path here and fix spread_builder.py before "
                       "wiring the cron job.")
+            snap_obj = snap if isinstance(snap, dict) and "open_interest" in snap else (
+                snap.get(symbol, {}) if isinstance(snap, dict) else (snap[0] if isinstance(snap, list) and snap else {})
+            )
+            has_oi = "open_interest" in json.dumps(snap)
+            print(f"open_interest present: {has_oi} (value: {snap_obj.get('open_interest')})")
+            if not has_oi:
+                print("!! spread_builder.py's _passes_liquidity() will reject every contract — "
+                      "check the real field name/path for open interest and fix "
+                      "spread_builder.py before wiring the cron job.")
 
         print("\n--- get_account (via alpaca_client, sanity check) ---")
         from alpaca_client import AlpacaClient

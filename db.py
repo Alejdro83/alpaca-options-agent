@@ -105,7 +105,7 @@ def record_spread_open(
         return row[0]
 
 
-def record_spread_close(spread_id: int, status: str, realized_pnl: float) -> None:
+def record_spread_close(spread_id: int, status: str, realized_pnl: float | None) -> None:
     with _connection() as conn, conn.cursor() as cur:
         cur.execute(
             f"""
