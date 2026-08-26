@@ -5,9 +5,19 @@ shown to the model); this module is where genuine judgment happens among
 whatever survives the gate — which candidate(s) to act on this cycle, sized
 within the remaining concurrent-spread budget, and why.
 
-Uses OpenRouter (key already provisioned in this environment for Hermes,
-`OPENROUTER_API_KEY`) rather than a provider-specific SDK, so this doesn't
-introduce a second credential to manage under a tight deadline.
+Provider is configurable via env (`REASONER_API_BASE`/`REASONER_API_KEY`/
+`REASONER_MODEL`), any OpenAI-compatible chat-completions endpoint. Default
+is the user's own flat-rate mimo-v2.5-pro plan (Xiaomi's direct API,
+`https://token-plan-ams.xiaomimimo.com/v1`) — already used reliably
+elsewhere in their own production infra (Gaussly), zero marginal cost since
+it's a monthly plan, and confirmed 2026-08-26 via 3/3 live test calls
+returning clean, schema-matching JSON (a genuinely free `:free` model on
+OpenRouter was tried first — nvidia/nemotron-3-ultra-550b-a55b:free — and
+rejected: 1 of 2 test calls returned a malformed response missing the
+"choices" key, plausible free-tier capacity flakiness. This model drives
+every trade decision, unattended, for the full judged week; reliability
+matters far more here than the trivial cost difference from a paid
+alternative like Sonnet).
 """
 from __future__ import annotations
 
@@ -19,8 +29,9 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL = os.environ.get("REASONER_MODEL", "anthropic/claude-sonnet-4.5")
+API_BASE = os.environ.get("REASONER_API_BASE", "https://token-plan-ams.xiaomimimo.com/v1")
+API_KEY_ENV = os.environ.get("REASONER_API_KEY_ENV", "REASONER_API_KEY")
+MODEL = os.environ.get("REASONER_MODEL", "mimo-v2.5-pro")
 
 SYSTEM_PROMPT = """You are the decision layer of an autonomous options-trading agent \
 competing in a hackathon (lablab.ai x Alpaca, "AI Trading Agents"). You choose which \
@@ -60,9 +71,9 @@ def decide(candidates: list[dict], remaining_budget: int) -> dict:
 
     try:
         resp = requests.post(
-            OPENROUTER_URL,
+            f"{API_BASE}/chat/completions",
             headers={
-                "Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}",
+                "Authorization": f"Bearer {os.environ[API_KEY_ENV]}",
                 "Content-Type": "application/json",
             },
             json={
