@@ -106,6 +106,17 @@ def _apply_trend_and_volatility_filters(client: AlpacaClient, signals: list) -> 
             logger.exception("Failed to fetch bars for %s, skipping", sig.ticker)
             continue
 
+        # A real failure mode hit live: get_bars() can return an empty list
+        # for a symbol (observed for BAC) -- pd.DataFrame([]) has no columns
+        # at all, so bars_df["close"] KeyErrors. The original code only
+        # guarded the trend-filter step against this and then immediately
+        # crashed the *entire cycle* (not just this ticker) on the very next
+        # line, in realized_vol_from_bars -- a single bad symbol took down
+        # every other candidate with it. Skip cleanly instead.
+        if bars_df.empty or "close" not in bars_df.columns:
+            logger.info("%s has no usable daily bars this cycle, skipping", sig.ticker)
+            continue
+
         try:
             trend_result = trend_filter.check(bars_df, sig.direction)
             trend_allowed = trend_result.allowed

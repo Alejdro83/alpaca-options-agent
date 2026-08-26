@@ -224,7 +224,13 @@ class AlpacaClient:
             feed=DataFeed.IEX,  # paper accounts get 403 on SIP for recent bars
         )
         bars = _retry(self._data.get_stock_bars, req)
-        rows = bars[symbol] if symbol in bars else []
+        # `symbol in bars` is always False -- BarSet doesn't proxy `in` to
+        # its `.data` dict the way `bars[symbol]` proxies `__getitem__` to
+        # it, so the original (trading_bot-inherited) check silently
+        # returned [] on every call, real data or not. Confirmed live
+        # 2026-08-26: `raw.data['CMCSA']` had 162 real bars while
+        # `'CMCSA' in raw` was False. Fixed to check `.data` directly.
+        rows = bars.data.get(symbol, [])
         return [
             {
                 "timestamp": str(b.timestamp),
