@@ -123,6 +123,62 @@ def get_open_spreads() -> list[dict[str, Any]]:
         return list(cur.fetchall())
 
 
+def _ensure_decision_journal_table() -> None:
+    with _connection() as conn, conn.cursor() as cur:
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {_schema()}.decision_journal (
+                id SERIAL PRIMARY KEY,
+                cycle_id INTEGER REFERENCES {_schema()}.cycles(id),
+                candidates JSONB,
+                llm_selected JSONB,
+                llm_reasoning TEXT,
+                shadow_selected JSONB,
+                gate_rejections JSONB,
+                pre_trade_rejections JSONB,
+                created_at TIMESTAMPTZ DEFAULT now()
+            )
+        """)
+
+
+_decision_journal_ready = False
+
+
+def record_decision_journal(
+    cycle_id: int,
+    candidates: list[dict],
+    llm_selected: list[str],
+    llm_reasoning: str,
+    shadow_selected: list[str],
+    gate_rejections: list[dict],
+    pre_trade_rejections: list[dict],
+) -> None:
+    global _decision_journal_ready
+    try:
+        if not _decision_journal_ready:
+            _ensure_decision_journal_table()
+            _decision_journal_ready = True
+        with _connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                insert into {_schema()}.decision_journal
+                    (cycle_id, candidates, llm_selected, llm_reasoning,
+                     shadow_selected, gate_rejections, pre_trade_rejections)
+                values (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    cycle_id,
+                    json.dumps(candidates),
+                    json.dumps(llm_selected),
+                    llm_reasoning,
+                    json.dumps(shadow_selected),
+                    json.dumps(gate_rejections),
+                    json.dumps(pre_trade_rejections),
+                ),
+            )
+    except Exception:
+        logger.exception("Failed to record decision journal (non-fatal)")
+
+
 def record_account_snapshot(
     equity: float,
     last_equity: float | None,

@@ -46,6 +46,8 @@ def check_new_spread(
     max_loss: float,
     expiration: date,
     today: date,
+    existing_exposure: dict[str, float] | None = None,
+    underlying: str | None = None,
 ) -> RiskCheckResult:
     reasons: list[str] = []
     limits = config.risk
@@ -74,6 +76,16 @@ def check_new_spread(
         reasons.append(
             f"{dte} DTE is outside the allowed [{limits.min_dte}, {limits.max_dte}] window"
         )
+
+    if existing_exposure is not None and underlying is not None:
+        projected_exposure = existing_exposure.get(underlying, 0) + max_loss
+        concentration_cap = equity * limits.max_concentration_pct
+        if projected_exposure > concentration_cap:
+            reasons.append(
+                f"projected exposure ${projected_exposure:.2f} for {underlying} "
+                f"exceeds {limits.max_concentration_pct:.0%} concentration cap "
+                f"(${concentration_cap:.2f})"
+            )
 
     return RiskCheckResult(allowed=not reasons, reasons=reasons)
 

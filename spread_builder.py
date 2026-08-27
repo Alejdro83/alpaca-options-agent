@@ -43,6 +43,8 @@ from mcp_client import AlpacaMCP
 
 logger = logging.getLogger(__name__)
 
+_contract_cache: dict[tuple, list[dict]] = {}
+
 
 @dataclass
 class SpreadPlan:
@@ -67,7 +69,10 @@ def _mid_from_snapshot(snap: dict) -> float | None:
     return (float(bid) + float(ask)) / 2
 
 
-def _passes_liquidity(contract: dict, snap: dict) -> bool:
+LONG_LEG_MAX_SPREAD_PCT = 0.25
+
+
+def _passes_liquidity(contract: dict, snap: dict, max_spread_override: float | None = None) -> bool:
     """Per-contract liquidity gate (2026-08-26 research pass) — equity-level
     liquidity (ScreeningFilters.min_avg_volume) is a poor proxy for options
     liquidity specifically. Checked on every leg individually, never
@@ -94,10 +99,14 @@ def _passes_liquidity(contract: dict, snap: dict) -> bool:
     quote = snap["latestQuote"]
     bid, ask = float(quote["bp"]), float(quote["ap"])
     spread_pct = (ask - bid) / mid
-    return spread_pct <= config.risk.max_bid_ask_spread_pct
+    threshold = max_spread_override if max_spread_override is not None else config.risk.max_bid_ask_spread_pct
+    return spread_pct <= threshold
 
 
 async def _fetch_contracts(mcp: AlpacaMCP, ticker: str, option_type: str, min_exp: date, max_exp: date) -> list[dict]:
+    cache_key = (ticker, option_type, min_exp.isoformat(), max_exp.isoformat())
+    if cache_key in _contract_cache:
+        return _contract_cache[cache_key]
     result = await mcp.call(
         "get_option_contracts",
         {
@@ -109,7 +118,9 @@ async def _fetch_contracts(mcp: AlpacaMCP, ticker: str, option_type: str, min_ex
             "limit": 100,
         },
     )
-    return (result or {}).get("data", {}).get("option_contracts", [])
+    contracts = (result or {}).get("data", {}).get("option_contracts", [])
+    _contract_cache[cache_key] = contracts
+    return contracts
 
 
 async def _fetch_snapshots(mcp: AlpacaMCP, symbols: list[str]) -> dict[str, dict]:
@@ -200,10 +211,7 @@ async def build_spread(
     long_contract = same_exp_by_strike[target_long_strike]
 
     long_snap = snap_by_symbol.get(long_contract["symbol"], {})
-    if not _passes_liquidity(long_contract, long_snap):
-        # Reject outright rather than silently walking to the next strike —
-        # a silently-substituted long leg changes the spread's actual width
-        # and max loss from what was reasoned about.
+    if not _passes_liquidity(long_contract, long_snap, max_spread_override=LONG_LEG_MAX_SPREAD_PCT):
         logger.info("%s long leg (%s) fails the liquidity gate, skipping", ticker, long_contract["symbol"])
         return None
 
@@ -220,6 +228,20 @@ async def build_spread(
 
     if credit_estimate <= 0:
         logger.info("%s spread has non-positive credit (%.2f), skipping", ticker, credit_estimate)
+        return None
+
+    # Real bug caught 2026-08-27: credit_estimate > 0 alone doesn't rule out
+    # a nonsensical spread — if credit exceeds the strike width (stale or
+    # crossed quotes, or the long strike snapping to something closer than
+    # the intended width), max_loss goes negative, meaning "risk-free
+    # profit" on paper. A spread whose own defined risk is negative or zero
+    # is not a real credit spread and must never reach execution.
+    if max_loss <= 0:
+        logger.warning(
+            "%s spread has non-positive max_loss (%.2f = width %.2f - credit %.2f) "
+            "-- almost certainly a stale/bad quote, skipping",
+            ticker, max_loss, width_dollars, credit_estimate,
+        )
         return None
 
     return SpreadPlan(

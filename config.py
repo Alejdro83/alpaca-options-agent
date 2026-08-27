@@ -141,6 +141,11 @@ class OptionsRiskLimits:
         # screening universe is single names).
         default_factory=lambda: _env_float("MAX_BID_ASK_SPREAD_PCT", 0.12)
     )
+    max_concentration_pct: float = field(
+        # No single underlying should represent more than this fraction of
+        # equity — prevents one position from dominating the portfolio.
+        default_factory=lambda: _env_float("MAX_CONCENTRATION_PCT", 0.20)
+    )
     contest_end_utc: str = field(
         # Hard close-out deadline, independent of profit/loss — added
         # specifically because should_close() previously only fired on
@@ -170,8 +175,24 @@ class VolatilityFilter:
     min_percentile: float = field(
         # Require current 20-day ATR% to be at/above this percentile of its
         # own trailing-year range — "elevated realized vol" as a cheap stand-
-        # in for "elevated IV rank."
+        # in for "elevated IV rank." 0.40 is the value the tastytrade study
+        # above actually used (48.2% -> 56.8% win rate at that threshold) —
+        # kept at 0.40, not the 0.25 briefly tried 2026-08-27 as a same-day
+        # reaction to a high rejection rate with zero external evidence for
+        # that specific number (see relaxed_min_percentile below for the
+        # honest way to handle a genuinely low-vol stretch).
         default_factory=lambda: _env_float("VOL_MIN_PERCENTILE", 0.40)
+    )
+    relaxed_min_percentile: float = field(
+        # Adaptive fallback (2026-08-27): if the baseline threshold above
+        # would reject more than max_rejection_rate_before_relax of a
+        # cycle's candidates, fall back to this lower percentile for that
+        # cycle instead of trading zero names — a documented, logged rule
+        # applied only when triggered, not a permanently-lowered bar.
+        default_factory=lambda: _env_float("VOL_RELAXED_MIN_PERCENTILE", 0.25)
+    )
+    max_rejection_rate_before_relax: float = field(
+        default_factory=lambda: _env_float("VOL_MAX_REJECTION_RATE_BEFORE_RELAX", 0.80)
     )
 
 

@@ -45,7 +45,7 @@ import executor_mcp
 import llm_reasoner
 import risk_gate
 from mcp_client import AlpacaMCP
-from spread_builder import build_spread
+from spread_builder import SpreadPlan, _mid_from_snapshot, build_spread
 
 from pathlib import Path
 
@@ -76,28 +76,20 @@ logger = logging.getLogger(__name__)
 TREND_FILTER_LOOKBACK_DAYS = 400
 
 
-def _passes_volatility_filter(bars_df: pd.DataFrame) -> bool:
-    """Realized-volatility-percentile proxy for true IV rank (2026-08-26
-    research pass — see config.VolatilityFilter's docstring for why a proxy,
-    not the real thing). Reuses the same ~400-day daily bars the trend
-    filter already fetched, no extra API calls: ranks today's N-day ATR%
-    against its own trailing-year distribution, and requires it to sit at or
-    above the configured percentile before entering a NEW credit spread —
-    elevated realized vol is a reasonable stand-in for "premium is rich
-    relative to its own recent history," which is what actually matters for
-    a premium seller.
+def _realized_vol_percentile(bars_df: pd.DataFrame) -> float | None:
+    """Where this ticker's current realized vol (20-day ATR%) ranks against
+    its own trailing-year distribution — None means "not enough history to
+    rank meaningfully," treated as fail-open by callers, same as before.
+    Split out from the old _passes_volatility_filter so the adaptive
+    threshold below can see every candidate's percentile before deciding
+    what bar to hold the whole cycle to (see _apply_trend_and_volatility_filters).
     """
     vol_cfg = config.volatility
-    if not vol_cfg.enabled:
-        return True
     atr = compute_atr(bars_df["high"], bars_df["low"], bars_df["close"], period=vol_cfg.lookback_window)
     atr_pct = (atr / bars_df["close"]).dropna()
     if len(atr_pct) < vol_cfg.lookback_window * 2:
-        # Not enough history to rank meaningfully — fail open rather than
-        # silently blocking every candidate for a newly-listed or thin name.
-        return True
-    percentile = atr_pct.rank(pct=True).iloc[-1]
-    return percentile >= vol_cfg.min_percentile
+        return None
+    return float(atr_pct.rank(pct=True).iloc[-1])
 
 
 def _fetch_daily_bars(client: AlpacaClient, ticker: str) -> pd.DataFrame:
@@ -116,9 +108,15 @@ def _apply_trend_and_volatility_filters(client: AlpacaClient, signals: list) -> 
     the annualized estimate `spread_builder.build_spread` feeds into
     `black_scholes.bs_delta` as the IV proxy, computed here (not re-fetched
     later) since this is already pulling the daily bars it needs.
+
+    Two passes: trend filter first (unchanged), then the volatility filter
+    with an adaptive threshold — see config.VolatilityFilter's docstring.
+    The adaptive rule needs every trend-survivor's percentile computed up
+    front to decide whether *this cycle* is unusually low-vol across the
+    board (relax) versus this one ticker just being quiet (still reject).
     """
     trend_filter = TrendFilter()
-    kept = []
+    trend_survivors: list[tuple] = []  # (sig, bars_df)
     for sig in signals:
         try:
             bars_df = _fetch_daily_bars(client, sig.ticker)
@@ -146,16 +144,61 @@ def _apply_trend_and_volatility_filters(client: AlpacaClient, signals: list) -> 
         if not trend_allowed:
             continue
 
-        try:
-            if not _passes_volatility_filter(bars_df):
-                logger.info("%s rejected: realized vol below the configured percentile", sig.ticker)
+        trend_survivors.append((sig, bars_df))
+
+    vol_cfg = config.volatility
+    min_percentile = vol_cfg.min_percentile
+
+    if vol_cfg.enabled and trend_survivors:
+        percentiles: list[float] = []
+        for sig, bars_df in trend_survivors:
+            try:
+                pct = _realized_vol_percentile(bars_df)
+            except Exception:
+                logger.exception("Volatility percentile failed for %s, treating as unrankable", sig.ticker)
+                pct = None
+            if pct is not None:
+                percentiles.append(pct)
+
+        if percentiles:
+            rejection_rate = sum(1 for p in percentiles if p < min_percentile) / len(percentiles)
+            if rejection_rate > vol_cfg.max_rejection_rate_before_relax:
+                logger.info(
+                    "Volatility filter would reject %.0f%% of %d rankable candidates at "
+                    "percentile %.2f -- relaxing to %.2f for this cycle only (adaptive rule, "
+                    "not a permanent change; see config.VolatilityFilter)",
+                    rejection_rate * 100, len(percentiles), min_percentile,
+                    vol_cfg.relaxed_min_percentile,
+                )
+                min_percentile = vol_cfg.relaxed_min_percentile
+
+    kept = []
+    for sig, bars_df in trend_survivors:
+        if vol_cfg.enabled:
+            try:
+                pct = _realized_vol_percentile(bars_df)
+            except Exception:
+                logger.exception("Volatility filter failed for %s, allowing", sig.ticker)
+                pct = None
+            if pct is not None and pct < min_percentile:
+                logger.info(
+                    "%s rejected: realized vol percentile %.2f below %.2f",
+                    sig.ticker, pct, min_percentile,
+                )
                 continue
-        except Exception:
-            logger.exception("Volatility filter failed for %s, allowing", sig.ticker)
 
         realized_vol = black_scholes.realized_vol_from_bars(bars_df)
         kept.append((sig, realized_vol))
     return kept
+
+
+def _optimal_contracts(equity: float, max_loss_per_contract: float, max_risk_pct: float = 0.02) -> int:
+    """Size contracts so total max loss stays within risk budget."""
+    if max_loss_per_contract <= 0:
+        return 1
+    dollar_budget = equity * max_risk_pct
+    contracts = int(dollar_budget // max_loss_per_contract)
+    return max(contracts, 1)
 
 
 async def manage_open_spreads(mcp: AlpacaMCP) -> list[str]:
@@ -199,7 +242,12 @@ async def manage_open_spreads(mcp: AlpacaMCP) -> list[str]:
                 status = "closed_expiry"
                 notes.append(f"Force-closed {spread['underlying']} {spread['direction']}: {reason} (P&L unknown, mark unavailable)")
             else:
-                realized_pnl = float(spread["credit_received"]) - mark
+                # credit_received/mark are both per-contract (get_spread_mark
+                # never multiplies by position size) — multiply by the real
+                # contracts held or P&L is understated whenever contracts>1,
+                # the same class of bug fixed in the entry path above.
+                contracts_held = int(spread.get("contracts") or 1)
+                realized_pnl = (float(spread["credit_received"]) - mark) * contracts_held
                 status = "closed_expiry" if force_close else ("closed_profit" if realized_pnl > 0 else "closed_stop")
                 notes.append(f"Closed {spread['underlying']} {spread['direction']}: {reason} (P&L ${realized_pnl:+.2f})")
             db.record_spread_close(spread["id"], status, realized_pnl)
@@ -209,7 +257,9 @@ async def manage_open_spreads(mcp: AlpacaMCP) -> list[str]:
     return notes
 
 
-async def find_candidates(mcp: AlpacaMCP, client: AlpacaClient, account: dict, open_count: int) -> list[dict]:
+async def find_candidates(
+    mcp: AlpacaMCP, client: AlpacaClient, account: dict, open_count: int
+) -> tuple[list[dict], list[dict]]:
     universe = get_universe()
     filtered = filter_universe(universe, client)
     tickers = [c.symbol for c in filtered]
@@ -217,7 +267,14 @@ async def find_candidates(mcp: AlpacaMCP, client: AlpacaClient, account: dict, o
     signals_with_vol = _apply_trend_and_volatility_filters(client, signals)
 
     today = datetime.now(timezone.utc).date()
+
+    existing_exposure: dict[str, float] = {}
+    for s in db.get_open_spreads():
+        underlying = s["underlying"]
+        existing_exposure[underlying] = existing_exposure.get(underlying, 0) + float(s.get("max_loss", 0))
+
     candidates = []
+    gate_rejections: list[dict] = []
     for sig, realized_vol in signals_with_vol:
         try:
             spot = client.get_latest_quote(sig.ticker)
@@ -235,9 +292,12 @@ async def find_candidates(mcp: AlpacaMCP, client: AlpacaClient, account: dict, o
             max_loss=plan.max_loss,
             expiration=plan.expiration,
             today=today,
+            existing_exposure=existing_exposure,
+            underlying=sig.ticker,
         )
         if not check.allowed:
             logger.info("%s rejected by risk gate: %s", sig.ticker, check.reasons)
+            gate_rejections.append({"ticker": sig.ticker, "reasons": check.reasons})
             continue
         candidates.append({
             "ticker": sig.ticker,
@@ -249,7 +309,7 @@ async def find_candidates(mcp: AlpacaMCP, client: AlpacaClient, account: dict, o
             "expiration": plan.expiration.isoformat(),
             "_plan": plan,
         })
-    return candidates
+    return candidates, gate_rejections
 
 
 def _daily_pl(account: dict) -> tuple[float, float]:
@@ -262,6 +322,111 @@ def _daily_pl(account: dict) -> tuple[float, float]:
     pl = equity - last_equity
     pl_pct = pl / last_equity if last_equity else 0.0
     return pl, pl_pct
+
+
+async def _pre_trade_check(
+    mcp: AlpacaMCP,
+    plan: SpreadPlan,
+    account: dict,
+    open_count: int,
+) -> tuple[bool, str | None, SpreadPlan]:
+    """Last-second validation before sending an order to Alpaca.
+
+    Re-fetches fresh option quotes for both legs, recomputes the credit
+    estimate, and re-runs risk_gate.check_new_spread.  If the credit has
+    shrunk by more than 20 % relative to the original estimate the trade
+    is skipped — the market moved against us between candidate screening
+    and the LLM's decision.
+    """
+    result = await mcp.call(
+        "get_option_snapshot",
+        {"symbols": f"{plan.short_symbol},{plan.long_symbol}", "feed": "indicative"},
+    )
+    snap_by_symbol = (result or {}).get("data", {}).get("snapshots", {})
+    short_snap = snap_by_symbol.get(plan.short_symbol, {})
+    long_snap = snap_by_symbol.get(plan.long_symbol, {})
+
+    short_mid = _mid_from_snapshot(short_snap)
+    long_mid = _mid_from_snapshot(long_snap)
+    if short_mid is None or long_mid is None:
+        return False, "fresh quotes unavailable for one or both legs", plan
+
+    now = datetime.now(timezone.utc)
+    # Real bug caught 2026-08-27: this only logged a warning on a stale
+    # quote and traded on it anyway. A quote hours old (market-closed
+    # remnant, or a genuine feed outage) is exactly what produced a
+    # nonsensical spread (credit exceeding the strike width) that day —
+    # now a hard block, not just a log line.
+    for label, snap in [("short", short_snap), ("long", long_snap)]:
+        ts_str = snap.get("latestQuote", {}).get("t")
+        if ts_str:
+            try:
+                quote_ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                age = now - quote_ts
+                if age > timedelta(minutes=15):
+                    return False, f"{label} leg quote is {age} old (>15 min) — stale, refusing to trade on it", plan
+            except (ValueError, TypeError):
+                pass
+
+    fresh_credit = round((short_mid - long_mid) * 100, 2)
+    if fresh_credit <= 0:
+        return False, f"fresh credit is non-positive (${fresh_credit:.2f})", plan
+
+    shrink_pct = (plan.credit_estimate - fresh_credit) / plan.credit_estimate
+    if shrink_pct > 0.20:
+        return (
+            False,
+            f"credit shrank {shrink_pct:.0%} (original ${plan.credit_estimate:.2f} → fresh ${fresh_credit:.2f})",
+            plan,
+        )
+
+    width_dollars = abs(plan.short_strike - plan.long_strike) * 100
+    updated_max_loss = round(width_dollars - fresh_credit, 2)
+    if updated_max_loss <= 0:
+        # Same sanity check as spread_builder.build_spread — a fresh
+        # requote can hit this too, not just the initial build.
+        return False, f"fresh max_loss is non-positive (${updated_max_loss:.2f}), refusing to trade", plan
+    updated_plan = SpreadPlan(
+        underlying=plan.underlying,
+        direction=plan.direction,
+        expiration=plan.expiration,
+        short_strike=plan.short_strike,
+        long_strike=plan.long_strike,
+        short_symbol=plan.short_symbol,
+        long_symbol=plan.long_symbol,
+        credit_estimate=fresh_credit,
+        max_loss=updated_max_loss,
+    )
+
+    today = now.date()
+    check = risk_gate.check_new_spread(
+        equity=float(account["equity"]),
+        daily_pl_pct=float(account.get("daily_pl_pct") or 0.0),
+        open_spreads_count=open_count,
+        max_loss=updated_max_loss,
+        expiration=plan.expiration,
+        today=today,
+    )
+    if not check.allowed:
+        return False, f"risk gate rejected on fresh quotes: {check.reasons}", updated_plan
+
+    return True, None, updated_plan
+
+
+def _shadow_select(candidates: list[dict], remaining_budget: int) -> list[str]:
+    """Mechanical baseline: rank by strength * (credit/max_loss), pick top N."""
+    if not candidates or remaining_budget <= 0:
+        return []
+    scored = []
+    for c in candidates:
+        credit = c.get("credit_estimate", 0)
+        max_loss = c.get("max_loss", 1)
+        strength = c.get("strength", 0)
+        rr = credit / max_loss if max_loss > 0 else 0
+        score = strength * rr
+        scored.append((c["ticker"], score))
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return [ticker for ticker, _ in scored[:remaining_budget]]
 
 
 async def run_cycle() -> None:
@@ -277,23 +442,75 @@ async def run_cycle() -> None:
         open_spreads = db.get_open_spreads()
         remaining_budget = max(0, config.risk.max_concurrent_spreads - len(open_spreads))
 
+        # Defense in depth, added 2026-08-27 after a real incident: this
+        # bot is only ever meant to open NEW positions while the market is
+        # actually open (the cron schedule already covers that in the
+        # common case, but a manual/out-of-schedule invocation has no such
+        # guard). Options market orders get rejected by Alpaca outside
+        # market hours anyway (confirmed live: HTTP 422, "options market
+        # orders are only allowed during market hours") -- checking here
+        # avoids wasting a full screening pass building candidates that can
+        # never actually execute, and closes the exact gap that produced a
+        # phantom "opened" db record that evening (see executor_mcp.py's
+        # _extract_order_ids for the other half of that fix). Managing
+        # already-open spreads still runs regardless -- force-close-by-
+        # deadline shouldn't wait on this check.
+        try:
+            market_open = client.get_clock()["is_open"]
+        except Exception:
+            logger.exception("Failed to check market clock, assuming closed (fail safe, not fail open)")
+            market_open = False
+
         open_notes = []
         candidates = []
+        slim_candidates: list[dict] = []
         decision = "skipped"
-        reasoning = "No eligible candidates this cycle."
+        reasoning = (
+            "No eligible candidates this cycle." if market_open
+            else "Market is closed — not screening for new candidates this cycle."
+        )
+        gate_rejections: list[dict] = []
+        pre_trade_rejections: list[dict] = []
+        shadow_selected: list[str] = []
+        llm_selected: list[str] = []
+        cycle_id: int | None = None
 
-        if remaining_budget > 0:
-            candidates = await find_candidates(mcp, client, account, len(open_spreads))
+        if remaining_budget > 0 and market_open:
+            candidates, gate_rejections = await find_candidates(mcp, client, account, len(open_spreads))
             slim_candidates = [{k: v for k, v in c.items() if k != "_plan"} for c in candidates]
+
             outcome = llm_reasoner.decide(slim_candidates, remaining_budget)
             reasoning = outcome["reasoning"]
-            selected_tickers = set(outcome["selected"])
+            llm_selected = outcome["selected"]
+            selected_tickers = set(llm_selected)
+
+            shadow_selected = _shadow_select(slim_candidates, remaining_budget)
+
             for c in candidates:
                 if c["ticker"] not in selected_tickers:
                     continue
                 plan = c["_plan"]
                 try:
-                    order_ids = await executor_mcp.open_spread(mcp, plan)
+                    allowed, reason, plan = await _pre_trade_check(
+                        mcp, plan, account, len(open_spreads),
+                    )
+                    if not allowed:
+                        logger.info("Pre-trade check blocked %s: %s", plan.underlying, reason)
+                        open_notes.append(f"Pre-trade check blocked {plan.underlying}: {reason}")
+                        pre_trade_rejections.append({"ticker": c["ticker"], "reason": reason})
+                        continue
+                    contracts = _optimal_contracts(
+                        equity=float(account["equity"]),
+                        max_loss_per_contract=plan.max_loss,
+                        max_risk_pct=config.risk.max_loss_per_spread_pct,
+                    )
+                    # Real bug caught in review 2026-08-27: this used to be
+                    # computed AFTER open_spread(mcp, plan) was already
+                    # called without a contracts= argument, so the real
+                    # order on Alpaca was always 1 contract regardless of
+                    # what got recorded in the DB — a genuine mismatch
+                    # between what actually executed and what we'd report.
+                    order_ids = await executor_mcp.open_spread(mcp, plan, contracts=contracts)
                     cycle_id = db.record_cycle(slim_candidates, "opened", reasoning)
                     db.record_spread_open(
                         underlying=plan.underlying,
@@ -303,15 +520,17 @@ async def run_cycle() -> None:
                         long_strike=plan.long_strike,
                         short_symbol=plan.short_symbol,
                         long_symbol=plan.long_symbol,
-                        contracts=1,
+                        contracts=contracts,
                         credit_received=plan.credit_estimate,
                         max_loss=plan.max_loss,
                         alpaca_order_ids=order_ids,
                         cycle_id=cycle_id,
                     )
                     open_notes.append(
-                        f"Opened {plan.underlying} {plan.direction}: "
-                        f"credit ${plan.credit_estimate:.2f}, max loss ${plan.max_loss:.2f}"
+                        f"Opened {plan.underlying} {plan.direction} x{contracts} contract(s): "
+                        f"credit ${plan.credit_estimate * contracts:.2f} total "
+                        f"(${plan.credit_estimate:.2f}/contract), "
+                        f"max loss ${plan.max_loss * contracts:.2f} total"
                     )
                     decision = "opened"
                 except Exception as exc:
@@ -320,7 +539,18 @@ async def run_cycle() -> None:
                     decision = "error"
 
         if decision == "skipped":
-            db.record_cycle([{k: v for k, v in c.items() if k != "_plan"} for c in candidates], decision, reasoning)
+            cycle_id = db.record_cycle(slim_candidates, decision, reasoning)
+
+        if cycle_id is not None:
+            db.record_decision_journal(
+                cycle_id=cycle_id,
+                candidates=slim_candidates,
+                llm_selected=llm_selected,
+                llm_reasoning=reasoning,
+                shadow_selected=shadow_selected,
+                gate_rejections=gate_rejections,
+                pre_trade_rejections=pre_trade_rejections,
+            )
 
         db.record_account_snapshot(
             equity=float(account["equity"]),
