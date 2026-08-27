@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 from contextlib import AsyncExitStack
+from pathlib import Path
 from typing import Any
 
 from mcp import ClientSession, StdioServerParameters
@@ -27,6 +28,16 @@ from mcp.client.stdio import stdio_client
 from config import config
 
 logger = logging.getLogger(__name__)
+
+# `stdio_client`'s `errlog` defaults to *our own* stderr — the subprocess's
+# FastMCP banner + startup log line ("Starting MCP server...") were bleeding
+# straight through to bot.py's stderr, which run_options_cron.sh's `2>&1`
+# then delivers as if it were noteworthy (found 2026-08-27 alongside the
+# separate logging.basicConfig fix in bot.py — same underlying "silent
+# unless something happened" contract, broken by a second, distinct
+# stdio-inheritance path this time). Redirecting it to a file closes that
+# path too.
+_MCP_STDERR_LOG = Path(__file__).resolve().parent / "state" / "mcp_server.log"
 
 
 class AlpacaMCP:
@@ -45,7 +56,9 @@ class AlpacaMCP:
                 "ALPACA_PAPER_TRADE": "true",
             },
         )
-        read, write = await self._stack.enter_async_context(stdio_client(params))
+        _MCP_STDERR_LOG.parent.mkdir(exist_ok=True)
+        errlog = self._stack.enter_context(open(_MCP_STDERR_LOG, "a"))
+        read, write = await self._stack.enter_async_context(stdio_client(params, errlog=errlog))
         self.session = await self._stack.enter_async_context(ClientSession(read, write))
         await self.session.initialize()
         return self

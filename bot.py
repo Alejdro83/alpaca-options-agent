@@ -47,7 +47,27 @@ import risk_gate
 from mcp_client import AlpacaMCP
 from spread_builder import build_spread
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+from pathlib import Path
+
+# `basicConfig`'s default StreamHandler writes to stderr, not stdout — but
+# run_options_cron.sh redirects stderr into stdout (`2>&1`) before deciding
+# whether there's anything worth delivering, so every INFO-level screening
+# line (dozens per cycle: "23/503 tickers passed filters", each rejection
+# reason, every MCP call) rode along regardless of the docstring's stated
+# "silent unless something happened" intent — confirmed directly: a single
+# no-op cycle produced 61 lines of output, all delivered as if noteworthy.
+# Real, user-visible symptom (2026-08-27): Alex had to ask Hermes to stop
+# forwarding these to Telegram entirely ("me llena de mensajes raros") and
+# reroute to Discord instead — which only relocates the noise, it doesn't
+# fix it. Routing the log handler to a file instead restores the original
+# design: stdout carries only the deliberate print(note) calls below.
+LOG_DIR = Path(__file__).resolve().parent / "state"
+LOG_DIR.mkdir(exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    filename=str(LOG_DIR / "bot.log"),
+)
 logger = logging.getLogger(__name__)
 
 # Same lookback trading_bot/bot.py uses for its own trend filter — EMA200 +
