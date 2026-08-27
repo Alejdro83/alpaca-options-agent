@@ -100,14 +100,21 @@ concurrent-spread portfolio cap or the LLM selection step.
 
 Result on a 12-symbol liquid basket over ~2 years (104 real entry events):
 the 10-21 DTE window (the 2026-08-26 research pass) held up well against a
-7-14 alternative across nearly every combination. `short_leg_target_delta`
-showed a modest, still win-rate-stable improvement moving from 0.17 to
-0.20 (win rate 80.8% vs 78.8%, positive average P&L both ways) — applied
-via `.env` before the first live cycle. Deltas further out (0.25) scored
-higher on raw total P&L but mainly by collecting larger premium per trade,
-not by being more reliable, so kept out given the whole point of 0.17 in
-the first place was variance stability over a ~5-trading-day judged
-sample, not long-run EV.
+7-14 alternative — a large, sign-flipping difference (7-14 went net
+negative in several combinations), not a marginal one, so this conclusion
+survives the caveat below. `short_leg_target_delta` initially looked like
+it should move 0.17 → 0.20 (win rate 80.8% vs 78.8%), but a follow-up
+sanity pass against synthetic cases (see `verify_backtest.py`-equivalent
+checks run inline, 2026-08-27) found the strike-selection step (round the
+Black-Scholes-implied strike to the nearest $1, an already-disclosed proxy
+for a real listed-strike ladder) carries real, quantified error — up to a
+34-47% relative delta miss at the production 15-day DTE midpoint for the
+basket's lower-priced names (e.g. CMCSA, ~$35-45). That's the same order
+of magnitude as the 0.17-vs-0.20 difference itself, so that specific
+result is **not trustworthy** and was reverted — `short_leg_target_delta`
+stayed at **0.17**. Recorded here rather than quietly fixed, since the
+first version of this note (now corrected) stated the 0.20 bump with more
+confidence than the underlying check actually supported.
 
 ## Honest scope notes
 
