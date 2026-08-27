@@ -3,6 +3,10 @@
 import { useEffect, useState } from 'react';
 import { Shell } from '@/components/Shell';
 import { EquitySparkline } from '@/components/EquitySparkline';
+import { KpiRow } from '@/components/KpiRow';
+import { RiskGatesPanel } from '@/components/RiskGatesPanel';
+import { StatusBadges } from '@/components/StatusBadges';
+import { computeKpis } from '@/lib/stats';
 
 interface DashboardState {
   latestSnapshot: {
@@ -87,9 +91,12 @@ export default function DashboardPage() {
   const { latestSnapshot, spreads, cycles, equityCurve } = state;
   const openSpreads = spreads.filter((s) => s.status === 'open');
   const closedSpreads = spreads.filter((s) => s.status !== 'open');
+  const kpis = computeKpis(spreads);
 
   return (
     <Shell>
+      <StatusBadges lastCycleAt={cycles[0]?.ran_at ?? null} />
+      {latestSnapshot && <KpiRow kpis={kpis} />}
       {!latestSnapshot ? (
         <p className="text-gray-500 text-sm">
           No account snapshots yet — the agent hasn&apos;t run its first cycle. Check back once the
@@ -167,6 +174,8 @@ export default function DashboardPage() {
           )}
         </>
       )}
+
+      <RiskGatesPanel />
 
       <section>
         <h2 className="text-sm font-semibold text-gray-300 mb-2">Recent agent decisions</h2>
