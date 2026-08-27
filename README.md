@@ -82,6 +82,33 @@ equities bot).
 | `config.py` | All tunables, env-overridable, defaults explained inline |
 | `screening/`, `signals/` | Vendored from `trading_bot/` — unmodified |
 
+## Parameter optimization pass (`backtest_optimize.py`)
+
+Run once, 2026-08-27, before the first live trading day. Reuses the REAL
+signal-generation logic (a documented frozen port of `signals.swing`'s
+per-symbol scoring, since that function fetches live data internally and
+can't be pointed at an arbitrary past date), the REAL `TrendFilter`, and
+the REAL volatility-percentile filter against REAL historical daily bars
+(`trading_bot/backtest/data.py`'s `HistoricalDataLoader`, unmodified) — but
+simulates spread economics with Black-Scholes theoretical pricing on the
+same realized-vol proxy the live bot uses, since real historical option
+chain prices aren't available on this account (same limitation as the live
+bot's own delta calculation — see below). This compares our own parameter
+choices against each other on one consistent, honest proxy; it is **not**
+a market-realistic options backtest, and it doesn't simulate the
+concurrent-spread portfolio cap or the LLM selection step.
+
+Result on a 12-symbol liquid basket over ~2 years (104 real entry events):
+the 10-21 DTE window (the 2026-08-26 research pass) held up well against a
+7-14 alternative across nearly every combination. `short_leg_target_delta`
+showed a modest, still win-rate-stable improvement moving from 0.17 to
+0.20 (win rate 80.8% vs 78.8%, positive average P&L both ways) — applied
+via `.env` before the first live cycle. Deltas further out (0.25) scored
+higher on raw total P&L but mainly by collecting larger premium per trade,
+not by being more reliable, so kept out given the whole point of 0.17 in
+the first place was variance stability over a ~5-trading-day judged
+sample, not long-run EV.
+
 ## Honest scope notes
 
 - **No broker-supplied Greeks.** Verified live against the real hackathon
