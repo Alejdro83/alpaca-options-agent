@@ -16,7 +16,7 @@ import uuid
 from datetime import datetime, timezone
 
 from mcp_client import AlpacaMCP
-from spread_builder import SpreadPlan
+from spread_builder import IronCondorPlan, SpreadPlan
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +112,115 @@ async def close_spread(mcp: AlpacaMCP, short_symbol: str, long_symbol: str, cont
     order_ids = _extract_order_ids(result)
     logger.info("Closed spread (%s / %s): orders %s", short_symbol, long_symbol, order_ids)
     return order_ids
+
+
+async def open_iron_condor(mcp: AlpacaMCP, plan: IronCondorPlan, contracts: int = 1) -> list[str]:
+    """Opens the iron condor as ONE 4-leg multi-leg order (sell both short
+    legs, buy both long legs simultaneously) — confirmed live via
+    `session.list_tools()` that `place_option_order`'s `legs` array supports
+    up to 4 entries, so this needs no second order the way a naive
+    "two separate verticals" implementation would, and keeps the same
+    fill-all-or-nothing guarantee `open_spread` relies on for two legs.
+    """
+    short_put_cid = _make_client_order_id(plan.underlying, plan.direction)
+    long_put_cid = _make_client_order_id(plan.underlying, plan.direction)
+    short_call_cid = _make_client_order_id(plan.underlying, plan.direction)
+    long_call_cid = _make_client_order_id(plan.underlying, plan.direction)
+    logger.info(
+        "client_order_ids for %s %s: short_put=%s long_put=%s short_call=%s long_call=%s",
+        plan.underlying, plan.direction, short_put_cid, long_put_cid, short_call_cid, long_call_cid,
+    )
+
+    result = await mcp.call(
+        "place_option_order",
+        {
+            "legs": [
+                {"symbol": plan.short_put_symbol, "side": "sell", "ratio_qty": "1", "position_intent": "sell_to_open", "client_order_id": short_put_cid},
+                {"symbol": plan.long_put_symbol, "side": "buy", "ratio_qty": "1", "position_intent": "buy_to_open", "client_order_id": long_put_cid},
+                {"symbol": plan.short_call_symbol, "side": "sell", "ratio_qty": "1", "position_intent": "sell_to_open", "client_order_id": short_call_cid},
+                {"symbol": plan.long_call_symbol, "side": "buy", "ratio_qty": "1", "position_intent": "buy_to_open", "client_order_id": long_call_cid},
+            ],
+            "qty": str(contracts),
+            "order_class": "mleg",
+            "type": "market",  # TODO: support limit orders for better fill control
+            "time_in_force": "day",
+        },
+    )
+    order_ids = _extract_order_ids(result)
+    logger.info("Opened %s iron condor: orders %s", plan.underlying, order_ids)
+    return order_ids
+
+
+async def close_iron_condor(
+    mcp: AlpacaMCP,
+    short_put_symbol: str,
+    long_put_symbol: str,
+    short_call_symbol: str,
+    long_call_symbol: str,
+    contracts: int,
+) -> list[str]:
+    """Reverses all 4 legs in one multi-leg order — same fill-together
+    reasoning as `close_spread`, just twice as many legs.
+    """
+    result = await mcp.call(
+        "place_option_order",
+        {
+            "legs": [
+                {"symbol": short_put_symbol, "side": "buy", "ratio_qty": "1", "position_intent": "buy_to_close"},
+                {"symbol": long_put_symbol, "side": "sell", "ratio_qty": "1", "position_intent": "sell_to_close"},
+                {"symbol": short_call_symbol, "side": "buy", "ratio_qty": "1", "position_intent": "buy_to_close"},
+                {"symbol": long_call_symbol, "side": "sell", "ratio_qty": "1", "position_intent": "sell_to_close"},
+            ],
+            "qty": str(contracts),
+            "order_class": "mleg",
+            "type": "market",
+            "time_in_force": "day",
+        },
+    )
+    order_ids = _extract_order_ids(result)
+    logger.info(
+        "Closed iron condor (%s / %s / %s / %s): orders %s",
+        short_put_symbol, long_put_symbol, short_call_symbol, long_call_symbol, order_ids,
+    )
+    return order_ids
+
+
+async def get_iron_condor_mark(
+    mcp: AlpacaMCP,
+    short_put_symbol: str,
+    long_put_symbol: str,
+    short_call_symbol: str,
+    long_call_symbol: str,
+) -> float | None:
+    """Current cost to close (debit) both sides, for risk_gate.should_close
+    — one `get_option_snapshot` call for all 4 symbols (same batching
+    `get_spread_mark` does for 2), mark = (short_put_ask - long_put_bid) +
+    (short_call_ask - long_call_bid).
+    """
+    symbols = [short_put_symbol, long_put_symbol, short_call_symbol, long_call_symbol]
+    result = await mcp.call(
+        "get_option_snapshot",
+        {"symbols": ",".join(symbols), "feed": "indicative"},
+    )
+    snap_by_symbol = (result or {}).get("data", {}).get("snapshots", {})
+
+    quotes = {}
+    for sym in symbols:
+        q = snap_by_symbol.get(sym, {}).get("latestQuote", {})
+        if not q:
+            return None
+        quotes[sym] = q
+
+    short_put_ask = quotes[short_put_symbol].get("ap")
+    long_put_bid = quotes[long_put_symbol].get("bp")
+    short_call_ask = quotes[short_call_symbol].get("ap")
+    long_call_bid = quotes[long_call_symbol].get("bp")
+    if None in (short_put_ask, long_put_bid, short_call_ask, long_call_bid):
+        return None
+
+    put_side_debit = float(short_put_ask) - float(long_put_bid)
+    call_side_debit = float(short_call_ask) - float(long_call_bid)
+    return round((put_side_debit + call_side_debit) * 100, 2)
 
 
 async def get_spread_mark(mcp: AlpacaMCP, short_symbol: str, long_symbol: str) -> float | None:

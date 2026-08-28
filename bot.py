@@ -45,7 +45,7 @@ import executor_mcp
 import llm_reasoner
 import risk_gate
 from mcp_client import AlpacaMCP
-from spread_builder import SpreadPlan, _mid_from_snapshot, build_spread
+from spread_builder import IronCondorPlan, SpreadPlan, _mid_from_snapshot, build_iron_condor, build_spread
 
 from pathlib import Path
 import json as _json
@@ -148,10 +148,18 @@ def _fetch_daily_bars(client: AlpacaClient, ticker: str) -> pd.DataFrame:
 
 
 def _apply_trend_and_volatility_filters(client: AlpacaClient, signals: list) -> list[tuple]:
-    """Returns (signal, realized_vol) pairs for survivors — realized_vol is
-    the annualized estimate `spread_builder.build_spread` feeds into
+    """Returns (signal, realized_vol, trend_direction) triples for
+    survivors — realized_vol is the annualized estimate
+    `spread_builder.build_spread`/`build_iron_condor` feed into
     `black_scholes.bs_delta` as the IV proxy, computed here (not re-fetched
     later) since this is already pulling the daily bars it needs.
+    `trend_direction` ('bullish'/'bearish'/'neutral', straight from
+    TrendFilterResult) used to be discarded here after only reading
+    `.allowed` — now threaded through so find_candidates() can route a
+    'neutral' result (the higher-timeframe trend never actually confirmed
+    the swing model's guessed direction) to build_iron_condor instead of
+    blindly building a directional vertical off a signal direction with no
+    trend backing it.
 
     Two passes: trend filter first (unchanged), then the volatility filter
     with an adaptive threshold — see config.VolatilityFilter's docstring.
@@ -160,7 +168,7 @@ def _apply_trend_and_volatility_filters(client: AlpacaClient, signals: list) -> 
     board (relax) versus this one ticker just being quiet (still reject).
     """
     trend_filter = TrendFilter()
-    trend_survivors: list[tuple] = []  # (sig, bars_df)
+    trend_survivors: list[tuple] = []  # (sig, bars_df, trend_direction)
     for sig in signals:
         try:
             bars_df = _fetch_daily_bars(client, sig.ticker)
@@ -182,19 +190,25 @@ def _apply_trend_and_volatility_filters(client: AlpacaClient, signals: list) -> 
         try:
             trend_result = trend_filter.check(bars_df, sig.direction)
             trend_allowed = trend_result.allowed
+            trend_direction = trend_result.trend_direction
         except Exception:
             logger.exception("Trend filter failed for %s, allowing", sig.ticker)
             trend_allowed = True
+            # Unknown trend on a filter failure is treated the same as a
+            # confirmed-neutral trend (route to an iron condor, no directional
+            # view required) rather than silently trusting the swing model's
+            # own guessed direction with zero trend confirmation behind it.
+            trend_direction = "neutral"
         if not trend_allowed:
             continue
 
-        trend_survivors.append((sig, bars_df))
+        trend_survivors.append((sig, bars_df, trend_direction))
 
     min_percentile = _vol("min_percentile")
 
     if _vol("enabled") and trend_survivors:
         percentiles: list[float] = []
-        for sig, bars_df in trend_survivors:
+        for sig, bars_df, _trend_direction in trend_survivors:
             try:
                 pct = _realized_vol_percentile(bars_df)
             except Exception:
@@ -216,7 +230,7 @@ def _apply_trend_and_volatility_filters(client: AlpacaClient, signals: list) -> 
                 min_percentile = _vol("relaxed_min_percentile")
 
     kept = []
-    for sig, bars_df in trend_survivors:
+    for sig, bars_df, trend_direction in trend_survivors:
         if _vol("enabled"):
             try:
                 pct = _realized_vol_percentile(bars_df)
@@ -231,7 +245,7 @@ def _apply_trend_and_volatility_filters(client: AlpacaClient, signals: list) -> 
                 continue
 
         realized_vol = black_scholes.realized_vol_from_bars(bars_df)
-        kept.append((sig, realized_vol))
+        kept.append((sig, realized_vol, trend_direction))
     return kept
 
 
@@ -250,8 +264,24 @@ async def manage_open_spreads(mcp: AlpacaMCP) -> list[str]:
         expiration = datetime.strptime(str(spread["expiration"]), "%Y-%m-%d").date()
         force_close, force_reason = risk_gate.should_force_close(expiration=expiration)
 
+        # `strategy` defaults to 'vertical' at the DB column level, but an
+        # old row read back with a driver that doesn't apply column
+        # defaults on select (or any future strategy value this code
+        # doesn't yet know) must still fall onto the pre-existing 2-symbol
+        # path rather than erroring or silently doing nothing.
+        is_iron_condor = spread.get("strategy") == "iron_condor"
+
         try:
-            mark = await executor_mcp.get_spread_mark(mcp, spread["short_symbol"], spread["long_symbol"])
+            if is_iron_condor:
+                mark = await executor_mcp.get_iron_condor_mark(
+                    mcp,
+                    short_put_symbol=spread["short_symbol"],
+                    long_put_symbol=spread["long_symbol"],
+                    short_call_symbol=spread["call_short_symbol"],
+                    long_call_symbol=spread["call_long_symbol"],
+                )
+            else:
+                mark = await executor_mcp.get_spread_mark(mcp, spread["short_symbol"], spread["long_symbol"])
         except Exception:
             logger.exception("Failed to get mark for spread %s", spread["id"])
             if not force_close:
@@ -270,12 +300,22 @@ async def manage_open_spreads(mcp: AlpacaMCP) -> list[str]:
         if not should_close:
             continue
         try:
-            await executor_mcp.close_spread(
-                mcp,
-                short_symbol=spread["short_symbol"],
-                long_symbol=spread["long_symbol"],
-                contracts=spread["contracts"],
-            )
+            if is_iron_condor:
+                await executor_mcp.close_iron_condor(
+                    mcp,
+                    short_put_symbol=spread["short_symbol"],
+                    long_put_symbol=spread["long_symbol"],
+                    short_call_symbol=spread["call_short_symbol"],
+                    long_call_symbol=spread["call_long_symbol"],
+                    contracts=spread["contracts"],
+                )
+            else:
+                await executor_mcp.close_spread(
+                    mcp,
+                    short_symbol=spread["short_symbol"],
+                    long_symbol=spread["long_symbol"],
+                    contracts=spread["contracts"],
+                )
             if mark is None:
                 # Force-closed without ever getting a fresh mark (quote fetch
                 # failed) — still worth closing out ahead of expiration/the
@@ -319,14 +359,21 @@ async def find_candidates(
     candidates = []
     gate_rejections: list[dict] = []
 
-    tickers_for_quotes = [sig.ticker for sig, _ in signals_with_vol]
+    tickers_for_quotes = [sig.ticker for sig, _, _ in signals_with_vol]
     try:
         snapshots = client.get_snapshots(tickers_for_quotes) if tickers_for_quotes else {}
     except Exception:
         logger.exception("Failed to batch-fetch snapshots, falling back to per-symbol quotes")
         snapshots = {}
 
-    for sig, realized_vol in signals_with_vol:
+    for sig, realized_vol, trend_direction in signals_with_vol:
+        # A 'neutral' higher-timeframe trend never actually confirmed the
+        # swing model's guessed direction (see TrendFilter.check and this
+        # function's own docstring) -- exactly the candidates the pipeline
+        # used to spend a full build_spread() call on anyway, trading on a
+        # direction nothing backed. Route those to an iron condor instead,
+        # which needs no directional view at all.
+        is_iron_condor = trend_direction == "neutral"
         try:
             snap = snapshots.get(sig.ticker)
             if snap and snap.get("latest_ask") is not None and snap.get("latest_bid") is not None:
@@ -334,9 +381,15 @@ async def find_candidates(
             else:
                 spot = client.get_latest_quote(sig.ticker)
                 spot_mid = (spot["ask_price"] + spot["bid_price"]) / 2
-            plan = await build_spread(mcp, sig.ticker, sig.direction, spot_price=spot_mid, realized_vol=realized_vol)
+            if is_iron_condor:
+                plan = await build_iron_condor(mcp, sig.ticker, spot_price=spot_mid, realized_vol=realized_vol)
+            else:
+                plan = await build_spread(mcp, sig.ticker, sig.direction, spot_price=spot_mid, realized_vol=realized_vol)
         except Exception:
-            logger.exception("Failed to build spread for %s", sig.ticker)
+            logger.exception(
+                "Failed to build %s for %s",
+                "iron condor" if is_iron_condor else "spread", sig.ticker,
+            )
             continue
         if plan is None:
             continue
@@ -356,9 +409,15 @@ async def find_candidates(
             continue
         candidates.append({
             "ticker": sig.ticker,
-            "direction": sig.direction,
-            "strength": sig.strength,
-            "signal_reasoning": sig.reasoning,
+            "strategy": "iron_condor" if is_iron_condor else "vertical",
+            # direction/strength/signal_reasoning come from the directional
+            # swing signal -- meaningless for an iron condor (it has no
+            # directional view by construction), so left None rather than
+            # showing the LLM a guessed direction the trend filter didn't
+            # confirm.
+            "direction": None if is_iron_condor else sig.direction,
+            "strength": None if is_iron_condor else sig.strength,
+            "signal_reasoning": None if is_iron_condor else sig.reasoning,
             "credit_estimate": plan.credit_estimate,
             "max_loss": plan.max_loss,
             "expiration": plan.expiration.isoformat(),
@@ -468,17 +527,136 @@ async def _pre_trade_check(
     return True, None, updated_plan
 
 
+async def _pre_trade_check_iron_condor(
+    mcp: AlpacaMCP,
+    plan: IronCondorPlan,
+    account: dict,
+    open_count: int,
+) -> tuple[bool, str | None, IronCondorPlan]:
+    """Same last-second-validation discipline as `_pre_trade_check`, applied
+    to all 4 iron condor legs in one snapshot call instead of 2: fresh
+    quotes required on every leg, a >15min-stale quote on ANY leg hard-
+    blocks (same real bug this guards against as the vertical path — see
+    `_pre_trade_check`'s docstring), credit shrink and non-positive
+    max_loss re-checked against fresh mids, and the risk gate re-run.
+    """
+    symbols = [plan.short_put_symbol, plan.long_put_symbol, plan.short_call_symbol, plan.long_call_symbol]
+    result = await mcp.call(
+        "get_option_snapshot",
+        {"symbols": ",".join(symbols), "feed": "indicative"},
+    )
+    snap_by_symbol = (result or {}).get("data", {}).get("snapshots", {})
+    legs = [
+        ("short put", plan.short_put_symbol),
+        ("long put", plan.long_put_symbol),
+        ("short call", plan.short_call_symbol),
+        ("long call", plan.long_call_symbol),
+    ]
+
+    snaps = {sym: snap_by_symbol.get(sym, {}) for _, sym in legs}
+    mids = {}
+    for label, sym in legs:
+        mid = _mid_from_snapshot(snaps[sym])
+        if mid is None:
+            return False, f"fresh quote unavailable for {label} leg ({sym})", plan
+        mids[sym] = mid
+
+    now = datetime.now(timezone.utc)
+    for label, sym in legs:
+        ts_str = snaps[sym].get("latestQuote", {}).get("t")
+        if ts_str:
+            try:
+                quote_ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                age = now - quote_ts
+                if age > timedelta(minutes=15):
+                    return False, f"{label} leg quote is {age} old (>15 min) — stale, refusing to trade on it", plan
+            except (ValueError, TypeError):
+                pass
+
+    fresh_put_credit = round((mids[plan.short_put_symbol] - mids[plan.long_put_symbol]) * 100, 2)
+    fresh_call_credit = round((mids[plan.short_call_symbol] - mids[plan.long_call_symbol]) * 100, 2)
+    if fresh_put_credit <= 0 or fresh_call_credit <= 0:
+        return (
+            False,
+            f"fresh credit is non-positive on one side (put ${fresh_put_credit:.2f}, call ${fresh_call_credit:.2f})",
+            plan,
+        )
+    fresh_credit = round(fresh_put_credit + fresh_call_credit, 2)
+
+    shrink_pct = (plan.credit_estimate - fresh_credit) / plan.credit_estimate
+    if shrink_pct > 0.20:
+        return (
+            False,
+            f"credit shrank {shrink_pct:.0%} (original ${plan.credit_estimate:.2f} → fresh ${fresh_credit:.2f})",
+            plan,
+        )
+
+    put_width_dollars = abs(plan.short_put_strike - plan.long_put_strike) * 100
+    call_width_dollars = abs(plan.short_call_strike - plan.long_call_strike) * 100
+    if round(put_width_dollars, 2) != round(call_width_dollars, 2):
+        # Should never happen (build_iron_condor already refuses unequal
+        # widths), but the max_loss formula below is only valid if it holds
+        # -- re-checked here rather than assumed on a plan built earlier.
+        return False, "put/call widths no longer match on re-check, refusing to trade", plan
+
+    updated_max_loss = round(put_width_dollars - fresh_credit, 2)
+    if updated_max_loss <= 0:
+        # Same sanity check as spread_builder.build_iron_condor — a fresh
+        # requote can hit this too, not just the initial build.
+        return False, f"fresh max_loss is non-positive (${updated_max_loss:.2f}), refusing to trade", plan
+
+    updated_plan = IronCondorPlan(
+        underlying=plan.underlying,
+        direction=plan.direction,
+        expiration=plan.expiration,
+        short_put_strike=plan.short_put_strike,
+        long_put_strike=plan.long_put_strike,
+        short_call_strike=plan.short_call_strike,
+        long_call_strike=plan.long_call_strike,
+        short_put_symbol=plan.short_put_symbol,
+        long_put_symbol=plan.long_put_symbol,
+        short_call_symbol=plan.short_call_symbol,
+        long_call_symbol=plan.long_call_symbol,
+        credit_estimate=fresh_credit,
+        max_loss=updated_max_loss,
+    )
+
+    today = now.date()
+    check = risk_gate.check_new_spread(
+        equity=float(account["equity"]),
+        daily_pl_pct=float(account.get("daily_pl_pct") or 0.0),
+        open_spreads_count=open_count,
+        max_loss=updated_max_loss,
+        expiration=plan.expiration,
+        today=today,
+    )
+    if not check.allowed:
+        return False, f"risk gate rejected on fresh quotes: {check.reasons}", updated_plan
+
+    return True, None, updated_plan
+
+
 def _shadow_select(candidates: list[dict], remaining_budget: int) -> list[str]:
-    """Mechanical baseline: rank by strength * (credit/max_loss), pick top N."""
+    """Mechanical baseline: rank by strength * (credit/max_loss), pick top N.
+
+    Real bug caught while wiring up iron condors: `strength` is explicitly
+    `None` (not absent) on an iron_condor candidate (see find_candidates —
+    it has no directional signal by construction), so `c.get("strength", 0)`
+    returned `None`, not the intended `0` default, and `strength * rr` would
+    have raised TypeError the first time an iron condor reached here. An
+    iron condor has no directional conviction to weigh, so it's scored on
+    risk/reward alone — same framing given to the LLM in llm_reasoner's
+    SYSTEM_PROMPT.
+    """
     if not candidates or remaining_budget <= 0:
         return []
     scored = []
     for c in candidates:
         credit = c.get("credit_estimate", 0)
         max_loss = c.get("max_loss", 1)
-        strength = c.get("strength", 0)
         rr = credit / max_loss if max_loss > 0 else 0
-        score = strength * rr
+        strength = c.get("strength")
+        score = rr if strength is None else strength * rr
         scored.append((c["ticker"], score))
     scored.sort(key=lambda x: x[1], reverse=True)
     return [ticker for ticker, _ in scored[:remaining_budget]]
@@ -568,10 +746,16 @@ async def run_cycle() -> None:
                 if c["ticker"] not in selected_tickers:
                     continue
                 plan = c["_plan"]
+                is_iron_condor = plan.direction == "iron_condor"
                 try:
-                    allowed, reason, plan = await _pre_trade_check(
-                        mcp, plan, account, len(open_spreads),
-                    )
+                    if is_iron_condor:
+                        allowed, reason, plan = await _pre_trade_check_iron_condor(
+                            mcp, plan, account, len(open_spreads),
+                        )
+                    else:
+                        allowed, reason, plan = await _pre_trade_check(
+                            mcp, plan, account, len(open_spreads),
+                        )
                     if not allowed:
                         logger.info("Pre-trade check blocked %s: %s", plan.underlying, reason)
                         open_notes.append(f"Pre-trade check blocked {plan.underlying}: {reason}")
@@ -593,23 +777,49 @@ async def run_cycle() -> None:
                         print("KILL SWITCH ACTIVE — aborting remaining opens")
                         break
 
-                    order_ids = await executor_mcp.open_spread(mcp, plan, contracts=contracts)
+                    if is_iron_condor:
+                        order_ids = await executor_mcp.open_iron_condor(mcp, plan, contracts=contracts)
+                    else:
+                        order_ids = await executor_mcp.open_spread(mcp, plan, contracts=contracts)
                     try:
-                        db.record_spread_open(
-                            underlying=plan.underlying,
-                            direction=plan.direction,
-                            expiration=plan.expiration.isoformat(),
-                            short_strike=plan.short_strike,
-                            long_strike=plan.long_strike,
-                            short_symbol=plan.short_symbol,
-                            long_symbol=plan.long_symbol,
-                            contracts=contracts,
-                            credit_received=plan.credit_estimate,
-                            max_loss=plan.max_loss,
-                            alpaca_order_ids=order_ids,
-                            cycle_id=cycle_id,
-                            generation=_current_generation,
-                        )
+                        if is_iron_condor:
+                            db.record_spread_open(
+                                underlying=plan.underlying,
+                                direction=plan.direction,
+                                expiration=plan.expiration.isoformat(),
+                                short_strike=plan.short_put_strike,
+                                long_strike=plan.long_put_strike,
+                                short_symbol=plan.short_put_symbol,
+                                long_symbol=plan.long_put_symbol,
+                                contracts=contracts,
+                                credit_received=plan.credit_estimate,
+                                max_loss=plan.max_loss,
+                                alpaca_order_ids=order_ids,
+                                cycle_id=cycle_id,
+                                generation=_current_generation,
+                                strategy="iron_condor",
+                                call_short_strike=plan.short_call_strike,
+                                call_long_strike=plan.long_call_strike,
+                                call_short_symbol=plan.short_call_symbol,
+                                call_long_symbol=plan.long_call_symbol,
+                            )
+                        else:
+                            db.record_spread_open(
+                                underlying=plan.underlying,
+                                direction=plan.direction,
+                                expiration=plan.expiration.isoformat(),
+                                short_strike=plan.short_strike,
+                                long_strike=plan.long_strike,
+                                short_symbol=plan.short_symbol,
+                                long_symbol=plan.long_symbol,
+                                contracts=contracts,
+                                credit_received=plan.credit_estimate,
+                                max_loss=plan.max_loss,
+                                alpaca_order_ids=order_ids,
+                                cycle_id=cycle_id,
+                                generation=_current_generation,
+                                strategy="vertical",
+                            )
                     except Exception:
                         logger.exception("Failed to record spread open to DB (order already sent to Alpaca)")
                     open_notes.append(

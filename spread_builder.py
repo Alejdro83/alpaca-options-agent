@@ -59,6 +59,31 @@ class SpreadPlan:
     max_loss: float
 
 
+@dataclass
+class IronCondorPlan:
+    """A put credit spread and a call credit spread at the same expiration,
+    same width, sold simultaneously — profits if the underlying stays
+    between the two short strikes through expiration, no directional view
+    required. `direction` is hardcoded to the literal "iron_condor" (not a
+    real long/short signal direction) so it flows through the existing
+    `plan.direction`-keyed code paths (DB `direction` column, log messages,
+    dashboard labels) with minimal special-casing elsewhere.
+    """
+    underlying: str
+    direction: str  # always "iron_condor"
+    expiration: date
+    short_put_strike: float
+    long_put_strike: float
+    short_call_strike: float
+    long_call_strike: float
+    short_put_symbol: str
+    long_put_symbol: str
+    short_call_symbol: str
+    long_call_symbol: str
+    credit_estimate: float
+    max_loss: float
+
+
 def _mid_from_snapshot(snap: dict) -> float | None:
     quote = snap.get("latestQuote")
     if not quote:
@@ -133,6 +158,84 @@ async def _fetch_snapshots(mcp: AlpacaMCP, symbols: list[str]) -> dict[str, dict
     return (result or {}).get("data", {}).get("snapshots", {})
 
 
+def _select_vertical_leg(
+    ticker: str,
+    option_type: str,
+    exp_contracts: list[dict],
+    snap_by_symbol: dict[str, dict],
+    spot_price: float,
+    dte_days: int,
+    realized_vol: float,
+    is_lower_long: bool,
+) -> tuple[dict, dict, float, float, float] | None:
+    """Shared strike-selection + liquidity logic for one side of a vertical
+    (either a standalone bull put/bear call, or one wing of an iron condor).
+    `is_lower_long` is True when the long leg sits BELOW the short strike
+    (a put side: further OTM = lower), False when it sits above (a call
+    side: further OTM = higher).
+
+    Returns (short_contract, long_contract, short_strike, long_strike,
+    credit_estimate) or None if no liquid/quotable pair exists for this
+    side — never a half-built leg.
+    """
+    limits = config.risk
+
+    def delta_of(contract: dict) -> float:
+        strike = float(contract["strike_price"])
+        return abs(bs_delta(
+            spot=spot_price, strike=strike, dte_days=dte_days,
+            volatility=realized_vol, option_type=option_type,
+        ))
+
+    liquid_candidates = [
+        (c, delta_of(c)) for c in exp_contracts
+        if _passes_liquidity(c, snap_by_symbol.get(c["symbol"], {}))
+    ]
+    if not liquid_candidates:
+        logger.info(
+            "%s %s chain has %d strikes but none pass the liquidity gate "
+            "(min OI %d, max spread %.0f%%), skipping",
+            ticker, option_type, len(exp_contracts),
+            limits.min_open_interest, limits.max_bid_ask_spread_pct * 100,
+        )
+        return None
+
+    liquid_candidates.sort(key=lambda cd: abs(cd[1] - limits.short_leg_target_delta))
+    short_contract, _ = liquid_candidates[0]
+    short_strike = float(short_contract["strike_price"])
+
+    # Long leg: `spread_width_dollars` further out-of-the-money than the
+    # short strike — lower strike for a put spread (further OTM = lower),
+    # higher strike for a call spread (further OTM = higher).
+    target_long_strike = (
+        short_strike - limits.spread_width_dollars
+        if is_lower_long
+        else short_strike + limits.spread_width_dollars
+    )
+    same_exp_by_strike = {float(c["strike_price"]): c for c in exp_contracts}
+    if target_long_strike not in same_exp_by_strike:
+        # Snap to the closest available strike rather than failing outright —
+        # standard option chains aren't guaranteed to have every $5 increment.
+        closest_strike = min(same_exp_by_strike, key=lambda k: abs(k - target_long_strike))
+        target_long_strike = closest_strike
+    long_contract = same_exp_by_strike[target_long_strike]
+
+    long_snap = snap_by_symbol.get(long_contract["symbol"], {})
+    if not _passes_liquidity(long_contract, long_snap, max_spread_override=LONG_LEG_MAX_SPREAD_PCT):
+        logger.info("%s long %s leg (%s) fails the liquidity gate, skipping", ticker, option_type, long_contract["symbol"])
+        return None
+
+    short_snap = snap_by_symbol.get(short_contract["symbol"], {})
+    short_mid = _mid_from_snapshot(short_snap)
+    long_mid = _mid_from_snapshot(long_snap)
+    if short_mid is None or long_mid is None:
+        logger.warning("Missing quotes for %s %s leg, skipping", ticker, option_type)
+        return None
+
+    credit_estimate = round((short_mid - long_mid) * 100, 2)  # per 1 contract, $ not cents
+    return short_contract, long_contract, short_strike, target_long_strike, credit_estimate
+
+
 async def build_spread(
     mcp: AlpacaMCP,
     ticker: str,
@@ -170,59 +273,14 @@ async def build_spread(
     symbols = [c["symbol"] for c in exp_contracts]
     snap_by_symbol = await _fetch_snapshots(mcp, symbols)
 
-    def delta_of(contract: dict) -> float:
-        strike = float(contract["strike_price"])
-        return abs(bs_delta(
-            spot=spot_price, strike=strike, dte_days=dte_days,
-            volatility=realized_vol, option_type=option_type,
-        ))
-
-    liquid_candidates = [
-        (c, delta_of(c)) for c in exp_contracts
-        if _passes_liquidity(c, snap_by_symbol.get(c["symbol"], {}))
-    ]
-    if not liquid_candidates:
-        logger.info(
-            "%s %s chain has %d strikes but none pass the liquidity gate "
-            "(min OI %d, max spread %.0f%%), skipping",
-            ticker, chosen_expiration, len(exp_contracts),
-            limits.min_open_interest, limits.max_bid_ask_spread_pct * 100,
-        )
-        return None
-
-    liquid_candidates.sort(key=lambda cd: abs(cd[1] - limits.short_leg_target_delta))
-    short_contract, _ = liquid_candidates[0]
-    short_strike = float(short_contract["strike_price"])
-
-    # Long leg: `spread_width_dollars` further out-of-the-money than the
-    # short strike — lower strike for a put spread (further OTM = lower),
-    # higher strike for a call spread (further OTM = higher).
-    target_long_strike = (
-        short_strike - limits.spread_width_dollars
-        if is_bull_put
-        else short_strike + limits.spread_width_dollars
+    leg = _select_vertical_leg(
+        ticker, option_type, exp_contracts, snap_by_symbol,
+        spot_price, dte_days, realized_vol, is_lower_long=is_bull_put,
     )
-    same_exp_by_strike = {float(c["strike_price"]): c for c in exp_contracts}
-    if target_long_strike not in same_exp_by_strike:
-        # Snap to the closest available strike rather than failing outright —
-        # standard option chains aren't guaranteed to have every $5 increment.
-        closest_strike = min(same_exp_by_strike, key=lambda k: abs(k - target_long_strike))
-        target_long_strike = closest_strike
-    long_contract = same_exp_by_strike[target_long_strike]
-
-    long_snap = snap_by_symbol.get(long_contract["symbol"], {})
-    if not _passes_liquidity(long_contract, long_snap, max_spread_override=LONG_LEG_MAX_SPREAD_PCT):
-        logger.info("%s long leg (%s) fails the liquidity gate, skipping", ticker, long_contract["symbol"])
+    if leg is None:
         return None
+    short_contract, long_contract, short_strike, target_long_strike, credit_estimate = leg
 
-    short_snap = snap_by_symbol.get(short_contract["symbol"], {})
-    short_mid = _mid_from_snapshot(short_snap)
-    long_mid = _mid_from_snapshot(long_snap)
-    if short_mid is None or long_mid is None:
-        logger.warning("Missing quotes for %s spread legs, skipping", ticker)
-        return None
-
-    credit_estimate = round((short_mid - long_mid) * 100, 2)  # per 1 contract, $ not cents
     width_dollars = abs(short_strike - target_long_strike) * 100
     max_loss = round(width_dollars - credit_estimate, 2)
 
@@ -252,6 +310,150 @@ async def build_spread(
         long_strike=target_long_strike,
         short_symbol=short_contract["symbol"],
         long_symbol=long_contract["symbol"],
+        credit_estimate=credit_estimate,
+        max_loss=max_loss,
+    )
+
+
+async def build_iron_condor(
+    mcp: AlpacaMCP,
+    ticker: str,
+    spot_price: float,
+    realized_vol: float,
+) -> IronCondorPlan | None:
+    """Builds a put credit spread AND a call credit spread at the SAME
+    expiration, sold together as one structure — for candidates where the
+    higher-timeframe trend filter came back 'neutral' (no directional edge
+    confirmed), which today are discarded by `build_spread`'s caller having
+    nothing directional to act on. Reuses every liquidity/delta/strike-width
+    rule `build_spread` already applies, independently on each side, via
+    `_select_vertical_leg`.
+
+    Returns None (never a half-built structure) if either side fails its
+    liquidity/credit gate, if the two sides can't agree on a common
+    expiration, or if the resulting max_loss isn't positive — exactly the
+    same "a skipped cycle is safer than a guessed one" discipline as
+    `build_spread`.
+    """
+    limits = config.risk
+    today = datetime.now(timezone.utc).date()
+    min_exp = today + timedelta(days=limits.min_dte)
+    max_exp = today + timedelta(days=limits.max_dte)
+
+    put_contracts = await _fetch_contracts(mcp, ticker, "put", min_exp, max_exp)
+    call_contracts = await _fetch_contracts(mcp, ticker, "call", min_exp, max_exp)
+    if not put_contracts or not call_contracts:
+        logger.info(
+            "%s missing %s contracts in [%s, %s], can't build an iron condor",
+            ticker, "puts" if not put_contracts else "calls", min_exp, max_exp,
+        )
+        return None
+
+    # Both sides must share one expiration -- pick the nearest one listed on
+    # BOTH the put and call chains (in practice these almost always match,
+    # but never assumed).
+    put_expirations = {c["expiration_date"] for c in put_contracts}
+    call_expirations = {c["expiration_date"] for c in call_contracts}
+    common_expirations = sorted(put_expirations & call_expirations)
+    if not common_expirations:
+        logger.info(
+            "%s has no expiration listed on both put and call chains in [%s, %s], skipping iron condor",
+            ticker, min_exp, max_exp,
+        )
+        return None
+    chosen_expiration = common_expirations[0]
+    dte_days = (datetime.strptime(chosen_expiration, "%Y-%m-%d").date() - today).days
+
+    put_exp_contracts = [c for c in put_contracts if c.get("expiration_date") == chosen_expiration]
+    call_exp_contracts = [c for c in call_contracts if c.get("expiration_date") == chosen_expiration]
+
+    # Real bug caught testing against the live account: `get_option_snapshot`
+    # enforces a hard 100-symbol limit ("HTTP 400: symbol limit is 100").
+    # build_spread never hits this because it only ever asks for one side's
+    # symbols (already bounded under 100 by _fetch_contracts' own `limit:
+    # 100` on get_option_contracts); an iron condor asks for BOTH sides, so
+    # combining put+call symbols into one snapshot call can push past 100 on
+    # a wide chain. Two separate per-side calls keep each request under the
+    # same bound build_spread already relies on, with no new API dependency.
+    put_snap_by_symbol = await _fetch_snapshots(mcp, [c["symbol"] for c in put_exp_contracts])
+    call_snap_by_symbol = await _fetch_snapshots(mcp, [c["symbol"] for c in call_exp_contracts])
+    snap_by_symbol = {**put_snap_by_symbol, **call_snap_by_symbol}
+
+    put_leg = _select_vertical_leg(
+        ticker, "put", put_exp_contracts, snap_by_symbol,
+        spot_price, dte_days, realized_vol, is_lower_long=True,
+    )
+    if put_leg is None:
+        return None
+    call_leg = _select_vertical_leg(
+        ticker, "call", call_exp_contracts, snap_by_symbol,
+        spot_price, dte_days, realized_vol, is_lower_long=False,
+    )
+    if call_leg is None:
+        return None
+
+    short_put, long_put, short_put_strike, long_put_strike, put_credit = put_leg
+    short_call, long_call, short_call_strike, long_call_strike, call_credit = call_leg
+
+    if put_credit <= 0:
+        logger.info("%s iron condor put side has non-positive credit (%.2f), skipping", ticker, put_credit)
+        return None
+    if call_credit <= 0:
+        logger.info("%s iron condor call side has non-positive credit (%.2f), skipping", ticker, call_credit)
+        return None
+
+    # A real, sane iron condor needs its short strikes straddling spot (short
+    # put below, short call above) -- if delta selection on a wild/illiquid
+    # chain ever inverted that, the structure isn't a real condor anymore
+    # and must not reach execution.
+    if short_put_strike >= short_call_strike:
+        logger.warning(
+            "%s iron condor short strikes are inverted or overlapping (short put %.2f >= short call %.2f), skipping",
+            ticker, short_put_strike, short_call_strike,
+        )
+        return None
+
+    put_width = abs(short_put_strike - long_put_strike)
+    call_width = abs(short_call_strike - long_call_strike)
+    # max_loss = width*100 - total credit is only correct because both sides
+    # share the SAME width (both built from config.risk.spread_width_dollars
+    # against the same chain) -- at expiration the underlying can't
+    # simultaneously be below the put spread and above the call spread, so
+    # exactly one side can ever be the loser, and its max loss is offset by
+    # the credit already banked on the side that expired worthless. Enforced
+    # explicitly here (not just assumed) since a strike snapped to the
+    # nearest available increment (see _select_vertical_leg) could in
+    # principle produce unequal widths on a sparse chain.
+    if round(put_width, 2) != round(call_width, 2):
+        logger.warning(
+            "%s iron condor put width (%.2f) != call width (%.2f) -- refusing, "
+            "the max_loss formula assumes equal widths",
+            ticker, put_width, call_width,
+        )
+        return None
+
+    credit_estimate = round(put_credit + call_credit, 2)
+    max_loss = round(put_width * 100 - credit_estimate, 2)
+    if max_loss <= 0:
+        logger.warning(
+            "%s iron condor has non-positive max_loss (%.2f = width %.2f - total credit %.2f) "
+            "-- almost certainly a stale/bad quote, skipping",
+            ticker, max_loss, put_width * 100, credit_estimate,
+        )
+        return None
+
+    return IronCondorPlan(
+        underlying=ticker,
+        direction="iron_condor",
+        expiration=datetime.strptime(chosen_expiration, "%Y-%m-%d").date(),
+        short_put_strike=short_put_strike,
+        long_put_strike=long_put_strike,
+        short_call_strike=short_call_strike,
+        long_call_strike=long_call_strike,
+        short_put_symbol=short_put["symbol"],
+        long_put_symbol=long_put["symbol"],
+        short_call_symbol=short_call["symbol"],
+        long_call_symbol=long_call["symbol"],
         credit_estimate=credit_estimate,
         max_loss=max_loss,
     )

@@ -115,22 +115,37 @@ def record_spread_open(
     alpaca_order_ids: list[str],
     cycle_id: int,
     generation: int = 0,
+    strategy: str = "vertical",
+    call_short_strike: float | None = None,
+    call_long_strike: float | None = None,
+    call_short_symbol: str | None = None,
+    call_long_symbol: str | None = None,
 ) -> int:
+    """`short_strike`/`long_strike`/`short_symbol`/`long_symbol` mean "the
+    only side" for a vertical, and "the PUT side" for an iron condor; the
+    call_* params (all None for a vertical) hold the call side — see
+    supabase/alpaca_hackathon_schema_iron_condor.sql for the migration this
+    matches. `strategy` defaults to 'vertical' to match the DB column's own
+    default, but is passed explicitly here rather than relying on that
+    default alone from the application code.
+    """
     with _connection() as conn, conn.cursor() as cur:
         cur.execute(
             f"""
             insert into {_schema()}.spreads
                 (underlying, direction, expiration, short_strike, long_strike,
                  short_symbol, long_symbol, contracts, credit_received, max_loss,
-                 alpaca_order_ids, cycle_id, status, generation)
-            values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'open', %s)
+                 alpaca_order_ids, cycle_id, status, generation, strategy,
+                 call_short_strike, call_long_strike, call_short_symbol, call_long_symbol)
+            values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'open', %s, %s, %s, %s, %s, %s)
             returning id
             """,
             (
                 underlying, direction, expiration, short_strike, long_strike,
                 short_symbol, long_symbol,
                 contracts, credit_received, max_loss, json.dumps(alpaca_order_ids), cycle_id,
-                generation,
+                generation, strategy,
+                call_short_strike, call_long_strike, call_short_symbol, call_long_symbol,
             ),
         )
         row = cur.fetchone()

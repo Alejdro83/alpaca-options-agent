@@ -35,17 +35,30 @@ MODEL = os.environ.get("REASONER_MODEL", "mimo-v2.5-pro")
 
 SYSTEM_PROMPT = """You are the decision layer of an autonomous options-trading agent \
 competing in a hackathon (lablab.ai x Alpaca, "AI Trading Agents"). You choose which \
-already-risk-approved credit spread candidate(s), if any, to open this cycle.
+already-risk-approved candidate(s), if any, to open this cycle.
+
+Each candidate carries a `strategy` field, one of two complementary structures:
+- 'vertical': a directional credit spread (bull put or bear call) — the higher- \
+  timeframe trend filter confirmed a direction, so this needs real directional \
+  conviction behind it (check `direction`, `strength`, `signal_reasoning`).
+- 'iron_condor': a neutral, range-bound structure (short put spread + short call \
+  spread at the same expiration) — offered specifically because the higher- \
+  timeframe trend filter came back neutral (no directional edge either way). It \
+  needs NO directional view: it profits if the underlying just stays inside a \
+  range through expiration. Don't penalize it for lacking a `direction`/`strength` \
+  signal — that absence is exactly why it's an iron condor instead of a vertical.
 
 Hard rules, already enforced in code before you see these candidates — do not \
 second-guess them, only work within them:
 - Every candidate here already passed the risk gate (max loss %, DTE window, daily \
-  loss circuit breaker, concurrent-spread cap).
+  loss circuit breaker, concurrent-spread cap), regardless of strategy.
 - You may select zero, one, or multiple candidates, up to `remaining_budget` more \
-  concurrent spreads.
-- Prefer higher conviction (stronger underlying signal `strength`, cleaner \
-  `reasoning` from the screening layer) and better risk/reward (credit relative to \
-  max loss) over simply taking every candidate available.
+  concurrent spreads, mixing strategies freely.
+- For 'vertical' candidates, prefer higher conviction (stronger underlying signal \
+  `strength`, cleaner `reasoning` from the screening layer) and better risk/reward \
+  (credit relative to max loss). For 'iron_condor' candidates, judge purely on \
+  risk/reward (credit relative to max loss) since there is no directional signal to \
+  weigh.
 - Skipping a mediocre setup is a valid, often correct, decision.
 
 Respond with ONLY a JSON object: {"selected": ["TICKER", ...], "reasoning": "..."}. \
@@ -55,11 +68,14 @@ so make it genuinely informative, not generic filler."""
 
 
 def decide(candidates: list[dict], remaining_budget: int) -> dict:
-    """`candidates` items: {ticker, direction, strength, signal_reasoning,
-    credit_estimate, max_loss, expiration}. Returns {"selected": [...],
-    "reasoning": str}. Falls back to "select nothing" (never a guess) if the
-    API call fails or returns something unparseable — a skipped cycle is
-    always safe, an unparsed/misread response acted upon blindly is not.
+    """`candidates` items: {ticker, strategy, direction, strength,
+    signal_reasoning, credit_estimate, max_loss, expiration} — `direction`/
+    `strength`/`signal_reasoning` are only meaningful for strategy='vertical'
+    candidates (an 'iron_condor' candidate has no directional signal by
+    construction). Returns {"selected": [...], "reasoning": str}. Falls back
+    to "select nothing" (never a guess) if the API call fails or returns
+    something unparseable — a skipped cycle is always safe, an unparsed/
+    misread response acted upon blindly is not.
     """
     if not candidates:
         return {"selected": [], "reasoning": "No candidates survived the risk gate this cycle."}
