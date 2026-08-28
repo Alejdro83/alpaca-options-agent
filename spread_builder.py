@@ -467,6 +467,25 @@ async def build_iron_condor(
         )
         return None
 
+    # Iron-condor-specific floor (tastytrade rule of thumb, 2026-08-28):
+    # reject if the total credit collected is too small a fraction of the
+    # width being risked -- e.g. below 1/3 of a $5 wing is under $1.67.
+    # max_loss > 0 alone doesn't catch a technically-valid but not-worth-
+    # the-risk structure (barely any premium for the full width at stake).
+    # Verticals don't have an equivalent check yet -- kept iron-condor-only
+    # rather than applied retroactively without the same research behind it
+    # there.
+    width_dollars = put_width * 100
+    min_credit = width_dollars * config.risk.min_credit_to_width_pct
+    if credit_estimate < min_credit:
+        logger.info(
+            "%s iron condor credit $%.2f is below the %.0f%% min-credit-to-width "
+            "floor ($%.2f of $%.2f width) -- not worth the risk, skipping",
+            ticker, credit_estimate, config.risk.min_credit_to_width_pct * 100,
+            min_credit, width_dollars,
+        )
+        return None
+
     return IronCondorPlan(
         underlying=ticker,
         direction="iron_condor",

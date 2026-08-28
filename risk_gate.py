@@ -48,6 +48,8 @@ def check_new_spread(
     today: date,
     existing_exposure: dict[str, float] | None = None,
     underlying: str | None = None,
+    strategy: str = "vertical",
+    open_iron_condor_count: int = 0,
 ) -> RiskCheckResult:
     reasons: list[str] = []
     limits = config.risk
@@ -62,6 +64,16 @@ def check_new_spread(
         reasons.append(
             f"{open_spreads_count} spreads already open, "
             f"at the {limits.max_concurrent_spreads} concurrent cap"
+        )
+
+    # Separate, tighter cap for iron condors (2026-08-28) -- see
+    # config.RiskLimits.max_concurrent_iron_condors' own docstring for why
+    # this needs its own limit rather than relying on max_concurrent_spreads
+    # alone.
+    if strategy == "iron_condor" and open_iron_condor_count >= limits.max_concurrent_iron_condors:
+        reasons.append(
+            f"{open_iron_condor_count} iron condors already open, "
+            f"at the {limits.max_concurrent_iron_condors} concurrent cap"
         )
 
     max_loss_cap = equity * limits.max_loss_per_spread_pct

@@ -146,6 +146,25 @@ class OptionsRiskLimits:
         # equity — prevents one position from dominating the portfolio.
         default_factory=lambda: _env_float("MAX_CONCENTRATION_PCT", 0.20)
     )
+    max_concurrent_iron_condors: int = field(
+        # Separate, tighter cap than max_concurrent_spreads (5) -- a 4-leg
+        # structure ties up more of the concentration/liquidity budget per
+        # position than a 2-leg vertical, and the regime that produces iron
+        # condor candidates (ADX below TrendFilter's threshold, i.e. no real
+        # trend backing them) can affect much of the screening universe at
+        # once, so nothing else stops every open slot from filling with
+        # correlated range-bound bets on the same low-volatility stretch.
+        default_factory=lambda: _env_int("MAX_CONCURRENT_IRON_CONDORS", 2)
+    )
+    min_credit_to_width_pct: float = field(
+        # Iron-condor-specific floor: reject if total credit is below this
+        # fraction of the (equal) wing width -- e.g. 1/3 of a $5 wing is
+        # $1.67. A cited tastytrade rule of thumb for whether the premium
+        # collected is worth the defined risk taken on; verticals don't have
+        # an equivalent check today, kept iron-condor-only rather than
+        # applied retroactively without the same research backing it there.
+        default_factory=lambda: _env_float("MIN_CREDIT_TO_WIDTH_PCT", 1 / 3)
+    )
     contest_end_utc: str = field(
         # Hard close-out deadline, independent of profit/loss — added
         # specifically because should_close() previously only fired on

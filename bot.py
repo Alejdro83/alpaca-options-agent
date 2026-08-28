@@ -363,9 +363,12 @@ async def find_candidates(
     today = datetime.now(timezone.utc).date()
 
     existing_exposure: dict[str, float] = {}
+    open_iron_condor_count = 0
     for s in db.get_open_spreads():
         underlying = s["underlying"]
         existing_exposure[underlying] = existing_exposure.get(underlying, 0) + float(s.get("max_loss", 0))
+        if s.get("strategy") == "iron_condor":
+            open_iron_condor_count += 1
 
     candidates = []
     gate_rejections: list[dict] = []
@@ -418,6 +421,8 @@ async def find_candidates(
             today=today,
             existing_exposure=existing_exposure,
             underlying=sig.ticker,
+            strategy="iron_condor" if is_iron_condor else "vertical",
+            open_iron_condor_count=open_iron_condor_count,
         )
         if not check.allowed:
             logger.info("%s rejected by risk gate: %s", sig.ticker, check.reasons)
@@ -620,6 +625,19 @@ async def _pre_trade_check_iron_condor(
         # Same sanity check as spread_builder.build_iron_condor — a fresh
         # requote can hit this too, not just the initial build.
         return False, f"fresh max_loss is non-positive (${updated_max_loss:.2f}), refusing to trade", plan
+
+    min_credit = put_width_dollars * config.risk.min_credit_to_width_pct
+    if fresh_credit < min_credit:
+        # Same min-credit-to-width floor as build_iron_condor — a fresh
+        # requote shrinking credit can drop below it even if the original
+        # build passed, not just widen max_loss.
+        return (
+            False,
+            f"fresh credit ${fresh_credit:.2f} is below the "
+            f"{config.risk.min_credit_to_width_pct:.0%} min-credit-to-width floor "
+            f"(${min_credit:.2f})",
+            plan,
+        )
 
     updated_plan = IronCondorPlan(
         underlying=plan.underlying,
