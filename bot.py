@@ -38,6 +38,7 @@ from screening.filters import filter_universe
 from signals.indicators import compute_atr
 from signals.swing import generate_swing_signals
 from signals.trend_filter import TrendFilter
+from signals.regime import Regime, RegimeDetector
 
 import black_scholes
 import db
@@ -148,27 +149,35 @@ def _fetch_daily_bars(client: AlpacaClient, ticker: str) -> pd.DataFrame:
 
 
 def _apply_trend_and_volatility_filters(client: AlpacaClient, signals: list) -> list[tuple]:
-    """Returns (signal, realized_vol, adx) triples for survivors —
+    """Returns (signal, realized_vol, regime) triples for survivors —
     realized_vol is the annualized estimate `spread_builder.build_spread`/
     `build_iron_condor` feed into `black_scholes.bs_delta` as the IV proxy,
     computed here (not re-fetched later) since this is already pulling the
-    daily bars it needs.
+    daily bars it needs. `regime` is a `signals.regime.Regime` enum value.
 
-    Real bug fixed 2026-08-28: this used to thread `trend_direction`
-    ('bullish'/'bearish'/'neutral') through instead of `adx`, routing
+    Real bug fixed 2026-08-28 (first pass): this used to thread
+    `trend_direction` ('bullish'/'bearish'/'neutral') through, routing
     find_candidates() to build_iron_condor on trend_direction=='neutral'.
-    But trend_direction comes from EMA50-vs-EMA200 (a DIRECTION read),
-    while ADX measures trend STRENGTH -- two different axes. 'neutral'
+    trend_direction comes from EMA50-vs-EMA200 (a DIRECTION read); 'neutral'
     only fires on exact EMA equality, which real data essentially never
-    produces (confirmed live: 0 of 20 real signals came back neutral in
-    one check, while 10 of those 20 had ADX<25 -- a genuinely weak/choppy
-    trend by any normal reading, just not an exact EMA crossover). The
-    iron condor path was effectively dead code as a result. Now threading
-    `adx` directly so find_candidates() can route on ADX<threshold (a
-    "ranging market" call, matching how `strength` is already derived
-    from the same value in TrendFilter.check) instead of the EMA
-    coincidence. The direction-vs-trend `allowed` gate below (don't trade
-    long against a confirmed bearish trend, etc.) is unchanged.
+    produces (confirmed live: 0 of 20 real signals came back neutral in one
+    check). Fixed to route on raw ADX<threshold instead (a genuine "no real
+    trend strength" read).
+
+    Second pass, same day: a teammate's strategy research proposed the
+    fuller ADX+vol_ratio 2x2 regime matrix (TRENDING / RANGING /
+    VOLATILE_TRENDING / VOLATILE_RANGING) as the real basis for choosing
+    between a directional vertical and an iron condor. Turned out
+    `signals/regime.py` (vendored from trading_bot/ at project start,
+    never imported by anything here — see the commit that recovered
+    signals/ and screening/ into git the same day) already implements
+    exactly this, with the same default thresholds (ADX 25, vol_ratio 1.5)
+    the research cited. Wired in here instead of reimplementing it.
+    TrendFilter is kept alongside it for its own, different job: the
+    direction-vs-trend `allowed` gate (don't trade long against a
+    confirmed bearish EMA trend) has no equivalent in RegimeDetector,
+    which only classifies the underlying's own regime, not a signal's
+    proposed direction against it.
 
     Two passes: trend filter first (unchanged), then the volatility filter
     with an adaptive threshold — see config.VolatilityFilter's docstring.
@@ -177,7 +186,8 @@ def _apply_trend_and_volatility_filters(client: AlpacaClient, signals: list) -> 
     board (relax) versus this one ticker just being quiet (still reject).
     """
     trend_filter = TrendFilter()
-    trend_survivors: list[tuple] = []  # (sig, bars_df, adx)
+    regime_detector = RegimeDetector()
+    trend_survivors: list[tuple] = []  # (sig, bars_df, regime)
     for sig in signals:
         try:
             bars_df = _fetch_daily_bars(client, sig.ticker)
@@ -197,29 +207,31 @@ def _apply_trend_and_volatility_filters(client: AlpacaClient, signals: list) -> 
             continue
 
         try:
-            trend_result = trend_filter.check(bars_df, sig.direction)
-            trend_allowed = trend_result.allowed
-            adx = trend_result.adx
+            trend_allowed = trend_filter.check(bars_df, sig.direction).allowed
         except Exception:
             logger.exception("Trend filter failed for %s, allowing", sig.ticker)
             trend_allowed = True
-            # Unknown trend on a filter failure: route to an iron condor
-            # (no directional view required) rather than silently trusting
-            # the swing model's own guessed direction with zero trend
-            # confirmation behind it -- adx=0.0 always clears the "ranging"
-            # threshold below, same conservative choice as
-            # TrendFilterResult's own insufficient-data path.
-            adx = 0.0
         if not trend_allowed:
             continue
 
-        trend_survivors.append((sig, bars_df, adx))
+        try:
+            regime = regime_detector.detect(bars_df).regime
+        except Exception:
+            logger.exception("Regime detection failed for %s, treating as RANGING", sig.ticker)
+            # Unknown regime: route to an iron condor (no directional view
+            # required) rather than silently trusting the swing model's own
+            # guessed direction with zero regime confirmation behind it --
+            # same conservative "don't guess a direction you can't confirm"
+            # choice made elsewhere in this project.
+            regime = Regime.RANGING
+
+        trend_survivors.append((sig, bars_df, regime))
 
     min_percentile = _vol("min_percentile")
 
     if _vol("enabled") and trend_survivors:
         percentiles: list[float] = []
-        for sig, bars_df, _adx in trend_survivors:
+        for sig, bars_df, _regime in trend_survivors:
             try:
                 pct = _realized_vol_percentile(bars_df)
             except Exception:
@@ -241,7 +253,7 @@ def _apply_trend_and_volatility_filters(client: AlpacaClient, signals: list) -> 
                 min_percentile = _vol("relaxed_min_percentile")
 
     kept = []
-    for sig, bars_df, adx in trend_survivors:
+    for sig, bars_df, regime in trend_survivors:
         if _vol("enabled"):
             try:
                 pct = _realized_vol_percentile(bars_df)
@@ -256,7 +268,7 @@ def _apply_trend_and_volatility_filters(client: AlpacaClient, signals: list) -> 
                 continue
 
         realized_vol = black_scholes.realized_vol_from_bars(bars_df)
-        kept.append((sig, realized_vol, adx))
+        kept.append((sig, realized_vol, regime))
     return kept
 
 
@@ -372,10 +384,6 @@ async def find_candidates(
 
     candidates = []
     gate_rejections: list[dict] = []
-    # Same threshold TrendFilter itself uses (25.0 default) -- read off a
-    # fresh instance once rather than duplicated as a separate constant
-    # that could drift out of sync.
-    adx_ranging_threshold = TrendFilter().adx_threshold
 
     tickers_for_quotes = [sig.ticker for sig, _, _ in signals_with_vol]
     try:
@@ -384,15 +392,24 @@ async def find_candidates(
         logger.exception("Failed to batch-fetch snapshots, falling back to per-symbol quotes")
         snapshots = {}
 
-    for sig, realized_vol, adx in signals_with_vol:
-        # ADX below TrendFilter's own adx_threshold (25.0, matched here
-        # rather than duplicated as a separate config value) means no real
-        # trend strength backs whatever direction the EMA crossover or the
-        # swing model implied -- a genuinely "ranging" read, not just a
-        # coincidental exact EMA tie (see _apply_trend_and_volatility_
-        # filters' docstring for the real bug this replaced). Route those
-        # to an iron condor instead, which needs no directional view at all.
-        is_iron_condor = adx < adx_ranging_threshold
+    for sig, realized_vol, regime in signals_with_vol:
+        # Regime -> strategy, per signals.regime.RegimeDetector (2x2 on ADX
+        # and vol_ratio=vol_20d/vol_60d_avg, matching a teammate's strategy
+        # research 2026-08-28 -- see _apply_trend_and_volatility_filters'
+        # docstring for why this module rather than a reimplementation):
+        # TRENDING / VOLATILE_TRENDING -> directional vertical (real trend
+        # strength backs a direction). RANGING -> iron condor (no trend, no
+        # elevated vol -- calm range, sell premium both sides).
+        # VOLATILE_RANGING -> skip: no trend to lean on AND vol is
+        # elevated, i.e. the range itself may not hold -- the research
+        # flagged this cell as "wider-wing IC or skip"; skip is the
+        # conservative choice until wider-wing sizing is actually built and
+        # tested, matching this project's standing "a skipped cycle is
+        # always safer than a guessed one" rule.
+        if regime == Regime.VOLATILE_RANGING:
+            logger.info("%s regime is VOLATILE_RANGING -- no trend to lean on and vol is elevated, skipping", sig.ticker)
+            continue
+        is_iron_condor = regime == Regime.RANGING
         try:
             snap = snapshots.get(sig.ticker)
             if snap and snap.get("latest_ask") is not None and snap.get("latest_bid") is not None:
