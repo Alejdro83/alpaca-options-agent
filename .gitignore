@@ -2,7 +2,7 @@
 .env
 __pycache__/
 *.pyc
-state/
+/state/
 logs/
 *.log
 .cache/

@@ -52,6 +52,15 @@ as a Telegram Mini App via [@Alpaca_alejdro_bot](https://t.me/Alpaca_alejdro_bot
 - **Dashboard**: a small Next.js app, also usable as a Telegram Mini App,
   reading the agent's live state (equity curve, open spreads, every cycle's
   reasoning) from Supabase — see `../alpaca-agent-dashboard/`.
+- **Two-strategy schema, dashboard ready ahead of the bot**: iron condor is
+  being added as a second structure alongside the existing directional
+  vertical spread (bull put / bear call) — `alpaca_hackathon.spreads` already
+  has the `strategy` column and the four `call_*` leg columns in production
+  (`supabase/alpaca_hackathon_schema_iron_condor.sql`), and the dashboard
+  already renders an iron condor row (badge + all 4 legs) once one appears.
+  The entry logic that actually opens iron condors is still in progress on a
+  separate branch, not merged here yet — this branch only ever opens
+  vertical spreads.
 
 ## Running it
 
