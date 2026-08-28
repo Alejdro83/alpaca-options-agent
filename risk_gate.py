@@ -50,6 +50,7 @@ def check_new_spread(
     underlying: str | None = None,
     strategy: str = "vertical",
     open_iron_condor_count: int = 0,
+    open_iron_condor_exposure: float = 0.0,
 ) -> RiskCheckResult:
     reasons: list[str] = []
     limits = config.risk
@@ -75,6 +76,21 @@ def check_new_spread(
             f"{open_iron_condor_count} iron condors already open, "
             f"at the {limits.max_concurrent_iron_condors} concurrent cap"
         )
+
+    # Real equity-percentage cap on total iron condor exposure (2026-08-28)
+    # -- aggregates max_loss*contracts across ALL open iron condors, not
+    # just per-underlying. This is the functional gate that
+    # max_concurrent_iron_condors' count-based approximation does NOT
+    # provide (see its own docstring and config.py's capital-allocation
+    # comment).
+    if strategy == "iron_condor":
+        ic_cap = equity * limits.max_iron_condor_equity_pct
+        if open_iron_condor_exposure + max_loss > ic_cap:
+            reasons.append(
+                f"iron condor exposure ${open_iron_condor_exposure:,.2f} + "
+                f"new max loss ${max_loss:,.2f} would exceed the "
+                f"{limits.max_iron_condor_equity_pct:.0%} equity cap (${ic_cap:,.2f})"
+            )
 
     max_loss_cap = equity * limits.max_loss_per_spread_pct
     if max_loss > max_loss_cap:

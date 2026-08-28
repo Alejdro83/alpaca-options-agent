@@ -118,6 +118,18 @@ class OptionsRiskLimits:
         # universe selects (see ScreeningFilters.min_price/max_price).
         default_factory=lambda: _env_float("SPREAD_WIDTH_DOLLARS", 5.0)
     )
+    volatile_trending_width_dollars: float = field(
+        # Wider spread width for VOLATILE_TRENDING regime (2026-08-28):
+        # roughly double the standard $5 width. The rationale is that
+        # elevated vol (vol_ratio > 1.5) with a strong trend (ADX > 25)
+        # means larger expected moves, so a wider spread captures more
+        # premium and gives the trade more room. NOTE: this exact $10
+        # default is a defensible-but-not-precisely-researched choice;
+        # unlike most of this project's other parameters, it has NOT been
+        # backtested. Override via VOLATILE_TRENDING_WIDTH_DOLLARS if
+        # live results suggest a different width.
+        default_factory=lambda: _env_float("VOLATILE_TRENDING_WIDTH_DOLLARS", 10.0)
+    )
     profit_target_pct: float = field(
         # Close early once 50% of max credit is captured — standard credit-
         # spread management, reduces tail-risk exposure to gamma near expiry.
@@ -158,6 +170,19 @@ class OptionsRiskLimits:
         # trend backing them) can affect much of the screening universe at
         # once, so nothing else stops every open slot from filling with
         # correlated range-bound bets on the same low-volatility stretch.
+        #
+        # COUNT-BASED APPROXIMATION of the team's 35%/35%/30% capital-
+        # allocation spec (vertical-bull / vertical-bear / iron-condor):
+        # this is NOT a real equity-percentage split. Because
+        # _optimal_contracts sizes every position (regardless of strategy)
+        # to roughly the same ~2% of equity risk, a count-based ratio
+        # approximates a capital-based ratio reasonably when several
+        # positions are open, but they are NOT the same mechanism and can
+        # diverge sharply at low position counts (e.g., 1 open IC out of
+        # 1 total open position is 100% by count but could be a small
+        # fraction of total equity). See also max_iron_condor_equity_pct
+        # for the real equity-percentage cap that this count-based cap
+        # does NOT provide.
         default_factory=lambda: _env_int("MAX_CONCURRENT_IRON_CONDORS", 2)
     )
     min_credit_to_width_pct: float = field(
@@ -169,6 +194,16 @@ class OptionsRiskLimits:
         # applied retroactively without the same research backing it there.
         default_factory=lambda: _env_float("MIN_CREDIT_TO_WIDTH_PCT", 1 / 3)
     )
+    max_iron_condor_equity_pct: float = field(
+        # Real equity-percentage cap on total iron condor exposure — the
+        # functional gate that max_concurrent_iron_condors' count-based
+        # approximation (see its own docstring) explicitly does NOT provide.
+        # Aggregates max_loss * contracts across ALL open iron condors and
+        # rejects a new IC if the total would exceed this fraction of
+        # current equity. Mirrors max_concentration_pct's code shape, just
+        # aggregated across all ICs instead of per-underlying.
+        default_factory=lambda: _env_float("MAX_IRON_CONDOR_EQUITY_PCT", 0.30)
+    )
     contest_end_utc: str = field(
         # Hard close-out deadline, independent of profit/loss — added
         # specifically because should_close() previously only fired on
@@ -177,6 +212,18 @@ class OptionsRiskLimits:
         # risk_gate.should_force_close().
         default_factory=lambda: _env("CONTEST_END_UTC", "2026-09-04T15:00:00+00:00")
     )
+
+
+# Scope note (2026-08-28): Real IV Rank was considered specifically for
+# iron-condor entry gating (per the team's 3-strategy spec doc: "IV Rank >
+# 30 -> enter IC"). It is NOT implementable on this account — confirmed
+# live: no OPRA/Greeks access (403 on feed=opra), and the free indicative
+# feed returns no implied-vol data at all. This project deliberately reuses
+# the existing realized-volatility-percentile filter below as-is for all
+# strategies, rather than fabricating a fake IV Rank number from the
+# realized-vol proxy. The realized-vol percentile IS a meaningful signal
+# (see the tastytrade-cited study in the docstring below), but it is NOT
+# the same thing as IV Rank and should not be relabeled as such.
 
 
 @dataclass(frozen=True)

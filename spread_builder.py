@@ -174,6 +174,8 @@ def _select_vertical_leg(
     dte_days: int,
     realized_vol: float,
     is_lower_long: bool,
+    width_override: float | None = None,
+    target_delta_override: float | None = None,
 ) -> tuple[dict, dict, float, float, float] | None:
     """Shared strike-selection + liquidity logic for one side of a vertical
     (either a standalone bull put/bear call, or one wing of an iron condor).
@@ -207,7 +209,8 @@ def _select_vertical_leg(
         )
         return None
 
-    liquid_candidates.sort(key=lambda cd: abs(cd[1] - limits.short_leg_target_delta))
+    effective_target_delta = target_delta_override if target_delta_override is not None else limits.short_leg_target_delta
+    liquid_candidates.sort(key=lambda cd: abs(cd[1] - effective_target_delta))
     short_contract, short_delta = liquid_candidates[0]
     short_strike = float(short_contract["strike_price"])
 
@@ -220,22 +223,23 @@ def _select_vertical_leg(
     # project's risk profile assumes" -- a spread whose short leg is nowhere
     # near the intended delta must not reach execution just because it was
     # technically the least-bad liquid option this instant.
-    if abs(short_delta - limits.short_leg_target_delta) > MAX_DELTA_DEVIATION:
+    if abs(short_delta - effective_target_delta) > MAX_DELTA_DEVIATION:
         logger.warning(
             "%s %s: closest liquid strike's delta (%.2f) is too far from target (%.2f) "
             "-- likely a thin/stale-quote moment leaving only illiquid or wrong-regime "
             "strikes as 'liquid', skipping",
-            ticker, option_type, short_delta, limits.short_leg_target_delta,
+            ticker, option_type, short_delta, effective_target_delta,
         )
         return None
 
     # Long leg: `spread_width_dollars` further out-of-the-money than the
     # short strike — lower strike for a put spread (further OTM = lower),
     # higher strike for a call spread (further OTM = higher).
+    effective_width = width_override if width_override is not None else limits.spread_width_dollars
     target_long_strike = (
-        short_strike - limits.spread_width_dollars
+        short_strike - effective_width
         if is_lower_long
-        else short_strike + limits.spread_width_dollars
+        else short_strike + effective_width
     )
     same_exp_by_strike = {float(c["strike_price"]): c for c in exp_contracts}
     if target_long_strike not in same_exp_by_strike:
@@ -267,6 +271,7 @@ async def build_spread(
     signal_direction: str,
     spot_price: float,
     realized_vol: float,
+    width_override: float | None = None,
 ) -> SpreadPlan | None:
     """signal_direction is the vendored Signal's own 'long'/'short' field.
     `spot_price` is the underlying's current mid quote, `realized_vol` the
@@ -301,6 +306,7 @@ async def build_spread(
     leg = _select_vertical_leg(
         ticker, option_type, exp_contracts, snap_by_symbol,
         spot_price, dte_days, realized_vol, is_lower_long=is_bull_put,
+        width_override=width_override,
     )
     if leg is None:
         return None
@@ -345,6 +351,7 @@ async def build_iron_condor(
     ticker: str,
     spot_price: float,
     realized_vol: float,
+    target_delta_override: float | None = None,
 ) -> IronCondorPlan | None:
     """Builds a put credit spread AND a call credit spread at the SAME
     expiration, sold together as one structure — called by find_candidates()
@@ -408,12 +415,14 @@ async def build_iron_condor(
     put_leg = _select_vertical_leg(
         ticker, "put", put_exp_contracts, snap_by_symbol,
         spot_price, dte_days, realized_vol, is_lower_long=True,
+        target_delta_override=target_delta_override,
     )
     if put_leg is None:
         return None
     call_leg = _select_vertical_leg(
         ticker, "call", call_exp_contracts, snap_by_symbol,
         spot_price, dte_days, realized_vol, is_lower_long=False,
+        target_delta_override=target_delta_override,
     )
     if call_leg is None:
         return None

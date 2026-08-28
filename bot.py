@@ -148,6 +148,37 @@ def _fetch_daily_bars(client: AlpacaClient, ticker: str) -> pd.DataFrame:
     return pd.DataFrame(bars)
 
 
+def _vixy_regime_percentile(client: AlpacaClient) -> float | None:
+    """Percentile-based proxy for market-wide vol regime using VIXY (a
+    VIX-futures ETF) — NOT the real VIX index (^VIX is unavailable via
+    Alpaca's data API, confirmed live: "invalid symbol: ^VIX").
+
+    VIXY's absolute price has no stable relationship to the real VIX level
+    (it has decayed from hundreds to ~$17-18 due to structural contango
+    roll costs), so raw price thresholds like "VIX < 15" would silently
+    misclassify essentially always. Instead, this ranks VIXY's current
+    close against its own trailing-year daily range using the same
+    rolling-window + `.rank(pct=True)` technique as
+    `_realized_vol_percentile` — a 0-1 percentile where 0 means "VIXY is
+    near its 1-year low" and 1 means "near its 1-year high."
+
+    Returns None if insufficient history (fail-open: treat as mid-regime,
+    no adjustment).
+    """
+    try:
+        bars_df = _fetch_daily_bars(client, "VIXY")
+    except Exception:
+        logger.exception("Failed to fetch VIXY bars, skipping VIXY regime overlay")
+        return None
+    if bars_df.empty or "close" not in bars_df.columns or len(bars_df) < 60:
+        logger.info("VIXY has insufficient data (%d rows), skipping VIXY regime overlay", len(bars_df))
+        return None
+    close = bars_df["close"].dropna()
+    if len(close) < 60:
+        return None
+    return float(close.rank(pct=True).iloc[-1])
+
+
 def _apply_trend_and_volatility_filters(client: AlpacaClient, signals: list) -> list[tuple]:
     """Returns (signal, realized_vol, regime) triples for survivors —
     realized_vol is the annualized estimate `spread_builder.build_spread`/
@@ -376,6 +407,7 @@ async def find_candidates(
 
     existing_exposure: dict[str, float] = {}
     open_iron_condor_count = 0
+    iron_condor_total_exposure = 0.0
     for s in db.get_open_spreads():
         underlying = s["underlying"]
         # Real bug found 2026-08-28 (while fixing the audit's pre-trade-
@@ -386,12 +418,39 @@ async def find_candidates(
         # above 1, silently weakening the 20%-of-equity concentration cap
         # this dict feeds into (risk_gate.check_new_spread).
         contracts_held = int(s.get("contracts") or 1)
-        existing_exposure[underlying] = existing_exposure.get(underlying, 0) + float(s.get("max_loss", 0)) * contracts_held
+        max_loss_total = float(s.get("max_loss", 0)) * contracts_held
+        existing_exposure[underlying] = existing_exposure.get(underlying, 0) + max_loss_total
         if s.get("strategy") == "iron_condor":
             open_iron_condor_count += 1
+            iron_condor_total_exposure += max_loss_total
 
     candidates = []
     gate_rejections: list[dict] = []
+
+    # VIXY regime overlay (2026-08-28): compute once per cycle to avoid
+    # extra API calls per candidate. This is a PERCENTILE-BASED VIXY PROXY
+    # for market-wide vol regime — explicitly NOT the real VIX index or
+    # literal threshold levels. See _vixy_regime_percentile's docstring.
+    vixy_pct = _vixy_regime_percentile(client)
+    if vixy_pct is not None:
+        logger.info("VIXY regime percentile: %.2f", vixy_pct)
+
+    # Low VIXY percentile (<0.33): vol-of-vol is low for its own year,
+    # iron condor strikes can be closer to ATM. Rule: use
+    # min(short_leg_target_delta * 1.5, 0.30) as the target delta.
+    # Rationale: 0.17 * 1.5 = 0.255, capped at 0.30 to stay within a
+    # sensible range even if the base delta is ever raised. This moves
+    # strikes closer to ATM (more premium collected, lower win rate) when
+    # the vol environment is calm — a defensible tilt, not a backtested
+    # edge.
+    ic_target_delta_override: float | None = None
+    if vixy_pct is not None and vixy_pct < 0.33:
+        ic_target_delta_override = min(config.risk.short_leg_target_delta * 1.5, 0.30)
+        logger.info(
+            "VIXY percentile %.2f < 0.33 (low): iron condor target delta "
+            "overridden to %.2f (closer to ATM)",
+            vixy_pct, ic_target_delta_override,
+        )
 
     tickers_for_quotes = [sig.ticker for sig, _, _ in signals_with_vol]
     try:
@@ -418,6 +477,18 @@ async def find_candidates(
             logger.info("%s regime is VOLATILE_RANGING -- no trend to lean on and vol is elevated, skipping", sig.ticker)
             continue
         is_iron_condor = regime == Regime.RANGING
+
+        # VIXY regime overlay: high percentile (>0.67) means elevated
+        # vol-of-vol proxy — skip iron condor routing entirely for this
+        # cycle (directional verticals still allowed). This is a
+        # percentile-based VIXY proxy, NOT a real VIX threshold.
+        if is_iron_condor and vixy_pct is not None and vixy_pct > 0.67:
+            logger.info(
+                "%s regime is RANGING but VIXY percentile %.2f > 0.67 "
+                "(elevated vol-of-vol proxy) -- skipping iron condor for this cycle",
+                sig.ticker, vixy_pct,
+            )
+            continue
         try:
             snap = snapshots.get(sig.ticker)
             if snap and snap.get("latest_ask") is not None and snap.get("latest_bid") is not None:
@@ -426,9 +497,14 @@ async def find_candidates(
                 spot = client.get_latest_quote(sig.ticker)
                 spot_mid = (spot["ask_price"] + spot["bid_price"]) / 2
             if is_iron_condor:
-                plan = await build_iron_condor(mcp, sig.ticker, spot_price=spot_mid, realized_vol=realized_vol)
+                plan = await build_iron_condor(mcp, sig.ticker, spot_price=spot_mid, realized_vol=realized_vol, target_delta_override=ic_target_delta_override)
             else:
-                plan = await build_spread(mcp, sig.ticker, sig.direction, spot_price=spot_mid, realized_vol=realized_vol)
+                # VOLATILE_TRENDING regime: use a wider spread width to
+                # capture more premium in elevated-vol conditions (see
+                # config.risk.volatile_trending_width_dollars). TRENDING
+                # keeps the standard width (no override).
+                w_override = config.risk.volatile_trending_width_dollars if regime == Regime.VOLATILE_TRENDING else None
+                plan = await build_spread(mcp, sig.ticker, sig.direction, spot_price=spot_mid, realized_vol=realized_vol, width_override=w_override)
         except Exception:
             logger.exception(
                 "Failed to build %s for %s",
@@ -448,6 +524,7 @@ async def find_candidates(
             underlying=sig.ticker,
             strategy="iron_condor" if is_iron_condor else "vertical",
             open_iron_condor_count=open_iron_condor_count,
+            open_iron_condor_exposure=iron_condor_total_exposure,
         )
         if not check.allowed:
             logger.info("%s rejected by risk gate: %s", sig.ticker, check.reasons)
@@ -595,6 +672,7 @@ async def _pre_trade_check_iron_condor(
     open_count: int,
     existing_exposure: dict[str, float] | None = None,
     open_iron_condor_count: int = 0,
+    open_iron_condor_exposure: float = 0.0,
 ) -> tuple[bool, str | None, IronCondorPlan]:
     """Same last-second-validation discipline as `_pre_trade_check`, applied
     to all 4 iron condor legs in one snapshot call instead of 2: fresh
@@ -714,6 +792,7 @@ async def _pre_trade_check_iron_condor(
         underlying=plan.underlying,
         strategy="iron_condor",
         open_iron_condor_count=open_iron_condor_count,
+        open_iron_condor_exposure=open_iron_condor_exposure,
     )
     if not check.allowed:
         return False, f"risk gate rejected on fresh quotes: {check.reasons}", updated_plan
@@ -782,13 +861,16 @@ async def run_cycle() -> None:
         # gate ever seeing it.
         running_exposure: dict[str, float] = {}
         running_ic_count = 0
+        running_ic_exposure = 0.0
         for s in open_spreads:
             # Same per-contract-vs-total fix as find_candidates()'s
             # existing_exposure -- db.spreads.max_loss is per contract.
             contracts_held = int(s.get("contracts") or 1)
-            running_exposure[s["underlying"]] = running_exposure.get(s["underlying"], 0) + float(s.get("max_loss", 0)) * contracts_held
+            max_loss_total = float(s.get("max_loss", 0)) * contracts_held
+            running_exposure[s["underlying"]] = running_exposure.get(s["underlying"], 0) + max_loss_total
             if s.get("strategy") == "iron_condor":
                 running_ic_count += 1
+                running_ic_exposure += max_loss_total
         running_spread_count = len(open_spreads)
 
         # Defense in depth, added 2026-08-27 after a real incident: this
@@ -857,6 +939,7 @@ async def run_cycle() -> None:
                             mcp, plan, account, running_spread_count,
                             existing_exposure=running_exposure,
                             open_iron_condor_count=running_ic_count,
+                            open_iron_condor_exposure=running_ic_exposure,
                         )
                     else:
                         allowed, reason, plan = await _pre_trade_check(
@@ -936,6 +1019,16 @@ async def run_cycle() -> None:
                         f"max loss ${plan.max_loss * contracts:.2f} total"
                     )
                     decision = "opened"
+                    # Update running tallies so the next candidate's
+                    # pre-trade check in this same cycle sees the
+                    # exposure we just added (same 2026-08-28 audit fix
+                    # discipline as the initial tally above).
+                    running_spread_count += 1
+                    max_loss_just_opened = plan.max_loss * contracts
+                    running_exposure[plan.underlying] = running_exposure.get(plan.underlying, 0) + max_loss_just_opened
+                    if is_iron_condor:
+                        running_ic_count += 1
+                        running_ic_exposure += max_loss_just_opened
                 except Exception as exc:
                     logger.exception("Failed to open spread for %s", plan.underlying)
                     open_notes.append(f"ERROR opening {plan.underlying}: {exc}")

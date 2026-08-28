@@ -39,6 +39,18 @@ as a Telegram Mini App via [@Alpaca_alejdro_bot](https://t.me/Alpaca_alejdro_bot
   breaker, a max-concurrent-spreads cap, a max-loss-per-spread cap as % of
   equity, and a DTE window. A candidate that fails any gate is never shown
   to the model.
+- **Capital allocation (count-based approximation)** — the team's
+  3-strategy spec calls for a 35%/35%/30% capital split (directional
+  verticals bull / verticals bear / iron condors). This project
+  approximates that via a COUNT-based cap: `max_concurrent_iron_condors`
+  (default 2) out of `max_concurrent_spreads` (default 5) = 40% by count.
+  Because `_optimal_contracts` sizes every position to ~2% of equity
+  regardless of strategy, a count ratio approximates a capital ratio
+  reasonably when several positions are open — but they are NOT the same
+  mechanism and can diverge sharply at low position counts (e.g., 1 open
+  IC out of 1 total = 100% by count, possibly a small fraction of equity).
+  A real equity-percentage cap for iron condors is enforced separately via
+  `max_iron_condor_equity_pct` (see `risk_gate.py`).
 - **Autonomous decision layer** (`llm_reasoner.py`) — among whatever
   survives the gate, an LLM call picks which spread(s), if any, to actually
   open this cycle, and produces the plain-language reasoning shown on the
@@ -147,3 +159,29 @@ confidence than the underlying check actually supported.
 - The LLM reasoning step can choose *not* to trade a risk-approved
   candidate; it can never trade one that failed the gate. That asymmetry is
   intentional.
+
+## VIXY regime overlay (percentile-based vol-of-vol proxy)
+
+Real VIX (^VIX) is **not available** via Alpaca's data API (confirmed live:
+"invalid symbol: ^VIX"). VIXY (a VIX-futures ETF) IS available with real
+historical daily bars. However, VIXY's absolute price has **no stable
+relationship** to the real VIX level — it has decayed from hundreds of
+dollars to ~$17-18 due to structural contango roll costs in the futures it
+holds. Using literal price thresholds like "VIX < 15" would silently
+misclassify the regime essentially always.
+
+Instead, this project computes **VIXY's own percentile rank against its
+trailing-year daily range** — the same rolling-window + `.rank(pct=True)`
+technique used for the realized-volatility-percentile filter. This 0-1
+percentile is then mapped to three buckets by tertile:
+
+| VIXY percentile | Interpretation | Effect on iron condors |
+|---|---|---|
+| < 0.33 (low) | Vol-of-vol is low for its own year | Strikes closer to ATM: target delta = `min(base_delta * 1.5, 0.30)` |
+| 0.33 – 0.67 (mid) | Standard vol environment | No change |
+| > 0.67 (high) | Elevated vol-of-vol proxy | **No new iron condors** this cycle (verticals still allowed) |
+
+This is explicitly a **percentile-based VIXY proxy**, NOT the real VIX
+index or its literal threshold levels — labeled honestly, the same way
+this codebase labels its realized-volatility-percentile filter as a proxy
+for IV rank rather than claiming it's the real thing.
