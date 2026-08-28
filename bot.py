@@ -51,48 +51,22 @@ from spread_builder import IronCondorPlan, SpreadPlan, _mid_from_snapshot, build
 from pathlib import Path
 import json as _json
 
-# Evolved parameter overrides — loaded from state/evolved_params.json at the
-# start of each run_cycle(). Empty dict means "use config defaults."
-_evolved_overrides: dict = {}
 # Which generation is active right now — tags every cycle/spread this run
 # opens so a generation's REAL P&L can be measured later (db.py's
 # get_realized_pnl_by_generation), not just overnight_evolution.py's own
 # one-day simulated replay. 0 == no evolution promoted yet, config defaults.
-_current_generation: int = 0
-
-
-def _load_evolved_params() -> None:
-    global _evolved_overrides, _current_generation
+# Read once at import time from the same evolved_params.json that config.py
+# now resolves parameter overrides from.
+def _read_current_generation() -> int:
     path = Path(__file__).resolve().parent / "state" / "evolved_params.json"
     if not path.exists():
-        _evolved_overrides = {}
-        _current_generation = 0
-        return
+        return 0
     try:
-        data = _json.loads(path.read_text())
-        _evolved_overrides = {k: v for k, v in data.items()
-                              if k not in ("evolved_at", "generation", "promotion_reason")}
-        _current_generation = int(data.get("generation", 0))
-        logger.info("Loaded evolved params (gen %s): %s",
-                     _current_generation, _evolved_overrides)
+        return int(_json.loads(path.read_text()).get("generation", 0))
     except Exception:
-        logger.exception("Failed to load evolved_params.json, using config defaults")
-        _evolved_overrides = {}
-        _current_generation = 0
+        return 0
 
-
-def _risk(attr: str):
-    """Return evolved value if present, else config.risk default."""
-    if attr in _evolved_overrides:
-        return _evolved_overrides[attr]
-    return getattr(config.risk, attr)
-
-
-def _vol(attr: str):
-    """Return evolved value if present, else config.volatility default."""
-    if attr in _evolved_overrides:
-        return _evolved_overrides[attr]
-    return getattr(config.volatility, attr)
+_current_generation: int = _read_current_generation()
 
 
 # `basicConfig`'s default StreamHandler writes to stderr, not stdout — but
@@ -130,9 +104,9 @@ def _realized_vol_percentile(bars_df: pd.DataFrame) -> float | None:
     threshold below can see every candidate's percentile before deciding
     what bar to hold the whole cycle to (see _apply_trend_and_volatility_filters).
     """
-    atr = compute_atr(bars_df["high"], bars_df["low"], bars_df["close"], period=_vol("lookback_window"))
+    atr = compute_atr(bars_df["high"], bars_df["low"], bars_df["close"], period=config.volatility.lookback_window)
     atr_pct = (atr / bars_df["close"]).dropna()
-    if len(atr_pct) < _vol("lookback_window") * 2:
+    if len(atr_pct) < config.volatility.lookback_window * 2:
         return None
     return float(atr_pct.rank(pct=True).iloc[-1])
 
@@ -258,9 +232,9 @@ def _apply_trend_and_volatility_filters(client: AlpacaClient, signals: list) -> 
 
         trend_survivors.append((sig, bars_df, regime))
 
-    min_percentile = _vol("min_percentile")
+    min_percentile = config.volatility.min_percentile
 
-    if _vol("enabled") and trend_survivors:
+    if config.volatility.enabled and trend_survivors:
         percentiles: list[float] = []
         for sig, bars_df, _regime in trend_survivors:
             try:
@@ -273,19 +247,19 @@ def _apply_trend_and_volatility_filters(client: AlpacaClient, signals: list) -> 
 
         if percentiles:
             rejection_rate = sum(1 for p in percentiles if p < min_percentile) / len(percentiles)
-            if rejection_rate > _vol("max_rejection_rate_before_relax"):
+            if rejection_rate > config.volatility.max_rejection_rate_before_relax:
                 logger.info(
                     "Volatility filter would reject %.0f%% of %d rankable candidates at "
                     "percentile %.2f -- relaxing to %.2f for this cycle only (adaptive rule, "
                     "not a permanent change; see config.VolatilityFilter)",
                     rejection_rate * 100, len(percentiles), min_percentile,
-                    _vol("relaxed_min_percentile"),
+                    config.volatility.relaxed_min_percentile,
                 )
-                min_percentile = _vol("relaxed_min_percentile")
+                min_percentile = config.volatility.relaxed_min_percentile
 
     kept = []
     for sig, bars_df, regime in trend_survivors:
-        if _vol("enabled"):
+        if config.volatility.enabled:
             try:
                 pct = _realized_vol_percentile(bars_df)
             except Exception:
@@ -833,8 +807,6 @@ async def run_cycle() -> None:
         print("KILL SWITCH ACTIVE — skipping this cycle")
         return
 
-    _load_evolved_params()
-
     client = AlpacaClient()
     account = client.get_account()
     daily_pl, daily_pl_pct = _daily_pl(account)
@@ -849,7 +821,7 @@ async def run_cycle() -> None:
         except Exception:
             logger.exception("Failed to read open spreads from DB, assuming 0")
             open_spreads = []
-        remaining_budget = max(0, _risk("max_concurrent_spreads") - len(open_spreads))
+        remaining_budget = max(0, config.risk.max_concurrent_spreads - len(open_spreads))
 
         # Running tallies for the pre-trade re-check below (2026-08-28 audit
         # fix): find_candidates()'s own concentration/IC-count checks only
@@ -954,7 +926,7 @@ async def run_cycle() -> None:
                     contracts = _optimal_contracts(
                         equity=float(account["equity"]),
                         max_loss_per_contract=plan.max_loss,
-                        max_risk_pct=_risk("max_loss_per_spread_pct"),
+                        max_risk_pct=config.risk.max_loss_per_spread_pct,
                     )
                     # Real bug caught in review 2026-08-27: this used to be
                     # computed AFTER open_spread(mcp, plan) was already

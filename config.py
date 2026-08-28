@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 
 
 def _env(key: str, default: str = "") -> str:
@@ -16,6 +18,38 @@ def _env_float(key: str, default: float) -> float:
 def _env_int(key: str, default: int) -> int:
     val = os.environ.get(key)
     return int(val) if val is not None else default
+
+
+def _evolved_params() -> dict:
+    """Reads state/evolved_params.json once (module-level, so it's read
+    exactly once per process = once per cron tick). Returns {} if the
+    file doesn't exist, can't parse, or has no promoted generation yet
+    -- 0 evolved overrides means "use env-var/literal defaults", the
+    existing behavior before this project had an evolution system."""
+    path = Path(__file__).resolve().parent / "state" / "evolved_params.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+        return {k: v for k, v in data.items()
+                 if k not in ("evolved_at", "generation", "promotion_reason")}
+    except Exception:
+        return {}
+
+
+_EVOLVED = _evolved_params()
+
+
+def _evolved_or_env_float(key: str, env_name: str, default: float) -> float:
+    if key in _EVOLVED:
+        return float(_EVOLVED[key])
+    return _env_float(env_name, default)
+
+
+def _evolved_or_env_int(key: str, env_name: str, default: int) -> int:
+    if key in _EVOLVED:
+        return int(_EVOLVED[key])
+    return _env_int(env_name, default)
 
 
 @dataclass(frozen=True)
@@ -71,7 +105,7 @@ class OptionsRiskLimits:
         # sizing discipline (it uses 10% of equity per position, but that's
         # notional stock exposure; a credit spread's *max loss* is a much
         # sharper number, so this is deliberately tighter).
-        default_factory=lambda: _env_float("MAX_LOSS_PER_SPREAD_PCT", 0.02)
+        default_factory=lambda: _evolved_or_env_float("max_loss_per_spread_pct", "MAX_LOSS_PER_SPREAD_PCT", 0.02)
     )
     max_daily_loss_pct: float = field(
         # Same 3% circuit breaker as trading_bot/config.py's RiskLimits —
@@ -95,11 +129,11 @@ class OptionsRiskLimits:
         # db.get_realized_pnl_by_generation, same mechanism the evolution
         # audit trail uses) is the real tiebreaker to watch for — if it
         # confirms the backtest's original finding, revert to 10/21.
-        default_factory=lambda: _env_int("MIN_DTE", 7)
+        default_factory=lambda: _evolved_or_env_int("min_dte", "MIN_DTE", 7)
     )
     max_dte: int = field(
         # See min_dte's comment — same pending-comparison flag, was 21.
-        default_factory=lambda: _env_int("MAX_DTE", 14)
+        default_factory=lambda: _evolved_or_env_int("max_dte", "MAX_DTE", 14)
     )
     short_leg_target_delta: float = field(
         # 16-18 delta, not 25 — published large-sample studies (tastytrade,
@@ -110,13 +144,13 @@ class OptionsRiskLimits:
         # long-run expectancy. 16-delta is separately cited as close to the
         # theta-per-day sweet spot, so this isn't purely a win-rate-over-EV
         # trade-off for our case (2026-08-26 research pass).
-        default_factory=lambda: _env_float("SHORT_LEG_TARGET_DELTA", 0.17)
+        default_factory=lambda: _evolved_or_env_float("short_leg_target_delta", "SHORT_LEG_TARGET_DELTA", 0.17)
     )
     spread_width_dollars: float = field(
         # Distance between short and long strikes. $5 wide is a clean,
         # common increment for the liquid large/mid-caps this screening
         # universe selects (see ScreeningFilters.min_price/max_price).
-        default_factory=lambda: _env_float("SPREAD_WIDTH_DOLLARS", 5.0)
+        default_factory=lambda: _evolved_or_env_float("spread_width_dollars", "SPREAD_WIDTH_DOLLARS", 5.0)
     )
     volatile_trending_width_dollars: float = field(
         # Wider spread width for VOLATILE_TRENDING regime (2026-08-28):
@@ -133,14 +167,14 @@ class OptionsRiskLimits:
     profit_target_pct: float = field(
         # Close early once 50% of max credit is captured — standard credit-
         # spread management, reduces tail-risk exposure to gamma near expiry.
-        default_factory=lambda: _env_float("PROFIT_TARGET_PCT", 0.50)
+        default_factory=lambda: _evolved_or_env_float("profit_target_pct", "PROFIT_TARGET_PCT", 0.50)
     )
     stop_loss_multiple: float = field(
         # Close if the spread's mark-to-market loss reaches this multiple of
         # credit received (e.g. 2x credit received = stop out). Within the
         # commonly-cited 1.5-2x professional range — kept as-is, no evidence
         # this needs to move for our situation (2026-08-26 research pass).
-        default_factory=lambda: _env_float("STOP_LOSS_MULTIPLE", 2.0)
+        default_factory=lambda: _evolved_or_env_float("stop_loss_multiple", "STOP_LOSS_MULTIPLE", 2.0)
     )
     min_open_interest: int = field(
         # Per-contract liquidity gate, applied to BOTH legs — equity-level
@@ -148,14 +182,14 @@ class OptionsRiskLimits:
         # options liquidity specifically; a heavily-traded stock can still
         # have a thin market on a given strike/expiration. Rejects rather
         # than silently widening the spread search (2026-08-26 research pass).
-        default_factory=lambda: _env_int("MIN_OPEN_INTEREST", 100)
+        default_factory=lambda: _evolved_or_env_int("min_open_interest", "MIN_OPEN_INTEREST", 100)
     )
     max_bid_ask_spread_pct: float = field(
         # Max (ask - bid) / mid on a single leg's quote. 12% sits in the
         # commonly-cited 10-15% "tradeable" band for single-name equity
         # options (index/ETF options are usually much tighter, but this
         # screening universe is single names).
-        default_factory=lambda: _env_float("MAX_BID_ASK_SPREAD_PCT", 0.12)
+        default_factory=lambda: _evolved_or_env_float("max_bid_ask_spread_pct", "MAX_BID_ASK_SPREAD_PCT", 0.12)
     )
     max_concentration_pct: float = field(
         # No single underlying should represent more than this fraction of
@@ -251,7 +285,7 @@ class VolatilityFilter:
         # reaction to a high rejection rate with zero external evidence for
         # that specific number (see relaxed_min_percentile below for the
         # honest way to handle a genuinely low-vol stretch).
-        default_factory=lambda: _env_float("VOL_MIN_PERCENTILE", 0.40)
+        default_factory=lambda: _evolved_or_env_float("min_percentile", "VOL_MIN_PERCENTILE", 0.40)
     )
     relaxed_min_percentile: float = field(
         # Adaptive fallback (2026-08-27): if the baseline threshold above
