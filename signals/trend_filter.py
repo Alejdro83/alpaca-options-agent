@@ -22,6 +22,17 @@ class TrendFilterResult:
     trend_direction: str  # "bullish", "bearish", "neutral"
     strength: float       # 0-1, fuerza de la tendencia
     reasoning: list[str]
+    # Raw ADX(14) value, added 2026-08-28 for the iron condor regime split.
+    # Real bug this fixed: `trend_direction` comes from EMA50 vs EMA200 --
+    # "neutral" only fires on exact EMA equality, which essentially never
+    # happens on real data (confirmed live: 0/20 real signals came back
+    # neutral in one check, while 10/20 had ADX<25 "weak trend"). ADX is a
+    # genuinely different axis (trend STRENGTH) from the EMA crossover
+    # (trend DIRECTION) -- a ticker can be "bullish" by EMA with an ADX of
+    # 15 (no real conviction behind it). Exposed raw here instead of only
+    # folded into `strength`'s fixed 0.3-or-scaled encoding, so callers can
+    # threshold on it directly against `adx_threshold`.
+    adx: float = 0.0
 
 
 class TrendFilter:
@@ -71,12 +82,19 @@ class TrendFilter:
         TrendFilterResult
         """
         if len(df) < self.ema_slow + 20:
-            # Datos insuficientes, permitir trade
+            # Datos insuficientes, permitir trade. adx=0.0 here is
+            # deliberate, not just "unknown": with no real trend read
+            # possible, routing this candidate to an iron condor (no
+            # directional conviction required) rather than a directional
+            # vertical is the conservative choice, same "don't guess a
+            # direction you can't confirm" spirit as elsewhere in this
+            # project.
             return TrendFilterResult(
                 allowed=True,
                 trend_direction="neutral",
                 strength=0.0,
                 reasoning=["Insufficient data for trend filter"],
+                adx=0.0,
             )
 
         close = df["close"]
@@ -130,6 +148,7 @@ class TrendFilter:
             trend_direction=trend_direction,
             strength=strength,
             reasoning=reasoning,
+            adx=float(last_adx),
         )
 
     @staticmethod
