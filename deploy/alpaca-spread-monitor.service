@@ -1,0 +1,17 @@
+[Unit]
+Description=Alpaca Options Agent - real-time spread monitor (WebSocket)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/lab-master/alpaca-options-agent
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/lab-master/alpaca-options-agent/run_spread_monitor.sh
+Restart=always
+RestartSec=15
+StandardOutput=append:/home/lab-master/alpaca-options-agent/state/spread_monitor.stdout.log
+StandardError=append:/home/lab-master/alpaca-options-agent/state/spread_monitor.stdout.log
+
+[Install]
+WantedBy=default.target
