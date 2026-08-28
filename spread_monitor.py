@@ -98,10 +98,28 @@ class SpreadMonitor:
         subscribe once it connects.
         """
         try:
-            self._spreads = db.get_open_spreads()
+            all_spreads = db.get_open_spreads()
         except Exception:
             logger.exception("Failed to refresh open spreads from DB")
             return
+
+        # Real gap found 2026-08-28 when iron condors were added: this
+        # monitor only ever tracked short_symbol/long_symbol (2 legs). An
+        # iron condor has 4 (put side in those same 2 columns, call side in
+        # call_short_symbol/call_long_symbol) -- watching/closing it here
+        # unchanged would silently ignore the call side entirely: wrong
+        # mark, and a "close" that only reverses 2 of 4 legs, leaving the
+        # other two open for real. Rather than rush 4-leg WS support into
+        # this always-on service, iron condors are excluded here and left
+        # entirely to bot.py's 15-min cron (manage_open_spreads, which does
+        # handle all 4 legs correctly) -- slower to react to a profit
+        # target/stop between cron ticks, but correct, which matters more.
+        # TODO: extend this monitor with real 4-leg support so iron condors
+        # get the same sub-cron reaction time verticals do.
+        self._spreads = [s for s in all_spreads if s.get("strategy") != "iron_condor"]
+        skipped = len(all_spreads) - len(self._spreads)
+        if skipped:
+            logger.info("Skipping %d iron condor spread(s) -- managed by the 15-min cron instead", skipped)
 
         new_symbols = self._all_leg_symbols() - self._subscribed
         if not new_symbols:

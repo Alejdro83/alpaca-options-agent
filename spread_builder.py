@@ -96,6 +96,13 @@ def _mid_from_snapshot(snap: dict) -> float | None:
 
 LONG_LEG_MAX_SPREAD_PCT = 0.25
 
+# Real bug caught 2026-08-28 (see _select_vertical_leg): the closest-liquid-
+# delta strike can, at a thin/stale-quote instant, be nowhere near the
+# actual target delta. 0.15 is generous enough not to reject a normal pick
+# on a coarse strike grid, while still catching a wrong-regime fallback
+# (e.g. the ~0.79-delta case that motivated this).
+MAX_DELTA_DEVIATION = 0.15
+
 
 def _passes_liquidity(contract: dict, snap: dict, max_spread_override: float | None = None) -> bool:
     """Per-contract liquidity gate (2026-08-26 research pass) — equity-level
@@ -201,8 +208,26 @@ def _select_vertical_leg(
         return None
 
     liquid_candidates.sort(key=lambda cd: abs(cd[1] - limits.short_leg_target_delta))
-    short_contract, _ = liquid_candidates[0]
+    short_contract, short_delta = liquid_candidates[0]
     short_strike = float(short_contract["strike_price"])
+
+    # Real bug caught testing the iron condor build against live data
+    # 2026-08-28: at a thin/stale-quote instant, every genuinely OTM strike
+    # can have bid=0 and fail the liquidity gate above, leaving only
+    # deep-ITM strikes as "liquid" -- one such moment picked a short strike
+    # with delta ~0.79 against a 0.17 target. "Closest available liquid
+    # delta" isn't the same claim as "close enough to the delta this
+    # project's risk profile assumes" -- a spread whose short leg is nowhere
+    # near the intended delta must not reach execution just because it was
+    # technically the least-bad liquid option this instant.
+    if abs(short_delta - limits.short_leg_target_delta) > MAX_DELTA_DEVIATION:
+        logger.warning(
+            "%s %s: closest liquid strike's delta (%.2f) is too far from target (%.2f) "
+            "-- likely a thin/stale-quote moment leaving only illiquid or wrong-regime "
+            "strikes as 'liquid', skipping",
+            ticker, option_type, short_delta, limits.short_leg_target_delta,
+        )
+        return None
 
     # Long leg: `spread_width_dollars` further out-of-the-money than the
     # short strike — lower strike for a put spread (further OTM = lower),
