@@ -73,7 +73,7 @@ def decide(candidates: list[dict], remaining_budget: int) -> dict:
         resp = requests.post(
             f"{API_BASE}/chat/completions",
             headers={
-                "Authorization": f"Bearer {os.environ[API_KEY_ENV]}",
+                "Authorization": f"Bearer {os.environ.get(API_KEY_ENV, '')}",
                 "Content-Type": "application/json",
             },
             json={

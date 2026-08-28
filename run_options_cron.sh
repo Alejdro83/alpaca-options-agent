@@ -23,7 +23,7 @@ set +a
 OUTPUT=$(python bot.py 2>&1) || {
     echo "⚠️ OPTIONS AGENT ERROR:"
     echo "$OUTPUT" | tail -20
-    exit 0
+    exit 1
 }
 
 if [ -n "$OUTPUT" ]; then

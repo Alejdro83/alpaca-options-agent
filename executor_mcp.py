@@ -83,7 +83,7 @@ async def open_spread(mcp: AlpacaMCP, plan: SpreadPlan, contracts: int = 1) -> l
             ],
             "qty": str(contracts),
             "order_class": "mleg",
-            "type": "market",
+            "type": "market",  # TODO: support limit orders for better fill control
             "time_in_force": "day",
         },
     )

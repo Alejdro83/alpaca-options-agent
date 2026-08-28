@@ -48,6 +48,43 @@ from mcp_client import AlpacaMCP
 from spread_builder import SpreadPlan, _mid_from_snapshot, build_spread
 
 from pathlib import Path
+import json as _json
+
+# Evolved parameter overrides — loaded from state/evolved_params.json at the
+# start of each run_cycle(). Empty dict means "use config defaults."
+_evolved_overrides: dict = {}
+
+
+def _load_evolved_params() -> None:
+    global _evolved_overrides
+    path = Path(__file__).resolve().parent / "state" / "evolved_params.json"
+    if not path.exists():
+        _evolved_overrides = {}
+        return
+    try:
+        data = _json.loads(path.read_text())
+        _evolved_overrides = {k: v for k, v in data.items()
+                              if k not in ("evolved_at", "generation", "promotion_reason")}
+        logger.info("Loaded evolved params (gen %s): %s",
+                     data.get("generation", "?"), _evolved_overrides)
+    except Exception:
+        logger.exception("Failed to load evolved_params.json, using config defaults")
+        _evolved_overrides = {}
+
+
+def _risk(attr: str):
+    """Return evolved value if present, else config.risk default."""
+    if attr in _evolved_overrides:
+        return _evolved_overrides[attr]
+    return getattr(config.risk, attr)
+
+
+def _vol(attr: str):
+    """Return evolved value if present, else config.volatility default."""
+    if attr in _evolved_overrides:
+        return _evolved_overrides[attr]
+    return getattr(config.volatility, attr)
+
 
 # `basicConfig`'s default StreamHandler writes to stderr, not stdout — but
 # run_options_cron.sh redirects stderr into stdout (`2>&1`) before deciding
@@ -84,10 +121,9 @@ def _realized_vol_percentile(bars_df: pd.DataFrame) -> float | None:
     threshold below can see every candidate's percentile before deciding
     what bar to hold the whole cycle to (see _apply_trend_and_volatility_filters).
     """
-    vol_cfg = config.volatility
-    atr = compute_atr(bars_df["high"], bars_df["low"], bars_df["close"], period=vol_cfg.lookback_window)
+    atr = compute_atr(bars_df["high"], bars_df["low"], bars_df["close"], period=_vol("lookback_window"))
     atr_pct = (atr / bars_df["close"]).dropna()
-    if len(atr_pct) < vol_cfg.lookback_window * 2:
+    if len(atr_pct) < _vol("lookback_window") * 2:
         return None
     return float(atr_pct.rank(pct=True).iloc[-1])
 
@@ -146,10 +182,9 @@ def _apply_trend_and_volatility_filters(client: AlpacaClient, signals: list) -> 
 
         trend_survivors.append((sig, bars_df))
 
-    vol_cfg = config.volatility
-    min_percentile = vol_cfg.min_percentile
+    min_percentile = _vol("min_percentile")
 
-    if vol_cfg.enabled and trend_survivors:
+    if _vol("enabled") and trend_survivors:
         percentiles: list[float] = []
         for sig, bars_df in trend_survivors:
             try:
@@ -162,19 +197,19 @@ def _apply_trend_and_volatility_filters(client: AlpacaClient, signals: list) -> 
 
         if percentiles:
             rejection_rate = sum(1 for p in percentiles if p < min_percentile) / len(percentiles)
-            if rejection_rate > vol_cfg.max_rejection_rate_before_relax:
+            if rejection_rate > _vol("max_rejection_rate_before_relax"):
                 logger.info(
                     "Volatility filter would reject %.0f%% of %d rankable candidates at "
                     "percentile %.2f -- relaxing to %.2f for this cycle only (adaptive rule, "
                     "not a permanent change; see config.VolatilityFilter)",
                     rejection_rate * 100, len(percentiles), min_percentile,
-                    vol_cfg.relaxed_min_percentile,
+                    _vol("relaxed_min_percentile"),
                 )
-                min_percentile = vol_cfg.relaxed_min_percentile
+                min_percentile = _vol("relaxed_min_percentile")
 
     kept = []
     for sig, bars_df in trend_survivors:
-        if vol_cfg.enabled:
+        if _vol("enabled"):
             try:
                 pct = _realized_vol_percentile(bars_df)
             except Exception:
@@ -275,10 +310,22 @@ async def find_candidates(
 
     candidates = []
     gate_rejections: list[dict] = []
+
+    tickers_for_quotes = [sig.ticker for sig, _ in signals_with_vol]
+    try:
+        snapshots = client.get_snapshots(tickers_for_quotes) if tickers_for_quotes else {}
+    except Exception:
+        logger.exception("Failed to batch-fetch snapshots, falling back to per-symbol quotes")
+        snapshots = {}
+
     for sig, realized_vol in signals_with_vol:
         try:
-            spot = client.get_latest_quote(sig.ticker)
-            spot_mid = (spot["ask_price"] + spot["bid_price"]) / 2
+            snap = snapshots.get(sig.ticker)
+            if snap and snap.get("latest_ask") is not None and snap.get("latest_bid") is not None:
+                spot_mid = (snap["latest_ask"] + snap["latest_bid"]) / 2
+            else:
+                spot = client.get_latest_quote(sig.ticker)
+                spot_mid = (spot["ask_price"] + spot["bid_price"]) / 2
             plan = await build_spread(mcp, sig.ticker, sig.direction, spot_price=spot_mid, realized_vol=realized_vol)
         except Exception:
             logger.exception("Failed to build spread for %s", sig.ticker)
@@ -430,6 +477,14 @@ def _shadow_select(candidates: list[dict], remaining_budget: int) -> list[str]:
 
 
 async def run_cycle() -> None:
+    # Kill switch — file-based, works even if DB is down
+    PAUSE_FILE = Path(__file__).resolve().parent / "state" / "PAUSE"
+    if PAUSE_FILE.exists():
+        print("KILL SWITCH ACTIVE — skipping this cycle")
+        return
+
+    _load_evolved_params()
+
     client = AlpacaClient()
     account = client.get_account()
     daily_pl, daily_pl_pct = _daily_pl(account)
@@ -439,8 +494,12 @@ async def run_cycle() -> None:
     async with AlpacaMCP() as mcp:
         close_notes = await manage_open_spreads(mcp)
 
-        open_spreads = db.get_open_spreads()
-        remaining_budget = max(0, config.risk.max_concurrent_spreads - len(open_spreads))
+        try:
+            open_spreads = db.get_open_spreads()
+        except Exception:
+            logger.exception("Failed to read open spreads from DB, assuming 0")
+            open_spreads = []
+        remaining_budget = max(0, _risk("max_concurrent_spreads") - len(open_spreads))
 
         # Defense in depth, added 2026-08-27 after a real incident: this
         # bot is only ever meant to open NEW positions while the market is
@@ -486,6 +545,17 @@ async def run_cycle() -> None:
 
             shadow_selected = _shadow_select(slim_candidates, remaining_budget)
 
+            # "pending" placeholder: cycle_id is needed below so
+            # record_spread_open can reference it, but the real outcome
+            # (opened/skipped/error) isn't known until the loop below runs.
+            # Corrected via db.update_cycle_decision() once it is — see the
+            # bug this replaced in update_cycle_decision's own docstring.
+            try:
+                cycle_id = db.record_cycle(slim_candidates, "pending", reasoning)
+            except Exception:
+                logger.exception("Failed to record cycle to DB")
+                cycle_id = None
+
             for c in candidates:
                 if c["ticker"] not in selected_tickers:
                     continue
@@ -502,7 +572,7 @@ async def run_cycle() -> None:
                     contracts = _optimal_contracts(
                         equity=float(account["equity"]),
                         max_loss_per_contract=plan.max_loss,
-                        max_risk_pct=config.risk.max_loss_per_spread_pct,
+                        max_risk_pct=_risk("max_loss_per_spread_pct"),
                     )
                     # Real bug caught in review 2026-08-27: this used to be
                     # computed AFTER open_spread(mcp, plan) was already
@@ -510,22 +580,29 @@ async def run_cycle() -> None:
                     # order on Alpaca was always 1 contract regardless of
                     # what got recorded in the DB — a genuine mismatch
                     # between what actually executed and what we'd report.
+                    # Kill switch check before each spread open
+                    if Path(__file__).resolve().parent.joinpath("state", "PAUSE").exists():
+                        print("KILL SWITCH ACTIVE — aborting remaining opens")
+                        break
+
                     order_ids = await executor_mcp.open_spread(mcp, plan, contracts=contracts)
-                    cycle_id = db.record_cycle(slim_candidates, "opened", reasoning)
-                    db.record_spread_open(
-                        underlying=plan.underlying,
-                        direction=plan.direction,
-                        expiration=plan.expiration.isoformat(),
-                        short_strike=plan.short_strike,
-                        long_strike=plan.long_strike,
-                        short_symbol=plan.short_symbol,
-                        long_symbol=plan.long_symbol,
-                        contracts=contracts,
-                        credit_received=plan.credit_estimate,
-                        max_loss=plan.max_loss,
-                        alpaca_order_ids=order_ids,
-                        cycle_id=cycle_id,
-                    )
+                    try:
+                        db.record_spread_open(
+                            underlying=plan.underlying,
+                            direction=plan.direction,
+                            expiration=plan.expiration.isoformat(),
+                            short_strike=plan.short_strike,
+                            long_strike=plan.long_strike,
+                            short_symbol=plan.short_symbol,
+                            long_symbol=plan.long_symbol,
+                            contracts=contracts,
+                            credit_received=plan.credit_estimate,
+                            max_loss=plan.max_loss,
+                            alpaca_order_ids=order_ids,
+                            cycle_id=cycle_id,
+                        )
+                    except Exception:
+                        logger.exception("Failed to record spread open to DB (order already sent to Alpaca)")
                     open_notes.append(
                         f"Opened {plan.underlying} {plan.direction} x{contracts} contract(s): "
                         f"credit ${plan.credit_estimate * contracts:.2f} total "
@@ -538,28 +615,49 @@ async def run_cycle() -> None:
                     open_notes.append(f"ERROR opening {plan.underlying}: {exc}")
                     decision = "error"
 
-        if decision == "skipped":
-            cycle_id = db.record_cycle(slim_candidates, decision, reasoning)
+        # Real bug fixed 2026-08-28: this used to re-insert a second cycle
+        # row only for the "skipped" outcome, and left "opened" (the
+        # placeholder hardcoded above) standing uncorrected for "error" —
+        # a candidate the LLM picked but failed to open stayed mislabeled
+        # "opened" in the cycles table forever. Now every outcome (opened/
+        # skipped/error) is written exactly once, via insert-if-missing or
+        # update-if-pending, never both.
+        if cycle_id is None:
+            try:
+                cycle_id = db.record_cycle(slim_candidates, decision, reasoning)
+            except Exception:
+                logger.exception("Failed to record cycle to DB (non-fatal)")
+        else:
+            try:
+                db.update_cycle_decision(cycle_id, decision, reasoning)
+            except Exception:
+                logger.exception("Failed to update cycle decision (non-fatal)")
 
         if cycle_id is not None:
-            db.record_decision_journal(
-                cycle_id=cycle_id,
-                candidates=slim_candidates,
-                llm_selected=llm_selected,
-                llm_reasoning=reasoning,
-                shadow_selected=shadow_selected,
-                gate_rejections=gate_rejections,
-                pre_trade_rejections=pre_trade_rejections,
-            )
+            try:
+                db.record_decision_journal(
+                    cycle_id=cycle_id,
+                    candidates=slim_candidates,
+                    llm_selected=llm_selected,
+                    llm_reasoning=reasoning,
+                    shadow_selected=shadow_selected,
+                    gate_rejections=gate_rejections,
+                    pre_trade_rejections=pre_trade_rejections,
+                )
+            except Exception:
+                logger.exception("Failed to record decision journal (non-fatal)")
 
-        db.record_account_snapshot(
-            equity=float(account["equity"]),
-            last_equity=float(account.get("last_equity")) if account.get("last_equity") else None,
-            cash=float(account.get("cash")) if account.get("cash") else None,
-            open_spreads_count=len(db.get_open_spreads()),
-            daily_pl=float(account.get("daily_pl")) if account.get("daily_pl") else None,
-            daily_pl_pct=float(account.get("daily_pl_pct")) if account.get("daily_pl_pct") else None,
-        )
+        try:
+            db.record_account_snapshot(
+                equity=float(account["equity"]),
+                last_equity=float(account.get("last_equity")) if account.get("last_equity") else None,
+                cash=float(account.get("cash")) if account.get("cash") else None,
+                open_spreads_count=len(open_spreads),
+                daily_pl=float(account.get("daily_pl")) if account.get("daily_pl") else None,
+                daily_pl_pct=float(account.get("daily_pl_pct")) if account.get("daily_pl_pct") else None,
+            )
+        except Exception:
+            logger.exception("Failed to record account snapshot (non-fatal)")
 
         for note in close_notes + open_notes:
             print(note)

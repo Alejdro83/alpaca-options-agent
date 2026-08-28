@@ -71,6 +71,29 @@ def record_cycle(
         return row[0]
 
 
+def update_cycle_decision(cycle_id: int, decision: str, reasoning: str) -> None:
+    """Corrects a cycle row written as a "pending" placeholder (needed early
+    so record_spread_open has a cycle_id to reference) once the real outcome
+    is known. Real bug fixed 2026-08-28: the previous version of this
+    caller path hardcoded decision="opened" at insert time and only
+    re-inserted a *second* row if the outcome turned out to be "skipped" —
+    an "error" outcome (LLM picked a candidate but opening it raised) was
+    never corrected and stayed mislabeled "opened" in the cycles table
+    forever, and a "skipped" outcome left two rows for one cycle. This
+    UPDATE replaces both re-insert paths so exactly one row exists per
+    cycle with its true final decision.
+    """
+    with _connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            f"""
+            update {_schema()}.cycles
+            set decision = %s, reasoning = %s
+            where id = %s
+            """,
+            (decision, reasoning, cycle_id),
+        )
+
+
 def record_spread_open(
     underlying: str,
     direction: str,
@@ -114,6 +137,24 @@ def record_spread_close(spread_id: int, status: str, realized_pnl: float | None)
             where id = %s
             """,
             (status, realized_pnl, spread_id),
+        )
+
+
+def reconcile_spread_close(spread_id: int, fill_pnl: float) -> None:
+    """Update realized_pnl with actual fill data instead of estimated marks.
+
+    Call this after fetching real fill prices from Alpaca (e.g. via
+    get_orders or portfolio history) to correct the estimate recorded
+    at close time.
+    """
+    with _connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            f"""
+            update {_schema()}.spreads
+            set realized_pnl = %s
+            where id = %s
+            """,
+            (fill_pnl, spread_id),
         )
 
 

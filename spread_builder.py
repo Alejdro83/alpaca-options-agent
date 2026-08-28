@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from black_scholes import bs_delta
 from config import config
@@ -148,7 +148,7 @@ async def build_spread(
     configured windows — a skipped cycle is always safer than a guessed one.
     """
     limits = config.risk
-    today = datetime.now().date()
+    today = datetime.now(timezone.utc).date()
     min_exp = today + timedelta(days=limits.min_dte)
     max_exp = today + timedelta(days=limits.max_dte)
 
