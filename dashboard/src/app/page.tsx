@@ -176,14 +176,14 @@ export default function DashboardPage() {
             <div className="flex justify-between items-baseline mb-2">
               <div>
                 <p className="text-xs text-gray-500">Account equity</p>
-                <p className="text-2xl font-bold">${latestSnapshot.equity.toLocaleString()}</p>
+                <p className="text-2xl font-bold">${Number(latestSnapshot.equity).toLocaleString()}</p>
               </div>
               {latestSnapshot.daily_pl !== null && (
-                <p className={latestSnapshot.daily_pl >= 0 ? 'text-emerald-400' : 'text-red-400'}>
-                  {latestSnapshot.daily_pl >= 0 ? '+' : ''}
-                  ${latestSnapshot.daily_pl.toFixed(2)}
+                <p className={Number(latestSnapshot.daily_pl) >= 0 ? 'text-emerald-400' : 'text-red-400'}>
+                  {Number(latestSnapshot.daily_pl) >= 0 ? '+' : ''}
+                  ${Number(latestSnapshot.daily_pl).toFixed(2)}
                   {latestSnapshot.daily_pl_pct !== null &&
-                    ` (${(latestSnapshot.daily_pl_pct * 100).toFixed(2)}%)`}
+                    ` (${(Number(latestSnapshot.daily_pl_pct) * 100).toFixed(2)}%)`}
                 </p>
               )}
             </div>
