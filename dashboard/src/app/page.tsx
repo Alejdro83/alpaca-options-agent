@@ -25,6 +25,8 @@ interface DashboardState {
     expiration: string;
     short_strike: number;
     long_strike: number;
+    short_symbol: string | null;
+    long_symbol: string | null;
     contracts: number;
     credit_received: number;
     max_loss: number;
@@ -32,6 +34,15 @@ interface DashboardState {
     realized_pnl: number | null;
     opened_at: string;
     closed_at: string | null;
+    // 'vertical' (existing directional credit spread) or 'iron_condor'.
+    // See alpaca_hackathon_schema_iron_condor.sql. For iron_condor rows,
+    // short_strike/long_strike/short_symbol/long_symbol above are the PUT
+    // side and the call_* fields below are the CALL side.
+    strategy: string;
+    call_short_strike: number | null;
+    call_long_strike: number | null;
+    call_short_symbol: string | null;
+    call_long_symbol: string | null;
   }>;
   cycles: Array<{
     id: number;
@@ -41,6 +52,63 @@ interface DashboardState {
     error: string | null;
   }>;
   equityCurve: Array<{ equity: number; snapshot_at: string }>;
+}
+
+type SpreadRow = DashboardState['spreads'][number];
+
+// strategy is the canonical field, but a fresh iron_condor row also carries
+// direction === 'iron_condor' literally (see alpaca_hackathon_schema_iron_condor.sql)
+// instead of 'bull_put'/'bear_call' — checking both is belt-and-suspenders.
+function isIronCondor(s: SpreadRow): boolean {
+  return s.strategy === 'iron_condor' || s.direction === 'iron_condor';
+}
+
+function directionLabel(s: SpreadRow): string {
+  if (isIronCondor(s)) return 'Iron Condor';
+  return s.direction === 'bull_put' ? 'bull put' : 'bear call';
+}
+
+// Small badge so an iron condor row is unmistakable at a glance next to the
+// existing directional vertical spreads.
+function StrategyBadge({ s }: { s: SpreadRow }) {
+  if (!isIronCondor(s)) return null;
+  return (
+    <span className="inline-flex items-center rounded-full bg-violet-950 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-violet-400">
+      4-leg
+    </span>
+  );
+}
+
+// A vertical spread has one short/long pair; an iron condor has two (put
+// side using the pre-existing short_strike/long_strike/short_symbol/long_symbol
+// columns, call side using the new call_* columns) — show all 4 legs.
+function SpreadLegs({ s }: { s: SpreadRow }) {
+  if (!isIronCondor(s)) {
+    return (
+      <p className="text-gray-400 text-xs mt-1">
+        short ${s.short_strike} / long ${s.long_strike} × {s.contracts} — credit $
+        {Number(s.credit_received).toFixed(2)}, max loss ${Number(s.max_loss).toFixed(2)}
+      </p>
+    );
+  }
+  return (
+    <div className="text-gray-400 text-xs mt-1 space-y-0.5">
+      <p>
+        put: short ${s.short_strike}
+        {s.short_symbol ? ` (${s.short_symbol})` : ''} / long ${s.long_strike}
+        {s.long_symbol ? ` (${s.long_symbol})` : ''}
+      </p>
+      <p>
+        call: short ${s.call_short_strike}
+        {s.call_short_symbol ? ` (${s.call_short_symbol})` : ''} / long ${s.call_long_strike}
+        {s.call_long_symbol ? ` (${s.call_long_symbol})` : ''}
+      </p>
+      <p>
+        × {s.contracts} — credit ${Number(s.credit_received).toFixed(2)}, max loss $
+        {Number(s.max_loss).toFixed(2)}
+      </p>
+    </div>
+  );
 }
 
 const POLL_MS = 30_000;
@@ -135,15 +203,13 @@ export default function DashboardPage() {
                 {openSpreads.map((s) => (
                   <div key={s.id} className="rounded-lg border border-gray-800 bg-gray-900/30 p-3 text-sm">
                     <div className="flex justify-between">
-                      <span className="font-semibold">
-                        {s.underlying} {s.direction === 'bull_put' ? 'bull put' : 'bear call'}
+                      <span className="font-semibold flex items-center gap-1.5">
+                        {s.underlying} {directionLabel(s)}
+                        <StrategyBadge s={s} />
                       </span>
                       <span className="text-gray-500">exp {s.expiration}</span>
                     </div>
-                    <p className="text-gray-400 text-xs mt-1">
-                      short ${s.short_strike} / long ${s.long_strike} × {s.contracts} — credit $
-                      {Number(s.credit_received).toFixed(2)}, max loss ${Number(s.max_loss).toFixed(2)}
-                    </p>
+                    <SpreadLegs s={s} />
                   </div>
                 ))}
               </div>
@@ -157,8 +223,9 @@ export default function DashboardPage() {
                 {closedSpreads.map((s) => (
                   <div key={s.id} className="rounded-lg border border-gray-800 bg-gray-900/20 p-3 text-sm">
                     <div className="flex justify-between">
-                      <span>
-                        {s.underlying} {s.direction === 'bull_put' ? 'bull put' : 'bear call'} — {s.status}
+                      <span className="flex items-center gap-1.5">
+                        {s.underlying} {directionLabel(s)} — {s.status}
+                        <StrategyBadge s={s} />
                       </span>
                       {s.realized_pnl !== null && (
                         <span className={Number(s.realized_pnl) >= 0 ? 'text-emerald-400' : 'text-red-400'}>
