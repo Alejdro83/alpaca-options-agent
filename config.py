@@ -83,19 +83,23 @@ class OptionsRiskLimits:
         default_factory=lambda: _env_int("MAX_CONCURRENT_SPREADS", 5)
     )
     min_dte: int = field(
-        # 10-21 days, not the textbook 30-45 — the contest window itself is
-        # only ~5 trading days, so full alignment with "enter at 30-45,
-        # manage out by 21" isn't available to us. This range is deliberately
-        # pulled *out* of the highest-gamma stretch (widened from an earlier
-        # 7-14, which sat entirely inside the zone convention says to have
-        # already exited by), while still resolving close enough to the
-        # judging window for `account_snapshots`' daily mark-to-market to
-        # show real, meaningful movement even on positions that never fully
-        # close (2026-08-26 research pass, see ONE_PAGER.md).
-        default_factory=lambda: _env_int("MIN_DTE", 10)
+        # PENDING COMPARISON, 2026-08-28: set to 7 here to follow the
+        # 3-strategy spec doc (external report, tastytrade-cited "more
+        # theta in fewer days"), overriding this project's OWN 2026-08-27
+        # walk-forward backtest (`backtest_optimize.py`), which found 10-21
+        # outperforms 7-14 "with a large, sign-changing difference, not
+        # marginal" (see README's "Parameter optimization pass" section
+        # for the full writeup) -- that finding was never invalidated, just
+        # deliberately overridden by the newer external spec. Real trading
+        # data accumulating under 7-14 (tag-able by generation via
+        # db.get_realized_pnl_by_generation, same mechanism the evolution
+        # audit trail uses) is the real tiebreaker to watch for — if it
+        # confirms the backtest's original finding, revert to 10/21.
+        default_factory=lambda: _env_int("MIN_DTE", 7)
     )
     max_dte: int = field(
-        default_factory=lambda: _env_int("MAX_DTE", 21)
+        # See min_dte's comment — same pending-comparison flag, was 21.
+        default_factory=lambda: _env_int("MAX_DTE", 14)
     )
     short_leg_target_delta: float = field(
         # 16-18 delta, not 25 — published large-sample studies (tastytrade,

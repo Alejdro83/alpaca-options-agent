@@ -6,8 +6,14 @@ from dataclasses import dataclass, field
 @dataclass
 class StrategyParams:
     short_leg_target_delta: float = 0.17
-    min_dte: int = 10
-    max_dte: int = 21
+    # PENDING COMPARISON, 2026-08-28: matches config.RiskLimits.min_dte/
+    # max_dte's own pending-comparison flag (was 10/21, following this
+    # project's own backtest; overridden to 7/14 to follow the external
+    # 3-strategy spec doc). Kept in sync here so the evolution incumbent
+    # baseline matches what's actually running -- see config.py's comment
+    # for the full context and the real-data tiebreaker to watch for.
+    min_dte: int = 7
+    max_dte: int = 14
     spread_width_dollars: float = 5.0
     profit_target_pct: float = 0.50
     stop_loss_multiple: float = 2.0

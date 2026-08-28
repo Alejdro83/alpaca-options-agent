@@ -347,12 +347,13 @@ async def build_iron_condor(
     realized_vol: float,
 ) -> IronCondorPlan | None:
     """Builds a put credit spread AND a call credit spread at the SAME
-    expiration, sold together as one structure — for candidates where the
-    higher-timeframe trend filter came back 'neutral' (no directional edge
-    confirmed), which today are discarded by `build_spread`'s caller having
-    nothing directional to act on. Reuses every liquidity/delta/strike-width
-    rule `build_spread` already applies, independently on each side, via
-    `_select_vertical_leg`.
+    expiration, sold together as one structure — called by find_candidates()
+    when `signals.regime.RegimeDetector` classifies the underlying as
+    RANGING (ADX below threshold, vol_ratio not elevated either): no real
+    trend strength to back a directional bet, so a neutral structure is
+    offered instead of forcing one. Reuses every liquidity/delta/strike-
+    width rule `build_spread` already applies, independently on each side,
+    via `_select_vertical_leg`.
 
     Returns None (never a half-built structure) if either side fails its
     liquidity/credit gate, if the two sides can't agree on a common

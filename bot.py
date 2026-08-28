@@ -378,7 +378,15 @@ async def find_candidates(
     open_iron_condor_count = 0
     for s in db.get_open_spreads():
         underlying = s["underlying"]
-        existing_exposure[underlying] = existing_exposure.get(underlying, 0) + float(s.get("max_loss", 0))
+        # Real bug found 2026-08-28 (while fixing the audit's pre-trade-
+        # recheck gap): db.spreads.max_loss is PER CONTRACT (never
+        # multiplied when recorded, see db.record_spread_open's callers) --
+        # summing it raw here understated real total exposure per
+        # underlying by a factor of `contracts` for any position sized
+        # above 1, silently weakening the 20%-of-equity concentration cap
+        # this dict feeds into (risk_gate.check_new_spread).
+        contracts_held = int(s.get("contracts") or 1)
+        existing_exposure[underlying] = existing_exposure.get(underlying, 0) + float(s.get("max_loss", 0)) * contracts_held
         if s.get("strategy") == "iron_condor":
             open_iron_condor_count += 1
 
@@ -481,6 +489,7 @@ async def _pre_trade_check(
     plan: SpreadPlan,
     account: dict,
     open_count: int,
+    existing_exposure: dict[str, float] | None = None,
 ) -> tuple[bool, str | None, SpreadPlan]:
     """Last-second validation before sending an order to Alpaca.
 
@@ -489,6 +498,17 @@ async def _pre_trade_check(
     shrunk by more than 20 % relative to the original estimate the trade
     is skipped — the market moved against us between candidate screening
     and the LLM's decision.
+
+    Real gap found in a 2026-08-28 audit: this used to call
+    risk_gate.check_new_spread without existing_exposure/underlying,
+    meaning the 20%-per-underlying concentration cap was only ever
+    checked once, at the top of find_candidates() against the cycle's
+    starting snapshot -- never re-verified against what run_cycle() has
+    actually opened so far THIS cycle. If the LLM selected two candidates
+    on the same underlying in one cycle, the second one's final gate
+    would not have caught it. `existing_exposure` is now threaded through
+    from run_cycle()'s own running tally (updated after each successful
+    open), closing that gap.
     """
     result = await mcp.call(
         "get_option_snapshot",
@@ -558,6 +578,9 @@ async def _pre_trade_check(
         max_loss=updated_max_loss,
         expiration=plan.expiration,
         today=today,
+        existing_exposure=existing_exposure,
+        underlying=plan.underlying,
+        strategy="vertical",
     )
     if not check.allowed:
         return False, f"risk gate rejected on fresh quotes: {check.reasons}", updated_plan
@@ -570,13 +593,20 @@ async def _pre_trade_check_iron_condor(
     plan: IronCondorPlan,
     account: dict,
     open_count: int,
+    existing_exposure: dict[str, float] | None = None,
+    open_iron_condor_count: int = 0,
 ) -> tuple[bool, str | None, IronCondorPlan]:
     """Same last-second-validation discipline as `_pre_trade_check`, applied
     to all 4 iron condor legs in one snapshot call instead of 2: fresh
     quotes required on every leg, a >15min-stale quote on ANY leg hard-
     blocks (same real bug this guards against as the vertical path — see
     `_pre_trade_check`'s docstring), credit shrink and non-positive
-    max_loss re-checked against fresh mids, and the risk gate re-run.
+    max_loss re-checked against fresh mids, and the risk gate re-run —
+    now including the concentration and max-concurrent-iron-condor caps
+    (same 2026-08-28 audit gap `_pre_trade_check` fixed; `existing_exposure`/
+    `open_iron_condor_count` come from run_cycle()'s running tally, updated
+    after each successful open this cycle, not just the cycle-start
+    snapshot).
     """
     symbols = [plan.short_put_symbol, plan.long_put_symbol, plan.short_call_symbol, plan.long_call_symbol]
     result = await mcp.call(
@@ -680,6 +710,10 @@ async def _pre_trade_check_iron_condor(
         max_loss=updated_max_loss,
         expiration=plan.expiration,
         today=today,
+        existing_exposure=existing_exposure,
+        underlying=plan.underlying,
+        strategy="iron_condor",
+        open_iron_condor_count=open_iron_condor_count,
     )
     if not check.allowed:
         return False, f"risk gate rejected on fresh quotes: {check.reasons}", updated_plan
@@ -737,6 +771,25 @@ async def run_cycle() -> None:
             logger.exception("Failed to read open spreads from DB, assuming 0")
             open_spreads = []
         remaining_budget = max(0, _risk("max_concurrent_spreads") - len(open_spreads))
+
+        # Running tallies for the pre-trade re-check below (2026-08-28 audit
+        # fix): find_candidates()'s own concentration/IC-count checks only
+        # see this cycle's STARTING snapshot. If the LLM selects more than
+        # one candidate this cycle, each one actually opened here must
+        # update these before the next candidate's pre-trade check runs,
+        # or a same-cycle multi-select could blow past the concentration
+        # cap or the max-concurrent-iron-condor cap without either final
+        # gate ever seeing it.
+        running_exposure: dict[str, float] = {}
+        running_ic_count = 0
+        for s in open_spreads:
+            # Same per-contract-vs-total fix as find_candidates()'s
+            # existing_exposure -- db.spreads.max_loss is per contract.
+            contracts_held = int(s.get("contracts") or 1)
+            running_exposure[s["underlying"]] = running_exposure.get(s["underlying"], 0) + float(s.get("max_loss", 0)) * contracts_held
+            if s.get("strategy") == "iron_condor":
+                running_ic_count += 1
+        running_spread_count = len(open_spreads)
 
         # Defense in depth, added 2026-08-27 after a real incident: this
         # bot is only ever meant to open NEW positions while the market is
@@ -801,11 +854,14 @@ async def run_cycle() -> None:
                 try:
                     if is_iron_condor:
                         allowed, reason, plan = await _pre_trade_check_iron_condor(
-                            mcp, plan, account, len(open_spreads),
+                            mcp, plan, account, running_spread_count,
+                            existing_exposure=running_exposure,
+                            open_iron_condor_count=running_ic_count,
                         )
                     else:
                         allowed, reason, plan = await _pre_trade_check(
-                            mcp, plan, account, len(open_spreads),
+                            mcp, plan, account, running_spread_count,
+                            existing_exposure=running_exposure,
                         )
                     if not allowed:
                         logger.info("Pre-trade check blocked %s: %s", plan.underlying, reason)

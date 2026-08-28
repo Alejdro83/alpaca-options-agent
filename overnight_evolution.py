@@ -160,8 +160,8 @@ def _incumbent_params() -> StrategyParams:
             data = json.loads(path.read_text())
             return StrategyParams(
                 short_leg_target_delta=data.get("short_leg_target_delta", 0.17),
-                min_dte=data.get("min_dte", 10),
-                max_dte=data.get("max_dte", 21),
+                min_dte=data.get("min_dte", 7),
+                max_dte=data.get("max_dte", 14),
                 spread_width_dollars=data.get("spread_width_dollars", 5.0),
                 profit_target_pct=data.get("profit_target_pct", 0.50),
                 stop_loss_multiple=data.get("stop_loss_multiple", 2.0),
