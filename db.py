@@ -53,19 +53,26 @@ def record_cycle(
     decision: str,
     reasoning: str,
     error: str | None = None,
+    generation: int = 0,
 ) -> int:
     """Logs one Hermes tick. Returns the new cycle id so a resulting spread
     row can reference it — the dashboard's "last N decisions" view and the
     per-spread "why did the agent open this" trace both read off this link.
+
+    `generation` tags which evolved-parameter generation (see
+    overnight_evolution.py / evolution_history table) was active for this
+    cycle — 0 means "no promoted evolution yet, running config.py
+    defaults." Needed so a generation's REAL P&L can be measured later
+    (get_realized_pnl_by_generation), not just its one-day simulated replay.
     """
     with _connection() as conn, conn.cursor() as cur:
         cur.execute(
             f"""
-            insert into {_schema()}.cycles (candidates, decision, reasoning, error)
-            values (%s, %s, %s, %s)
+            insert into {_schema()}.cycles (candidates, decision, reasoning, error, generation)
+            values (%s, %s, %s, %s, %s)
             returning id
             """,
-            (json.dumps(candidates), decision, reasoning, error),
+            (json.dumps(candidates), decision, reasoning, error, generation),
         )
         row = cur.fetchone()
         return row[0]
@@ -107,6 +114,7 @@ def record_spread_open(
     max_loss: float,
     alpaca_order_ids: list[str],
     cycle_id: int,
+    generation: int = 0,
 ) -> int:
     with _connection() as conn, conn.cursor() as cur:
         cur.execute(
@@ -114,14 +122,15 @@ def record_spread_open(
             insert into {_schema()}.spreads
                 (underlying, direction, expiration, short_strike, long_strike,
                  short_symbol, long_symbol, contracts, credit_received, max_loss,
-                 alpaca_order_ids, cycle_id, status)
-            values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'open')
+                 alpaca_order_ids, cycle_id, status, generation)
+            values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'open', %s)
             returning id
             """,
             (
                 underlying, direction, expiration, short_strike, long_strike,
                 short_symbol, long_symbol,
                 contracts, credit_received, max_loss, json.dumps(alpaca_order_ids), cycle_id,
+                generation,
             ),
         )
         row = cur.fetchone()
@@ -218,6 +227,128 @@ def record_decision_journal(
             )
     except Exception:
         logger.exception("Failed to record decision journal (non-fatal)")
+
+
+def _ensure_evolution_history_table() -> None:
+    with _connection() as conn, conn.cursor() as cur:
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {_schema()}.evolution_history (
+                id SERIAL PRIMARY KEY,
+                generation INTEGER NOT NULL,
+                ran_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                decision TEXT NOT NULL,
+                params_before JSONB,
+                params_after JSONB,
+                reason TEXT NOT NULL,
+                simulated_metrics JSONB,
+                real_metrics JSONB,
+                reverted_at TIMESTAMPTZ,
+                reverted_reason TEXT
+            )
+        """)
+
+
+_evolution_history_ready = False
+
+
+def record_evolution_history(
+    generation: int,
+    decision: str,
+    params_before: dict | None,
+    params_after: dict | None,
+    reason: str,
+    simulated_metrics: dict | None = None,
+    real_metrics: dict | None = None,
+) -> int:
+    """Append-only audit trail for overnight_evolution.py — every night's
+    run gets a row here, `decision` in ('promoted', 'held', 'auto_reverted',
+    'manual_revert'), whether or not anything actually changed. Unlike
+    evolved_params.json (which only ever holds the *current* state) or
+    evolution_report.md (overwritten every run), this is never overwritten
+    — the whole point is to be able to look back at every generation ever
+    tried and why, and to revert to any of them (see revert_evolution.py).
+    """
+    global _evolution_history_ready
+    if not _evolution_history_ready:
+        _ensure_evolution_history_table()
+        _evolution_history_ready = True
+    with _connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            f"""
+            insert into {_schema()}.evolution_history
+                (generation, decision, params_before, params_after, reason,
+                 simulated_metrics, real_metrics)
+            values (%s, %s, %s, %s, %s, %s, %s)
+            returning id
+            """,
+            (
+                generation, decision,
+                json.dumps(params_before) if params_before is not None else None,
+                json.dumps(params_after) if params_after is not None else None,
+                reason,
+                json.dumps(simulated_metrics) if simulated_metrics is not None else None,
+                json.dumps(real_metrics) if real_metrics is not None else None,
+            ),
+        )
+        row = cur.fetchone()
+        return row[0]
+
+
+def mark_generation_reverted(generation: int, reverted_reason: str) -> None:
+    """Marks the ('promoted', generation) row as reverted — found by
+    generation number, latest first, so re-promoting the same generation
+    number twice (shouldn't happen, generations are monotonic) still marks
+    the most recent one.
+    """
+    global _evolution_history_ready
+    if not _evolution_history_ready:
+        _ensure_evolution_history_table()
+        _evolution_history_ready = True
+    with _connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            f"""
+            update {_schema()}.evolution_history
+            set reverted_at = now(), reverted_reason = %s
+            where id = (
+                select id from {_schema()}.evolution_history
+                where generation = %s and decision = 'promoted' and reverted_at is null
+                order by ran_at desc limit 1
+            )
+            """,
+            (reverted_reason, generation),
+        )
+
+
+def get_evolution_history(limit: int = 50) -> list[dict[str, Any]]:
+    global _evolution_history_ready
+    if not _evolution_history_ready:
+        _ensure_evolution_history_table()
+        _evolution_history_ready = True
+    with _connection() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            f"select * from {_schema()}.evolution_history order by ran_at desc limit %s",
+            (limit,),
+        )
+        return list(cur.fetchall())
+
+
+def get_realized_pnl_by_generation(generation: int) -> dict[str, Any]:
+    """Real (not simulated) trade count + total/avg realized_pnl for closed
+    spreads opened under a given parameter generation — the actual evidence
+    Layer 2's auto-revert check compares across generations, as opposed to
+    overnight_evolution.py's own one-day synthetic replay.
+    """
+    with _connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            f"""
+            select count(*), coalesce(sum(realized_pnl), 0), coalesce(avg(realized_pnl), 0)
+            from {_schema()}.spreads
+            where generation = %s and status != 'open' and realized_pnl is not null
+            """,
+            (generation,),
+        )
+        count, total, avg = cur.fetchone()
+        return {"generation": generation, "closed_trades": count, "total_pnl": float(total), "avg_pnl": float(avg)}
 
 
 def record_account_snapshot(

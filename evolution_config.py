@@ -42,3 +42,12 @@ POPULATION_SIZE = 8
 PROMOTION_THRESHOLD = 0.05
 PARAMS_PATH = "state/evolved_params.json"
 REPORT_PATH = "state/evolution_report.md"
+
+# Layer 2 safety net (2026-08-28): a promotion is only ever justified by one
+# day's simulated replay (see overnight_evolution.py's own docstring on why
+# that's not statistically significant on its own). MIN_TRADES_FOR_REVERT_CHECK
+# is how many REAL closed trades a generation needs -- both the active one
+# and the one before it -- before its real performance is trusted enough to
+# judge or compare; below that, the auto-revert check stays quiet rather
+# than act on noise.
+MIN_TRADES_FOR_REVERT_CHECK = 5

@@ -53,23 +53,31 @@ import json as _json
 # Evolved parameter overrides — loaded from state/evolved_params.json at the
 # start of each run_cycle(). Empty dict means "use config defaults."
 _evolved_overrides: dict = {}
+# Which generation is active right now — tags every cycle/spread this run
+# opens so a generation's REAL P&L can be measured later (db.py's
+# get_realized_pnl_by_generation), not just overnight_evolution.py's own
+# one-day simulated replay. 0 == no evolution promoted yet, config defaults.
+_current_generation: int = 0
 
 
 def _load_evolved_params() -> None:
-    global _evolved_overrides
+    global _evolved_overrides, _current_generation
     path = Path(__file__).resolve().parent / "state" / "evolved_params.json"
     if not path.exists():
         _evolved_overrides = {}
+        _current_generation = 0
         return
     try:
         data = _json.loads(path.read_text())
         _evolved_overrides = {k: v for k, v in data.items()
                               if k not in ("evolved_at", "generation", "promotion_reason")}
+        _current_generation = int(data.get("generation", 0))
         logger.info("Loaded evolved params (gen %s): %s",
-                     data.get("generation", "?"), _evolved_overrides)
+                     _current_generation, _evolved_overrides)
     except Exception:
         logger.exception("Failed to load evolved_params.json, using config defaults")
         _evolved_overrides = {}
+        _current_generation = 0
 
 
 def _risk(attr: str):
@@ -551,7 +559,7 @@ async def run_cycle() -> None:
             # Corrected via db.update_cycle_decision() once it is — see the
             # bug this replaced in update_cycle_decision's own docstring.
             try:
-                cycle_id = db.record_cycle(slim_candidates, "pending", reasoning)
+                cycle_id = db.record_cycle(slim_candidates, "pending", reasoning, generation=_current_generation)
             except Exception:
                 logger.exception("Failed to record cycle to DB")
                 cycle_id = None
@@ -600,6 +608,7 @@ async def run_cycle() -> None:
                             max_loss=plan.max_loss,
                             alpaca_order_ids=order_ids,
                             cycle_id=cycle_id,
+                            generation=_current_generation,
                         )
                     except Exception:
                         logger.exception("Failed to record spread open to DB (order already sent to Alpaca)")
@@ -624,7 +633,7 @@ async def run_cycle() -> None:
         # update-if-pending, never both.
         if cycle_id is None:
             try:
-                cycle_id = db.record_cycle(slim_candidates, decision, reasoning)
+                cycle_id = db.record_cycle(slim_candidates, decision, reasoning, generation=_current_generation)
             except Exception:
                 logger.exception("Failed to record cycle to DB (non-fatal)")
         else:
