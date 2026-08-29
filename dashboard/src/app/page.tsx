@@ -51,7 +51,7 @@ interface DashboardState {
     reasoning: string | null;
     error: string | null;
   }>;
-  equityCurve: Array<{ equity: number; snapshot_at: string }>;
+  equityCurve: Array<{ equity: number; spy_price: number | null; snapshot_at: string }>;
 }
 
 type SpreadRow = DashboardState['spreads'][number];
@@ -188,6 +188,12 @@ export default function DashboardPage() {
               )}
             </div>
             <EquitySparkline points={equityCurve} />
+            {equityCurve.some((p) => p.spy_price != null) && (
+              <p className="text-xs text-gray-500 mt-1 flex items-center gap-1.5">
+                <span className="inline-block w-3 border-t border-dashed border-gray-400" />
+                SPY, same-dated (skill vs market)
+              </p>
+            )}
             <p className="text-xs text-gray-500 mt-2">
               {latestSnapshot.open_spreads_count} open spread{latestSnapshot.open_spreads_count === 1 ? '' : 's'} ·
               last updated {new Date(latestSnapshot.snapshot_at).toLocaleString()}

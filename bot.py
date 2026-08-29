@@ -627,9 +627,30 @@ async def _pre_trade_check(
     open_count: int,
     existing_exposure: dict[str, float] | None = None,
 ) -> tuple[bool, str | None, SpreadPlan]:
-    """Last-second validation before sending an order to Alpaca.
+    """Last-second validation before sending an order to Alpaca. Fail-closed
+    (2026-08-29, prompted by reviewing a teammate's equivalent gate): any
+    unexpected exception here blocks the trade with a labeled reason instead
+    of propagating into run_cycle()'s broader per-candidate error handling,
+    which would have logged it as an "open" failure even though nothing was
+    ever attempted. Safety was already equivalent either way (both paths
+    result in no trade) -- this is about the journal telling the truth
+    about which stage actually failed.
+    """
+    try:
+        return await _pre_trade_check_inner(mcp, plan, account, open_count, existing_exposure)
+    except Exception as exc:
+        logger.exception("Pre-trade gate errored for %s — blocking the trade (fail-closed)", plan.underlying)
+        return False, f"gate error (fail-closed): {exc}", plan
 
-    Re-fetches fresh option quotes for both legs, recomputes the credit
+
+async def _pre_trade_check_inner(
+    mcp: AlpacaMCP,
+    plan: SpreadPlan,
+    account: dict,
+    open_count: int,
+    existing_exposure: dict[str, float] | None = None,
+) -> tuple[bool, str | None, SpreadPlan]:
+    """Re-fetches fresh option quotes for both legs, recomputes the credit
     estimate, and re-runs risk_gate.check_new_spread.  If the credit has
     shrunk by more than 20 % relative to the original estimate the trade
     is skipped — the market moved against us between candidate screening
@@ -694,6 +715,23 @@ async def _pre_trade_check(
         # Same sanity check as spread_builder.build_spread — a fresh
         # requote can hit this too, not just the initial build.
         return False, f"fresh max_loss is non-positive (${updated_max_loss:.2f}), refusing to trade", plan
+
+    # Buying-power floor (2026-08-29, prompted by reviewing a teammate's
+    # equivalent gate): equity alone doesn't say collateral is actually
+    # free -- concurrent open spreads tie up buying power as margin, so a
+    # healthy-looking equity% check could still pass while there isn't
+    # enough real collateral for even one contract. Checked against ONE
+    # contract's max_loss here; _optimal_contracts (after this gate) sizes
+    # down from there, never up, so this floor can't be satisfied by
+    # accident then violated by the real order.
+    buying_power = float(account.get("buying_power") or 0.0)
+    if buying_power < updated_max_loss:
+        return (
+            False,
+            f"buying power ${buying_power:,.2f} below one contract's max loss ${updated_max_loss:,.2f}",
+            plan,
+        )
+
     updated_plan = SpreadPlan(
         underlying=plan.underlying,
         direction=plan.direction,
@@ -725,6 +763,29 @@ async def _pre_trade_check(
 
 
 async def _pre_trade_check_iron_condor(
+    mcp: AlpacaMCP,
+    plan: IronCondorPlan,
+    account: dict,
+    open_count: int,
+    existing_exposure: dict[str, float] | None = None,
+    open_iron_condor_count: int = 0,
+    open_iron_condor_exposure: float = 0.0,
+) -> tuple[bool, str | None, IronCondorPlan]:
+    """Fail-closed wrapper — same reasoning as `_pre_trade_check`'s
+    (2026-08-29): an unexpected exception blocks the trade with a labeled
+    reason instead of surfacing as a misleading "open" failure upstream.
+    """
+    try:
+        return await _pre_trade_check_iron_condor_inner(
+            mcp, plan, account, open_count, existing_exposure,
+            open_iron_condor_count, open_iron_condor_exposure,
+        )
+    except Exception as exc:
+        logger.exception("Pre-trade gate errored for %s — blocking the trade (fail-closed)", plan.underlying)
+        return False, f"gate error (fail-closed): {exc}", plan
+
+
+async def _pre_trade_check_iron_condor_inner(
     mcp: AlpacaMCP,
     plan: IronCondorPlan,
     account: dict,
@@ -820,6 +881,15 @@ async def _pre_trade_check_iron_condor(
             f"fresh credit ${fresh_credit:.2f} is below the "
             f"{config.risk.min_credit_to_width_pct:.0%} min-credit-to-width floor "
             f"(${min_credit:.2f})",
+            plan,
+        )
+
+    # Buying-power floor (2026-08-29) -- same reasoning as _pre_trade_check's.
+    buying_power = float(account.get("buying_power") or 0.0)
+    if buying_power < updated_max_loss:
+        return (
+            False,
+            f"buying power ${buying_power:,.2f} below one contract's max loss ${updated_max_loss:,.2f}",
             plan,
         )
 
@@ -1123,6 +1193,19 @@ async def run_cycle() -> None:
             except Exception:
                 logger.exception("Failed to record decision journal (non-fatal)")
 
+        # SPY close alongside every snapshot -- a synthetic, non-capital-
+        # consuming shadow benchmark (2026-08-29, prompted by reviewing a
+        # teammate's build): lets the dashboard show "skill vs market"
+        # instead of a bare equity curve that a rising tape alone could
+        # explain. Best-effort; a quote failure must never block recording
+        # the snapshot itself.
+        spy_price: float | None = None
+        try:
+            spy_result = await mcp.call("get_stock_latest_trade", {"symbols": "SPY"})
+            spy_price = float((spy_result or {}).get("data", {}).get("trades", {}).get("SPY", {}).get("p"))
+        except Exception:
+            logger.exception("Failed to fetch SPY price for snapshot (non-fatal)")
+
         try:
             db.record_account_snapshot(
                 equity=float(account["equity"]),
@@ -1131,6 +1214,7 @@ async def run_cycle() -> None:
                 open_spreads_count=len(open_spreads),
                 daily_pl=float(account.get("daily_pl")) if account.get("daily_pl") else None,
                 daily_pl_pct=float(account.get("daily_pl_pct")) if account.get("daily_pl_pct") else None,
+                spy_price=spy_price,
             )
         except Exception:
             logger.exception("Failed to record account snapshot (non-fatal)")

@@ -373,13 +373,14 @@ def record_account_snapshot(
     open_spreads_count: int,
     daily_pl: float | None,
     daily_pl_pct: float | None,
+    spy_price: float | None = None,
 ) -> None:
     with _connection() as conn, conn.cursor() as cur:
         cur.execute(
             f"""
             insert into {_schema()}.account_snapshots
-                (equity, last_equity, cash, open_spreads_count, daily_pl, daily_pl_pct)
-            values (%s, %s, %s, %s, %s, %s)
+                (equity, last_equity, cash, open_spreads_count, daily_pl, daily_pl_pct, spy_price)
+            values (%s, %s, %s, %s, %s, %s, %s)
             """,
-            (equity, last_equity, cash, open_spreads_count, daily_pl, daily_pl_pct),
+            (equity, last_equity, cash, open_spreads_count, daily_pl, daily_pl_pct, spy_price),
         )

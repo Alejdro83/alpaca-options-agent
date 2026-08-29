@@ -35,6 +35,7 @@ export interface AccountSnapshot {
   open_spreads_count: number;
   daily_pl: number | null;
   daily_pl_pct: number | null;
+  spy_price: number | null;
   snapshot_at: string;
 }
 
@@ -82,7 +83,7 @@ export async function getDashboardState() {
   try {
     const [snapshot, spreads, cycles] = await Promise.all([
       client.query<AccountSnapshot>(
-        `select equity, last_equity, cash, open_spreads_count, daily_pl, daily_pl_pct, snapshot_at
+        `select equity, last_equity, cash, open_spreads_count, daily_pl, daily_pl_pct, spy_price, snapshot_at
          from ${SCHEMA}.account_snapshots order by snapshot_at desc limit 1`
       ),
       client.query<Spread>(
@@ -98,8 +99,8 @@ export async function getDashboardState() {
       ),
       // Equity curve for the chart — every snapshot, not just the latest.
     ]);
-    const curve = await client.query<Pick<AccountSnapshot, 'equity' | 'snapshot_at'>>(
-      `select equity, snapshot_at from ${SCHEMA}.account_snapshots order by snapshot_at asc`
+    const curve = await client.query<Pick<AccountSnapshot, 'equity' | 'spy_price' | 'snapshot_at'>>(
+      `select equity, spy_price, snapshot_at from ${SCHEMA}.account_snapshots order by snapshot_at asc`
     );
 
     return {
