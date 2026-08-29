@@ -277,6 +277,80 @@ def _apply_trend_and_volatility_filters(client: AlpacaClient, signals: list) -> 
     return kept
 
 
+# Adaptive cron frequency (2026-08-29): the alternative to this project's
+# original fixed 15-min cadence, requested explicitly as "our same
+# strategy, just a bit smarter than a flat cron" rather than the separate
+# natural-language trading agent ("Paco"/zeroclaw) that got tried first
+# and was reviewed out (shared the real judged account with no
+# coordination, and re-implemented risk logic as prompt text instead of
+# code -- see pendientes.md for the full writeup). This keeps bot.py,
+# risk_gate.py, spread_builder.py, and the LLM's role completely
+# unchanged; it only rewrites this job's OWN schedule in Hermes's
+# jobs.json at the end of each cycle, based on the state that cycle just
+# observed.
+_HERMES_JOBS_PATH = Path.home() / ".hermes" / "cron" / "jobs.json"
+_ALPACA_CRON_JOB_ID = "e9ff8808c39c"
+
+
+def _adaptive_cron_minutes(open_count: int, near_stop: bool, circuit_breaker_active: bool) -> int:
+    """2 min if any open position is near its stop (risk_gate.is_near_stop)
+    -- regardless of the circuit breaker, an existing position still needs
+    fast reaction. 5 min with positions open and none near stop (this
+    project's original fixed cadence, kept as the "normal" tier). 30 min
+    idle (no open positions) AND the daily circuit breaker is active --
+    nothing to do until it resets at the next session. 10 min idle and
+    calm otherwise.
+    """
+    if near_stop:
+        return 2
+    if open_count > 0:
+        return 5
+    if circuit_breaker_active:
+        return 30
+    return 10
+
+
+def _update_cron_frequency(minutes: int) -> None:
+    """Rewrites _ALPACA_CRON_JOB_ID's own schedule in Hermes's jobs.json.
+    Non-fatal on any failure -- an adaptive-frequency problem must never
+    crash or block a cycle that already ran correctly; worst case, the
+    schedule just stays at whatever it already was.
+    """
+    try:
+        if not _HERMES_JOBS_PATH.exists():
+            logger.warning("Adaptive cron: %s not found, skipping", _HERMES_JOBS_PATH)
+            return
+        data = _json.loads(_HERMES_JOBS_PATH.read_text())
+        jobs = data if isinstance(data, list) else data.get("jobs", [])
+        job = next((j for j in jobs if j.get("id") == _ALPACA_CRON_JOB_ID), None)
+        if job is None:
+            job = next((j for j in jobs if j.get("name") == "Alpaca Options Agent"), None)
+        if job is None:
+            logger.warning("Adaptive cron: couldn't find the Alpaca Options Agent job, skipping")
+            return
+
+        new_expr = f"*/{minutes} 13-20 * * 1-5"
+        schedule = job.get("schedule") or {}
+        if schedule.get("expr") == new_expr:
+            return  # already at this frequency, don't touch the file
+
+        old_expr = schedule.get("expr")
+        schedule["expr"] = new_expr
+        schedule["display"] = new_expr
+        job["schedule"] = schedule
+        job["schedule_display"] = new_expr
+
+        # Atomic write -- jobs.json is a live file Hermes's own scheduler
+        # reads; a crash mid-write must never leave it torn/corrupted.
+        tmp_path = _HERMES_JOBS_PATH.with_suffix(".json.tmp")
+        tmp_path.write_text(_json.dumps(data, indent=2, default=str))
+        tmp_path.replace(_HERMES_JOBS_PATH)
+        logger.info("Adaptive cron: frequency %s -> %s", old_expr, new_expr)
+        print(f"Adjusting check frequency to every {minutes} min (was {old_expr})")
+    except Exception:
+        logger.exception("Adaptive cron: failed to update frequency (non-fatal)")
+
+
 def _optimal_contracts(equity: float, max_loss_per_contract: float, max_risk_pct: float = 0.02) -> int:
     """Size contracts so total max loss stays within risk budget."""
     if max_loss_per_contract <= 0:
@@ -286,8 +360,15 @@ def _optimal_contracts(equity: float, max_loss_per_contract: float, max_risk_pct
     return max(contracts, 1)
 
 
-async def manage_open_spreads(mcp: AlpacaMCP) -> list[str]:
+async def manage_open_spreads(mcp: AlpacaMCP) -> tuple[list[str], bool]:
+    """Returns (notes, near_stop) -- near_stop is True if ANY still-open
+    spread (after this pass' closes) is within risk_gate.is_near_stop's
+    80% threshold of its stop. Feeds the adaptive cron frequency at the
+    end of run_cycle() -- checking every leg's mark here already happens
+    regardless, so this reuses marks already fetched, no extra API calls.
+    """
     notes = []
+    near_stop = False
     for spread in db.get_open_spreads():
         expiration = datetime.strptime(str(spread["expiration"]), "%Y-%m-%d").date()
         force_close, force_reason = risk_gate.should_force_close(expiration=expiration)
@@ -325,6 +406,10 @@ async def manage_open_spreads(mcp: AlpacaMCP) -> list[str]:
                 credit_received=float(spread["credit_received"]),
                 current_mark=mark,
             )
+            if not should_close and risk_gate.is_near_stop(
+                credit_received=float(spread["credit_received"]), current_mark=mark,
+            ):
+                near_stop = True
         if not should_close:
             continue
         try:
@@ -365,7 +450,7 @@ async def manage_open_spreads(mcp: AlpacaMCP) -> list[str]:
         except Exception as exc:
             logger.exception("Failed to close spread %s", spread["id"])
             notes.append(f"ERROR closing {spread['underlying']}: {exc}")
-    return notes
+    return notes, near_stop
 
 
 async def find_candidates(
@@ -814,7 +899,7 @@ async def run_cycle() -> None:
     account["daily_pl_pct"] = daily_pl_pct
 
     async with AlpacaMCP() as mcp:
-        close_notes = await manage_open_spreads(mcp)
+        close_notes, near_stop = await manage_open_spreads(mcp)
 
         try:
             open_spreads = db.get_open_spreads()
@@ -1049,6 +1134,16 @@ async def run_cycle() -> None:
             )
         except Exception:
             logger.exception("Failed to record account snapshot (non-fatal)")
+
+        try:
+            final_open_count = len(db.get_open_spreads())
+        except Exception:
+            logger.exception("Failed to read open spreads for adaptive cron (non-fatal, keeping current frequency)")
+            final_open_count = None
+        if final_open_count is not None:
+            circuit_breaker_active = daily_pl_pct <= -config.risk.max_daily_loss_pct
+            minutes = _adaptive_cron_minutes(final_open_count, near_stop, circuit_breaker_active)
+            _update_cron_frequency(minutes)
 
         for note in close_notes + open_notes:
             print(note)

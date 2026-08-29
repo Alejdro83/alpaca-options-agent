@@ -139,6 +139,21 @@ def should_close(
     return False, None
 
 
+def is_near_stop(*, credit_received: float, current_mark: float, near_pct: float = 0.80) -> bool:
+    """Early-warning signal for the adaptive cron frequency (2026-08-29) --
+    True once `current_mark` has closed `near_pct` of the way to the stop
+    threshold (`credit_received * stop_loss_multiple`), distinct from
+    should_close's own hard 100% trigger. Lets run_cycle() check more
+    often while a position is getting close to a real stop, without
+    changing should_close's own trigger point at all.
+    """
+    if not credit_received:
+        return False
+    limits = config.risk
+    stop_threshold = credit_received * limits.stop_loss_multiple
+    return current_mark >= stop_threshold * near_pct
+
+
 def should_force_close(
     *,
     expiration: date,
