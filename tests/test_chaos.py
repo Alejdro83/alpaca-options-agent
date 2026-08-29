@@ -912,3 +912,133 @@ class TestSpreadBuilderEdgeCases:
 
         # Inverted strikes -> must be rejected
         assert result is None
+
+
+# ===================================================================
+# 10. CORRELATION-CLUSTER CONCENTRATION CAP (added 2026-08-29)
+# ===================================================================
+
+class TestClusterConcentrationCap:
+    """risk_gate.check_new_spread's cluster_exposure gate: a real gap the
+    per-underlying concentration cap doesn't cover -- several concurrent
+    spreads on DIFFERENT mega-cap tech names aren't independent bets (see
+    screening/correlation_clusters.py). Added after a research pass on
+    further improvements worth making before the contest deadline.
+    """
+
+    def test_cluster_cap_breached_rejects(self):
+        import risk_gate
+
+        today = date.today()
+        exp = today + timedelta(days=10)
+        result = risk_gate.check_new_spread(
+            equity=100_000, daily_pl_pct=0.0, open_spreads_count=1, max_loss=200,
+            expiration=exp, today=today,
+            underlying="AAPL", cluster_exposure={"mega_cap_tech": 39_900},
+        )
+        assert result.allowed is False
+        assert any("mega_cap_tech" in r for r in result.reasons)
+
+    def test_cluster_cap_not_breached_allows(self):
+        import risk_gate
+
+        today = date.today()
+        exp = today + timedelta(days=10)
+        result = risk_gate.check_new_spread(
+            equity=100_000, daily_pl_pct=0.0, open_spreads_count=1, max_loss=200,
+            expiration=exp, today=today,
+            underlying="AAPL", cluster_exposure={"mega_cap_tech": 5_000},
+        )
+        assert result.allowed is True
+
+    def test_ticker_outside_any_cluster_never_rejected_by_this_gate(self):
+        """JPM isn't in any defined cluster -- cluster_for returns None, so
+        this gate must never fire for it regardless of cluster_exposure's
+        contents (it would be a different underlying's exposure anyway)."""
+        import risk_gate
+
+        today = date.today()
+        exp = today + timedelta(days=10)
+        result = risk_gate.check_new_spread(
+            equity=100_000, daily_pl_pct=0.0, open_spreads_count=1, max_loss=200,
+            expiration=exp, today=today,
+            underlying="JPM", cluster_exposure={"mega_cap_tech": 39_900},
+        )
+        assert result.allowed is True
+
+    @pytest.mark.asyncio
+    async def test_pre_trade_check_blocks_on_cluster_breach(self):
+        """The pre-trade re-check (not just find_candidates' initial gate)
+        must also see cluster_exposure -- same 2026-08-28 audit discipline
+        already applied to existing_exposure/open_iron_condor_count."""
+        from bot import _pre_trade_check
+
+        mcp = FakeMCP()
+        plan = make_plan(underlying="MSFT", credit_estimate=1.50, max_loss=3.50)
+        account = {"equity": 100_000, "last_equity": 100_000, "buying_power": 100_000.0}
+
+        short_snap = make_quote(bid=1.40, ask=1.60, age_minutes=1)
+        long_snap = make_quote(bid=0.10, ask=0.20, age_minutes=1)
+        mcp.set_response("get_option_snapshot", make_snapshot_response({
+            plan.short_symbol: short_snap,
+            plan.long_symbol: long_snap,
+        }))
+
+        allowed, reason, _ = await _pre_trade_check(
+            mcp, plan, account, 0, cluster_exposure={"mega_cap_tech": 39_900},
+        )
+        assert allowed is False
+        assert reason is not None
+        assert "mega_cap_tech" in reason
+
+
+# ===================================================================
+# 11. EXIT-RULE COUNTERFACTUALS (added 2026-08-29)
+# ===================================================================
+
+class TestExitRuleCounterfactuals:
+    """risk_gate.should_close's stop_loss_multiple_override/disable_stop:
+    lets shadow_book.py run tight-stop/no-stop as counterfactual policies
+    against real live decisions, without changing the real book's own
+    default (2x) behavior. Default-args behavior must be byte-for-byte
+    unchanged from before these params existed.
+    """
+
+    def test_default_behavior_unchanged(self):
+        import risk_gate
+
+        # mark = 1.5x credit -> below the real 2x stop, should NOT close
+        should_close, reason = risk_gate.should_close(credit_received=1.0, current_mark=1.5)
+        assert should_close is False
+        assert reason is None
+
+    def test_tight_stop_override_closes_where_default_would_not(self):
+        import risk_gate
+
+        should_close, reason = risk_gate.should_close(
+            credit_received=1.0, current_mark=1.5, stop_loss_multiple_override=1.0,
+        )
+        assert should_close is True
+        assert "1.0x" in reason
+
+    def test_disable_stop_never_closes_on_stop_no_matter_how_bad(self):
+        import risk_gate
+
+        # mark = 5x credit -- a real blowout that would trip any normal stop
+        should_close, reason = risk_gate.should_close(
+            credit_received=1.0, current_mark=5.0, disable_stop=True,
+        )
+        assert should_close is False
+        assert reason is None
+
+    def test_disable_stop_still_honors_profit_target(self):
+        """disable_stop must only suppress the STOP check -- the profit
+        target exit (checked first, unconditionally) must still fire."""
+        import risk_gate
+
+        # 60% profit captured, default profit_target_pct is 50%
+        should_close, reason = risk_gate.should_close(
+            credit_received=1.0, current_mark=0.40, disable_stop=True,
+        )
+        assert should_close is True
+        assert "profit target" in reason

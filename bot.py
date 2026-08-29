@@ -33,6 +33,7 @@ from alpaca.data.timeframe import TimeFrame
 
 from alpaca_client import AlpacaClient
 from config import config
+from screening import correlation_clusters
 from screening.universe import get_universe
 from screening.filters import filter_universe
 from signals.indicators import compute_atr
@@ -466,6 +467,7 @@ async def find_candidates(
     today = datetime.now(timezone.utc).date()
 
     existing_exposure: dict[str, float] = {}
+    cluster_exposure: dict[str, float] = {}
     open_iron_condor_count = 0
     iron_condor_total_exposure = 0.0
     for s in db.get_open_spreads():
@@ -480,6 +482,9 @@ async def find_candidates(
         contracts_held = int(s.get("contracts") or 1)
         max_loss_total = float(s.get("max_loss", 0)) * contracts_held
         existing_exposure[underlying] = existing_exposure.get(underlying, 0) + max_loss_total
+        cluster = correlation_clusters.cluster_for(underlying)
+        if cluster is not None:
+            cluster_exposure[cluster] = cluster_exposure.get(cluster, 0) + max_loss_total
         if s.get("strategy") == "iron_condor":
             open_iron_condor_count += 1
             iron_condor_total_exposure += max_loss_total
@@ -585,6 +590,7 @@ async def find_candidates(
             strategy="iron_condor" if is_iron_condor else "vertical",
             open_iron_condor_count=open_iron_condor_count,
             open_iron_condor_exposure=iron_condor_total_exposure,
+            cluster_exposure=cluster_exposure,
         )
         if not check.allowed:
             logger.info("%s rejected by risk gate: %s", sig.ticker, check.reasons)
@@ -645,6 +651,7 @@ async def _pre_trade_check(
     account: dict,
     open_count: int,
     existing_exposure: dict[str, float] | None = None,
+    cluster_exposure: dict[str, float] | None = None,
 ) -> tuple[bool, str | None, SpreadPlan]:
     """Last-second validation before sending an order to Alpaca. Fail-closed
     (2026-08-29, prompted by reviewing a teammate's equivalent gate): any
@@ -656,7 +663,7 @@ async def _pre_trade_check(
     about which stage actually failed.
     """
     try:
-        return await _pre_trade_check_inner(mcp, plan, account, open_count, existing_exposure)
+        return await _pre_trade_check_inner(mcp, plan, account, open_count, existing_exposure, cluster_exposure)
     except Exception as exc:
         logger.exception("Pre-trade gate errored for %s — blocking the trade (fail-closed)", plan.underlying)
         return False, f"gate error (fail-closed): {exc}", plan
@@ -668,6 +675,7 @@ async def _pre_trade_check_inner(
     account: dict,
     open_count: int,
     existing_exposure: dict[str, float] | None = None,
+    cluster_exposure: dict[str, float] | None = None,
 ) -> tuple[bool, str | None, SpreadPlan]:
     """Re-fetches fresh option quotes for both legs, recomputes the credit
     estimate, and re-runs risk_gate.check_new_spread.  If the credit has
@@ -774,6 +782,7 @@ async def _pre_trade_check_inner(
         existing_exposure=existing_exposure,
         underlying=plan.underlying,
         strategy="vertical",
+        cluster_exposure=cluster_exposure,
     )
     if not check.allowed:
         return False, f"risk gate rejected on fresh quotes: {check.reasons}", updated_plan
@@ -789,6 +798,7 @@ async def _pre_trade_check_iron_condor(
     existing_exposure: dict[str, float] | None = None,
     open_iron_condor_count: int = 0,
     open_iron_condor_exposure: float = 0.0,
+    cluster_exposure: dict[str, float] | None = None,
 ) -> tuple[bool, str | None, IronCondorPlan]:
     """Fail-closed wrapper — same reasoning as `_pre_trade_check`'s
     (2026-08-29): an unexpected exception blocks the trade with a labeled
@@ -797,7 +807,7 @@ async def _pre_trade_check_iron_condor(
     try:
         return await _pre_trade_check_iron_condor_inner(
             mcp, plan, account, open_count, existing_exposure,
-            open_iron_condor_count, open_iron_condor_exposure,
+            open_iron_condor_count, open_iron_condor_exposure, cluster_exposure,
         )
     except Exception as exc:
         logger.exception("Pre-trade gate errored for %s — blocking the trade (fail-closed)", plan.underlying)
@@ -812,6 +822,7 @@ async def _pre_trade_check_iron_condor_inner(
     existing_exposure: dict[str, float] | None = None,
     open_iron_condor_count: int = 0,
     open_iron_condor_exposure: float = 0.0,
+    cluster_exposure: dict[str, float] | None = None,
 ) -> tuple[bool, str | None, IronCondorPlan]:
     """Same last-second-validation discipline as `_pre_trade_check`, applied
     to all 4 iron condor legs in one snapshot call instead of 2: fresh
@@ -941,6 +952,7 @@ async def _pre_trade_check_iron_condor_inner(
         strategy="iron_condor",
         open_iron_condor_count=open_iron_condor_count,
         open_iron_condor_exposure=open_iron_condor_exposure,
+        cluster_exposure=cluster_exposure,
     )
     if not check.allowed:
         return False, f"risk gate rejected on fresh quotes: {check.reasons}", updated_plan
@@ -1018,6 +1030,7 @@ async def run_cycle() -> None:
         # cap or the max-concurrent-iron-condor cap without either final
         # gate ever seeing it.
         running_exposure: dict[str, float] = {}
+        running_cluster_exposure: dict[str, float] = {}
         running_ic_count = 0
         running_ic_exposure = 0.0
         for s in open_spreads:
@@ -1026,6 +1039,9 @@ async def run_cycle() -> None:
             contracts_held = int(s.get("contracts") or 1)
             max_loss_total = float(s.get("max_loss", 0)) * contracts_held
             running_exposure[s["underlying"]] = running_exposure.get(s["underlying"], 0) + max_loss_total
+            cluster = correlation_clusters.cluster_for(s["underlying"])
+            if cluster is not None:
+                running_cluster_exposure[cluster] = running_cluster_exposure.get(cluster, 0) + max_loss_total
             if s.get("strategy") == "iron_condor":
                 running_ic_count += 1
                 running_ic_exposure += max_loss_total
@@ -1098,11 +1114,13 @@ async def run_cycle() -> None:
                             existing_exposure=running_exposure,
                             open_iron_condor_count=running_ic_count,
                             open_iron_condor_exposure=running_ic_exposure,
+                            cluster_exposure=running_cluster_exposure,
                         )
                     else:
                         allowed, reason, plan = await _pre_trade_check(
                             mcp, plan, account, running_spread_count,
                             existing_exposure=running_exposure,
+                            cluster_exposure=running_cluster_exposure,
                         )
                     if not allowed:
                         logger.info("Pre-trade check blocked %s: %s", plan.underlying, reason)
@@ -1184,9 +1202,23 @@ async def run_cycle() -> None:
                     running_spread_count += 1
                     max_loss_just_opened = plan.max_loss * contracts
                     running_exposure[plan.underlying] = running_exposure.get(plan.underlying, 0) + max_loss_just_opened
+                    just_opened_cluster = correlation_clusters.cluster_for(plan.underlying)
+                    if just_opened_cluster is not None:
+                        running_cluster_exposure[just_opened_cluster] = (
+                            running_cluster_exposure.get(just_opened_cluster, 0) + max_loss_just_opened
+                        )
                     if is_iron_condor:
                         running_ic_count += 1
                         running_ic_exposure += max_loss_just_opened
+
+                    # Exit-rule counterfactuals (2026-08-29, research pass):
+                    # mirror this REAL pick under tight-stop/no-stop policies
+                    # in the shadow book, isolating the effect of the exit
+                    # rule alone from the effect of selection.
+                    try:
+                        shadow_book.open_llm_mirror(cycle_id, c, plan, contracts)
+                    except Exception:
+                        logger.exception("shadow_book.open_llm_mirror failed (non-fatal)")
                 except Exception as exc:
                     logger.exception("Failed to open spread for %s", plan.underlying)
                     open_notes.append(f"ERROR opening {plan.underlying}: {exc}")

@@ -238,6 +238,19 @@ class OptionsRiskLimits:
         # aggregated across all ICs instead of per-underlying.
         default_factory=lambda: _env_float("MAX_IRON_CONDOR_EQUITY_PCT", 0.30)
     )
+    max_cluster_concentration_pct: float = field(
+        # Real gap max_concentration_pct (per-underlying) does NOT cover
+        # (2026-08-29, research pass): mega-cap tech pairwise correlations
+        # spike toward ~0.9 in stress, so several concurrent spreads on
+        # different mega-cap names aren't independent bets -- see
+        # screening/correlation_clusters.py. Looser than the 20%
+        # per-underlying cap since it aggregates multiple symbols by
+        # design (two symbols at the per-underlying cap should still fit);
+        # a starting value, not independently backtested -- watch real
+        # per-generation P&L the same way every other threshold here is
+        # watched, same evolution audit-trail mechanism.
+        default_factory=lambda: _env_float("MAX_CLUSTER_CONCENTRATION_PCT", 0.40)
+    )
     contest_end_utc: str = field(
         # Hard close-out deadline, independent of profit/loss — added
         # specifically because should_close() previously only fired on

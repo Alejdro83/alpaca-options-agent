@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react';
 import { Shell } from '@/components/Shell';
 import { EquitySparkline } from '@/components/EquitySparkline';
+import { ExitRuleComparisonPanel } from '@/components/ExitRuleComparisonPanel';
 import { KpiRow } from '@/components/KpiRow';
 import { RiskGatesPanel } from '@/components/RiskGatesPanel';
 import { ShadowBookPanel } from '@/components/ShadowBookPanel';
@@ -213,6 +214,12 @@ export default function DashboardPage() {
           </section>
 
           <ShadowBookPanel data={shadowBook} />
+
+          <ExitRuleComparisonPanel
+            summaries={shadowBook.summaries}
+            policySeries={shadowBook.shadowPnlSeries}
+            llmSeries={shadowBook.llmPnlSeries}
+          />
 
           <section className="mb-4">
             <h2 className="text-sm font-semibold text-gray-300 mb-2">Open spreads ({openSpreads.length})</h2>

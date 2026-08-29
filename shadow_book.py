@@ -1,12 +1,24 @@
-"""Shadow book — counterfactual P&L tracking for two alternative policies
-(mechanical rule and random pick), evaluated on the same gate-approved
-candidate menu the real LLM cycle saw.
+"""Shadow book — counterfactual P&L tracking for alternative policies,
+evaluated on the same gate-approved candidate menu (or the same real fill)
+the real LLM cycle saw.
 
 Each cycle, after the real decision is recorded, `open_counterfactuals`
-opens virtual positions for both policies. `manage_open` marks them to
-market and closes them by the same risk_gate rules as the real book —
-never touching Alpaca for orders, only reading quotes via
-executor_mcp.get_spread_mark / get_iron_condor_mark.
+opens virtual positions for the `shadow` (mechanical rule) and `random`
+policies. `manage_open` marks everything to market and closes by the same
+risk_gate rules as the real book — never touching Alpaca for orders, only
+reading quotes via executor_mcp.get_spread_mark / get_iron_condor_mark.
+
+`open_llm_mirror` (2026-08-29, research pass) is a second, independent
+kind of counterfactual: it mirrors the REAL LLM pick (same underlying,
+strike, credit, contracts as the position bot.py actually opened) under
+two alternative EXIT rules instead of alternative SELECTION rules --
+`llm_tight_stop` (1x credit stop) and `llm_no_stop` (no stop-loss trigger
+at all, only profit target / force-close). This tests a specific,
+concrete research finding (single-source, not peer-reviewed, so not
+strong enough to change the real book's own 2x stop outright): for
+short-DTE credit spreads, a tight stop or no stop each reportedly beat a
+middle-ground multiple like 2x. `manage_open` applies the matching
+risk_gate.should_close override per policy.
 
 Every function is wrapped in try/except that logs and swallows — this
 module must NEVER be able to affect the real trading path, matching the
@@ -239,6 +251,27 @@ def _open_counterfactuals_inner(
             )
 
 
+def open_llm_mirror(cycle_id: int | None, candidate: dict, plan: Any, contracts: int) -> None:
+    """Mirrors a REAL LLM pick under the two exit-rule counterfactual
+    policies (2026-08-29, research pass) -- called right after bot.py's
+    real open succeeds, with the exact same plan/contracts as the real
+    position, so `llm_tight_stop`/`llm_no_stop` diverge from the real book
+    ONLY in how they exit, never in what/how much was entered. Wrapped in
+    try/except -- must never affect the real trading path.
+    """
+    try:
+        record_open(
+            cycle_id=cycle_id, policy="llm_tight_stop", candidate=candidate,
+            plan=plan, contracts=contracts, same_as_llm=True,
+        )
+        record_open(
+            cycle_id=cycle_id, policy="llm_no_stop", candidate=candidate,
+            plan=plan, contracts=contracts, same_as_llm=True,
+        )
+    except Exception:
+        logger.exception("Shadow book: open_llm_mirror failed (non-fatal)")
+
+
 def _optimal_contracts(equity: float, max_loss_per_contract: float, max_risk_pct: float = 0.02) -> int:
     """Size contracts so total max loss stays within risk budget.
     Same function as bot._optimal_contracts — duplicated here to avoid a
@@ -305,10 +338,28 @@ async def _manage_open_inner(mcp) -> None:
             elif mark is None:
                 continue
             else:
-                should_close, reason = risk_gate.should_close(
-                    credit_received=float(pos["credit_received"]),
-                    current_mark=mark,
-                )
+                # Exit-rule counterfactuals (2026-08-29): llm_tight_stop/
+                # llm_no_stop mirror a real LLM pick but exit differently --
+                # 'shadow'/'random' (selection counterfactuals) keep the
+                # real book's own default (2x) stop unchanged.
+                policy = pos.get("policy")
+                if policy == "llm_tight_stop":
+                    should_close, reason = risk_gate.should_close(
+                        credit_received=float(pos["credit_received"]),
+                        current_mark=mark,
+                        stop_loss_multiple_override=1.0,
+                    )
+                elif policy == "llm_no_stop":
+                    should_close, reason = risk_gate.should_close(
+                        credit_received=float(pos["credit_received"]),
+                        current_mark=mark,
+                        disable_stop=True,
+                    )
+                else:
+                    should_close, reason = risk_gate.should_close(
+                        credit_received=float(pos["credit_received"]),
+                        current_mark=mark,
+                    )
             if not should_close:
                 if mark is not None:
                     # Update unrealized mark for dashboard display.

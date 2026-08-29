@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 
 from config import config
+from screening.correlation_clusters import cluster_for
 
 
 @dataclass
@@ -51,6 +52,7 @@ def check_new_spread(
     strategy: str = "vertical",
     open_iron_condor_count: int = 0,
     open_iron_condor_exposure: float = 0.0,
+    cluster_exposure: dict[str, float] | None = None,
 ) -> RiskCheckResult:
     reasons: list[str] = []
     limits = config.risk
@@ -115,6 +117,27 @@ def check_new_spread(
                 f"(${concentration_cap:.2f})"
             )
 
+    # Correlation-cluster concentration (2026-08-29, research pass) -- a
+    # real gap the per-underlying cap above does NOT cover: several
+    # concurrent spreads on DIFFERENT mega-cap tech names aren't
+    # independent bets, since those names' pairwise correlation spikes in
+    # stress (see screening/correlation_clusters.py). `underlying` not
+    # being in any defined cluster (cluster_for returns None) means this
+    # check simply doesn't apply -- it is never a rejection reason on its
+    # own.
+    if cluster_exposure is not None and underlying is not None:
+        cluster = cluster_for(underlying)
+        if cluster is not None:
+            projected_cluster_exposure = cluster_exposure.get(cluster, 0) + max_loss
+            cluster_cap = equity * limits.max_cluster_concentration_pct
+            if projected_cluster_exposure > cluster_cap:
+                reasons.append(
+                    f"projected exposure ${projected_cluster_exposure:.2f} for the "
+                    f"'{cluster}' correlation cluster (adding {underlying}) exceeds "
+                    f"{limits.max_cluster_concentration_pct:.0%} cluster cap "
+                    f"(${cluster_cap:.2f})"
+                )
+
     return RiskCheckResult(allowed=not reasons, reasons=reasons)
 
 
@@ -123,19 +146,36 @@ def should_close(
     credit_received: float,
     current_mark: float,
     is_credit_spread: bool = True,
+    stop_loss_multiple_override: float | None = None,
+    disable_stop: bool = False,
 ) -> tuple[bool, str] | tuple[bool, None]:
     """`current_mark` is the current cost to close (debit to buy back the
     spread). Credit spreads profit as this shrinks toward zero.
+
+    `stop_loss_multiple_override`/`disable_stop` (2026-08-29, research
+    pass): a single-source but concrete backtest finding suggested a
+    MIDDLE stop-loss multiple like this project's real default (2x) may be
+    the worst of both worlds for short-DTE credit spreads specifically --
+    a tight stop (~1x) or no stop at all each outperformed a 2x stop in
+    that backtest. Not strong enough evidence to change the real book's
+    default on its own (single vendor source, not peer-reviewed) -- these
+    params exist so shadow_book.py can run tight-stop/no-stop as
+    counterfactual policies against real live decisions, same "let real
+    data decide" approach already used for vertical-vs-iron-condor and
+    shadow-vs-random. Default behavior (no args passed) is completely
+    unchanged.
     """
     limits = config.risk
     profit_captured_pct = 1 - (current_mark / credit_received) if credit_received else 0
     if profit_captured_pct >= limits.profit_target_pct:
         return True, f"profit target hit: {profit_captured_pct:.0%} of max credit captured"
-    if current_mark >= credit_received * limits.stop_loss_multiple:
-        return True, (
-            f"stop hit: cost to close (${current_mark:.2f}) reached "
-            f"{limits.stop_loss_multiple}x credit received (${credit_received:.2f})"
-        )
+    if not disable_stop:
+        multiple = stop_loss_multiple_override if stop_loss_multiple_override is not None else limits.stop_loss_multiple
+        if current_mark >= credit_received * multiple:
+            return True, (
+                f"stop hit: cost to close (${current_mark:.2f}) reached "
+                f"{multiple}x credit received (${credit_received:.2f})"
+            )
     return False, None
 
 
