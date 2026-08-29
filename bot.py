@@ -590,6 +590,23 @@ async def find_candidates(
             logger.info("%s rejected by risk gate: %s", sig.ticker, check.reasons)
             gate_rejections.append({"ticker": sig.ticker, "reasons": check.reasons})
             continue
+
+        # Fact provenance (2026-08-29, prompted by reviewing a teammate's
+        # build): short, deterministic IDs for the real numbers this
+        # candidate was built from, so llm_reasoner's SYSTEM_PROMPT can
+        # require the model to cite its sources inline rather than
+        # asserting numbers with no traceable origin. Iron condors omit
+        # SIGNAL_STRENGTH -- no directional signal by construction, same
+        # reasoning _shadow_select already documents for `strength=None`.
+        dte = (plan.expiration - today).days
+        fact_ids: dict[str, object] = {
+            f"{sig.ticker}_CREDIT_EST": plan.credit_estimate,
+            f"{sig.ticker}_MAX_LOSS": plan.max_loss,
+            f"{sig.ticker}_DTE": dte,
+        }
+        if not is_iron_condor:
+            fact_ids[f"{sig.ticker}_SIGNAL_STRENGTH"] = sig.strength
+
         candidates.append({
             "ticker": sig.ticker,
             "strategy": "iron_condor" if is_iron_condor else "vertical",
@@ -604,6 +621,7 @@ async def find_candidates(
             "credit_estimate": plan.credit_estimate,
             "max_loss": plan.max_loss,
             "expiration": plan.expiration.isoformat(),
+            "fact_ids": fact_ids,
             "_plan": plan,
         })
     return candidates, gate_rejections

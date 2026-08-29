@@ -52,6 +52,20 @@ regimes: TRENDING, VOLATILE_TRENDING, RANGING, VOLATILE_RANGING):
   penalize it for lacking a `direction`/`strength` signal — that absence is exactly \
   why it's an iron condor instead of a vertical.
 
+Each candidate also carries a `fact_ids` dict: short, deterministic, UPPERCASE \
+identifiers (pattern: TICKER_FIELD, e.g. AAPL_CREDIT_EST, AAPL_MAX_LOSS, AAPL_DTE, \
+AAPL_SIGNAL_STRENGTH) mapped to their numeric values. These are the ground-truth \
+numbers this candidate was built from.
+
+CITATION RULE (mandatory): Every number you mention in `reasoning` MUST cite its \
+source fact ID inline using square brackets, exactly like this: \
+"...$66.52 credit [AAPL_CREDIT_EST] against $433.48 max loss [AAPL_MAX_LOSS]...". \
+WHY: this reasoning text is shown verbatim on the project's public dashboard as the \
+agent's own explanation. A judge, a debugging session, or a future audit must be able \
+to check every number you claimed against where it actually came from — uncited \
+numbers are unverifiable and undermine the agent's credibility. Cite the fact IDs \
+from the candidate(s) you are discussing, not invented ones.
+
 Hard rules, already enforced in code before you see these candidates — do not \
 second-guess them, only work within them:
 - Every candidate here already passed the risk gate (max loss %, DTE window, daily \
@@ -73,16 +87,21 @@ so make it genuinely informative, not generic filler."""
 
 def decide(candidates: list[dict], remaining_budget: int) -> dict:
     """`candidates` items: {ticker, strategy, direction, strength,
-    signal_reasoning, credit_estimate, max_loss, expiration} — `direction`/
-    `strength`/`signal_reasoning` are only meaningful for strategy='vertical'
-    candidates (an 'iron_condor' candidate has no directional signal by
-    construction). Returns {"selected": [...], "reasoning": str}. Falls back
-    to "select nothing" (never a guess) if the API call fails or returns
-    something unparseable — a skipped cycle is always safe, an unparsed/
-    misread response acted upon blindly is not.
+    signal_reasoning, credit_estimate, max_loss, expiration, fact_ids} —
+    `direction`/`strength`/`signal_reasoning` are only meaningful for
+    strategy='vertical' candidates (an 'iron_condor' candidate has no
+    directional signal by construction). `fact_ids` maps short UPPERCASE
+    identifiers (e.g. AAPL_CREDIT_EST) to their numeric values, for the
+    LLM to cite in its reasoning.
+
+    Returns {"selected": [...], "reasoning": str, "cited_fact_ids": [...],
+    "uncited_ratio": float}. Falls back to "select nothing" (never a
+    guess) if the API call fails or returns something unparseable — a
+    skipped cycle is always safe, an unparsed/misread response acted upon
+    blindly is not.
     """
     if not candidates:
-        return {"selected": [], "reasoning": "No candidates survived the risk gate this cycle."}
+        return {"selected": [], "reasoning": "No candidates survived the risk gate this cycle.", "cited_fact_ids": [], "uncited_ratio": 0.0}
 
     user_prompt = json.dumps(
         {"remaining_budget": remaining_budget, "candidates": candidates},
@@ -112,7 +131,27 @@ def decide(candidates: list[dict], remaining_budget: int) -> dict:
         parsed = json.loads(content)
         assert isinstance(parsed.get("selected"), list)
         assert isinstance(parsed.get("reasoning"), str)
+
+        # --- citation validation (best-effort, never blocking) ---
+        reasoning = parsed["reasoning"]
+        import re as _re
+        cited = _re.findall(r"\[([A-Z0-9_]+)\]", reasoning)
+        all_fact_keys: set[str] = set()
+        for c in candidates:
+            all_fact_keys.update(c.get("fact_ids", {}).keys())
+
+        unknown = [fid for fid in cited if fid not in all_fact_keys]
+        if unknown:
+            logger.warning("LLM reasoning cited unknown fact IDs: %s", unknown)
+        if not cited and candidates:
+            logger.warning("LLM reasoning cited ZERO fact IDs despite %d candidates", len(candidates))
+
+        valid_cited = [fid for fid in cited if fid in all_fact_keys]
+        uncited_ratio = 1.0 - (len(valid_cited) / len(all_fact_keys)) if all_fact_keys else 0.0
+
+        parsed["cited_fact_ids"] = valid_cited
+        parsed["uncited_ratio"] = round(uncited_ratio, 3)
         return parsed
     except Exception as exc:
         logger.exception("LLM reasoning step failed, defaulting to no trade")
-        return {"selected": [], "reasoning": f"LLM reasoning step failed ({exc}); no trade taken this cycle."}
+        return {"selected": [], "reasoning": f"LLM reasoning step failed ({exc}); no trade taken this cycle.", "cited_fact_ids": [], "uncited_ratio": 0.0}
