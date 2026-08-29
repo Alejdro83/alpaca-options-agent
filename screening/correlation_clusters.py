@@ -12,26 +12,48 @@ universe recurrently surfaces the same handful of mega-cap tech names).
 
 This is deliberately NOT a full sector taxonomy -- building and maintaining
 one is out of scope for the time remaining before the hackathon deadline.
-It is exactly one cluster (the names whose correlation risk is both
-best-documented and most likely to actually appear in this project's own
-S&P 500 / Nasdaq 100 screening universe), checked via risk_gate's new
-cluster-exposure gate (max_cluster_concentration_pct) alongside the
-existing per-underlying cap, not instead of it.
+These are the clusters whose correlation risk is both best-documented and
+most likely to actually appear in this project's own S&P 500 / Nasdaq 100
+screening universe (the same 12-symbol backtest basket in
+backtest_optimize.py already spans tech/financials/energy/healthcare/
+consumer, for example), checked via risk_gate's cluster-exposure gate
+(max_cluster_concentration_pct) alongside the existing per-underlying cap,
+not instead of it.
+
+2026-08-29, extended from one cluster to three (financials, energy) after
+the original single-cluster version shipped -- same reasoning, same
+"well-documented, not exhaustive" bar. A name matching NO cluster here is
+simply not covered by this gate, not a claim it's uncorrelated with
+anything.
 """
 from __future__ import annotations
 
 # "Magnificent Seven" plus the two other names most commonly cited
 # alongside them for correlation purposes (AVGO, AMD -- both large-cap
 # semiconductor names that move with the same AI/growth-tech factor).
-# Deliberately a flat set, not a hierarchy -- add clusters here (as
-# additional named sets) if a second one becomes worth tracking, rather
-# than growing this one into an ad-hoc sector map.
 MEGA_CAP_TECH: frozenset[str] = frozenset({
     "AAPL", "MSFT", "GOOGL", "GOOG", "AMZN", "META", "NVDA", "TSLA", "AVGO", "AMD",
 })
 
+# Big US banks/financials -- a textbook correlated group (rate-sensitivity,
+# credit-cycle exposure, and simple sector-ETF co-movement via XLF/KBE all
+# push these together in a broad move, well beyond idiosyncratic single-name
+# risk).
+BIG_BANKS: frozenset[str] = frozenset({
+    "JPM", "BAC", "WFC", "C", "GS", "MS",
+})
+
+# Oil & gas majors/large-caps -- move together on the same commodity-price
+# factor (crude/nat-gas prices), not idiosyncratic company news, for the
+# large majority of their daily variance.
+ENERGY_MAJORS: frozenset[str] = frozenset({
+    "XOM", "CVX", "COP", "SLB", "OXY",
+})
+
 _CLUSTERS: dict[str, frozenset[str]] = {
     "mega_cap_tech": MEGA_CAP_TECH,
+    "big_banks": BIG_BANKS,
+    "energy_majors": ENERGY_MAJORS,
 }
 
 
