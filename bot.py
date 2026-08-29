@@ -1066,21 +1066,41 @@ async def run_cycle() -> None:
             logger.exception("Failed to check market clock, assuming closed (fail safe, not fail open)")
             market_open = False
 
+        # Options approval level (2026-08-29, from cross-checking Alpaca's own
+        # OpenAPI spec): 3 = "Spreads/Straddles", required for every multi-leg
+        # order this bot places -- gate on options_trading_level (the
+        # EFFECTIVE level: min of options_approved_level and the account
+        # config's max_options_trading_level), not options_approved_level,
+        # which only reflects one half of that. Verified once manually at
+        # account setup, never checked at runtime before this -- cheap
+        # defense in depth against the level ever changing (account config
+        # edit, a support action) without anyone noticing until an order
+        # inexplicably rejects mid-cycle.
+        options_level = account.get("options_trading_level")
+        options_level_ok = options_level is not None and options_level >= 3
+        if not options_level_ok:
+            logger.error(
+                "options_trading_level=%r, need >=3 (Spreads/Straddles) for multi-leg orders -- "
+                "skipping candidate screening this cycle", options_level,
+            )
+
         open_notes = []
         candidates = []
         slim_candidates: list[dict] = []
         decision = "skipped"
-        reasoning = (
-            "No eligible candidates this cycle." if market_open
-            else "Market is closed — not screening for new candidates this cycle."
-        )
+        if not options_level_ok:
+            reasoning = f"Options trading level is {options_level!r}, need >=3 for spreads — not screening this cycle."
+        elif market_open:
+            reasoning = "No eligible candidates this cycle."
+        else:
+            reasoning = "Market is closed — not screening for new candidates this cycle."
         gate_rejections: list[dict] = []
         pre_trade_rejections: list[dict] = []
         shadow_selected: list[str] = []
         llm_selected: list[str] = []
         cycle_id: int | None = None
 
-        if remaining_budget > 0 and market_open:
+        if remaining_budget > 0 and market_open and options_level_ok:
             candidates, gate_rejections = await find_candidates(mcp, client, account, len(open_spreads))
             slim_candidates = [{k: v for k, v in c.items() if k != "_plan"} for c in candidates]
 

@@ -53,6 +53,7 @@ class FakeClient:
         "buying_power": 200_000.0,
         "portfolio_value": 100_000.0,
         "status": "ACTIVE",
+        "options_trading_level": 3,
     })
     clock: dict[str, Any] = field(default_factory=lambda: {
         "is_open": True,

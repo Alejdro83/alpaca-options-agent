@@ -69,6 +69,12 @@ class AlpacaClient:
             "buying_power": float(acct.buying_power),
             "portfolio_value": float(acct.portfolio_value),
             "status": acct.status.value if hasattr(acct.status, "value") else str(acct.status),
+            # The EFFECTIVE options level (min of options_approved_level and
+            # the account config's max_options_trading_level) -- confirmed
+            # 2026-08-29 against Alpaca's own OpenAPI spec that this, not
+            # options_approved_level, is the field to gate on. 3 = spreads/
+            # straddles, required for any multi-leg order this bot places.
+            "options_trading_level": getattr(acct, "options_trading_level", None),
         }
 
     def get_positions(self) -> list[dict[str, Any]]:

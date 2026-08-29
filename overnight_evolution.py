@@ -29,6 +29,7 @@ import pandas as pd
 
 from evolution_config import (
     MIN_TRADES_FOR_REVERT_CHECK,
+    MUTABLE_PARAMS,
     PARAM_RANGES,
     POPULATION_SIZE,
     PROMOTION_THRESHOLD,
@@ -186,9 +187,17 @@ def _mutate_param(name: str, current_value, rng: random.Random):
 
 def generate_variants(incumbent: StrategyParams, seed: int) -> list[StrategyParams]:
     """Generate POPULATION_SIZE variants. First 7 mutate one param each;
-    variant 8 mutates 2-3 params simultaneously."""
+    variant 8 mutates 2-3 params simultaneously.
+
+    Only mutates MUTABLE_PARAMS (2026-08-29 safeguard) -- pure risk-gate
+    fields (max_loss_per_spread_pct, min_open_interest,
+    max_bid_ask_spread_pct, stop_loss_multiple) are never touched by this
+    process; see evolution_config.py's own comment for why. With 7 mutation
+    slots and 6 mutable params, one param gets mutated in two of the
+    single-param variants -- harmless, still a valid population member.
+    """
     rng = random.Random(seed)
-    param_names = list(asdict(incumbent).keys())
+    param_names = list(MUTABLE_PARAMS)
     variants = []
 
     for i in range(POPULATION_SIZE - 1):

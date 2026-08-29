@@ -44,6 +44,35 @@ PARAM_RANGES: dict[str, tuple[float, float] | tuple[int, int]] = {
     "min_percentile": (0.15, 0.50),
 }
 
+# Safeguard added 2026-08-29 (was flagged as a real gap on 2026-08-28: "excluir
+# gates de riesgo puro de la mutación" -- never implemented until now).
+# generate_variants() only ever mutates params in this set -- PARAM_RANGES
+# above still defines bounds for every evolvable field (kept intact rather
+# than deleted, in case a param is ever promoted back into MUTABLE_PARAMS
+# deliberately), but the four excluded here are safety ceilings/floors, not
+# return-optimization knobs, and an overnight process driven by one day's
+# simulated replay (this module's own documented statistical-significance
+# caveat) should never be the thing that loosens them:
+#   - max_loss_per_spread_pct: the hard per-position risk ceiling itself.
+#   - min_open_interest / max_bid_ask_spread_pct: liquidity/execution-quality
+#     floors, not a performance lever -- loosening them to "win" a replay
+#     means trading contracts genuinely too illiquid to trust, not a better
+#     strategy.
+#   - stop_loss_multiple: still a real open question (2026-08-29 research:
+#     single-source evidence that a MIDDLE multiple like our 2x may be worse
+#     than either a tight 1x or no stop for short-DTE spreads) -- but that's
+#     now explored through shadow_book.py's exit-rule counterfactuals against
+#     real live decisions instead, a more targeted and safer mechanism than
+#     a noisy one-day overnight replay mutating it blind.
+MUTABLE_PARAMS: frozenset[str] = frozenset({
+    "short_leg_target_delta",
+    "min_dte",
+    "max_dte",
+    "spread_width_dollars",
+    "profit_target_pct",
+    "min_percentile",
+})
+
 POPULATION_SIZE = 8
 PROMOTION_THRESHOLD = 0.05
 PARAMS_PATH = "state/evolved_params.json"

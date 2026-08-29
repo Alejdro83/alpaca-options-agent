@@ -790,6 +790,121 @@ class TestMarketClosedShortCircuit:
 
 
 # ===================================================================
+# 13. OPTIONS TRADING LEVEL GATE (added 2026-08-29)
+# ===================================================================
+
+class TestOptionsLevelGate:
+    """bot.run_cycle(): a real gap found cross-checking Alpaca's own OpenAPI
+    spec -- options_trading_level (the EFFECTIVE level, not
+    options_approved_level) was never checked at runtime, only verified
+    once by hand at account setup. Level 3 ("Spreads/Straddles") is
+    required for every multi-leg order this bot places; below that,
+    find_candidates() must never be called.
+    """
+
+    @pytest.mark.asyncio
+    async def test_insufficient_options_level_skips_screening(self):
+        import bot as bot_module
+
+        mcp = FakeMCP()
+        fake_client = FakeClient(clock={"is_open": True, "next_open": "", "next_close": "", "timestamp": ""})
+        fake_client.account["options_trading_level"] = 2  # Long Call/Put only -- no spreads
+        fake_client.account["daily_pl"] = 0.0
+        fake_client.account["daily_pl_pct"] = 0.0
+
+        with patch.object(bot_module, "AlpacaClient", return_value=fake_client), \
+             patch.object(bot_module, "AlpacaMCP") as MockMCP, \
+             patch("bot.db") as mock_db, \
+             patch("bot.llm_reasoner") as mock_llm, \
+             patch("bot.find_candidates", new_callable=AsyncMock) as mock_find:
+
+            MockMCP.return_value.__aenter__ = AsyncMock(return_value=mcp)
+            MockMCP.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            mock_db.get_open_spreads.return_value = []
+            mock_db.record_cycle.return_value = 1
+            mock_db.record_decision_journal.return_value = None
+            mock_db.record_account_snapshot.return_value = None
+
+            pause_file = Path(__file__).resolve().parent.parent / "state" / "PAUSE"
+            if pause_file.exists():
+                pause_file.unlink()
+
+            await bot_module.run_cycle()
+
+            mock_find.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_missing_options_level_fails_closed(self):
+        """A missing/unreadable field must be treated as insufficient, not
+        as an implicit pass -- fail closed, same convention as every other
+        gate in this codebase."""
+        import bot as bot_module
+
+        mcp = FakeMCP()
+        fake_client = FakeClient(clock={"is_open": True, "next_open": "", "next_close": "", "timestamp": ""})
+        del fake_client.account["options_trading_level"]
+        fake_client.account["daily_pl"] = 0.0
+        fake_client.account["daily_pl_pct"] = 0.0
+
+        with patch.object(bot_module, "AlpacaClient", return_value=fake_client), \
+             patch.object(bot_module, "AlpacaMCP") as MockMCP, \
+             patch("bot.db") as mock_db, \
+             patch("bot.llm_reasoner") as mock_llm, \
+             patch("bot.find_candidates", new_callable=AsyncMock) as mock_find:
+
+            MockMCP.return_value.__aenter__ = AsyncMock(return_value=mcp)
+            MockMCP.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            mock_db.get_open_spreads.return_value = []
+            mock_db.record_cycle.return_value = 1
+            mock_db.record_decision_journal.return_value = None
+            mock_db.record_account_snapshot.return_value = None
+
+            pause_file = Path(__file__).resolve().parent.parent / "state" / "PAUSE"
+            if pause_file.exists():
+                pause_file.unlink()
+
+            await bot_module.run_cycle()
+
+            mock_find.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_level_3_allows_screening(self):
+        """Sanity: level 3 (the real production value) does not block
+        screening on its own."""
+        import bot as bot_module
+
+        mcp = FakeMCP()
+        fake_client = FakeClient(clock={"is_open": True, "next_open": "", "next_close": "", "timestamp": ""})
+        fake_client.account["daily_pl"] = 0.0
+        fake_client.account["daily_pl_pct"] = 0.0
+
+        with patch.object(bot_module, "AlpacaClient", return_value=fake_client), \
+             patch.object(bot_module, "AlpacaMCP") as MockMCP, \
+             patch("bot.db") as mock_db, \
+             patch("bot.llm_reasoner") as mock_llm, \
+             patch("bot.find_candidates", new_callable=AsyncMock, return_value=([], [])) as mock_find:
+
+            MockMCP.return_value.__aenter__ = AsyncMock(return_value=mcp)
+            MockMCP.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            mock_db.get_open_spreads.return_value = []
+            mock_db.record_cycle.return_value = 1
+            mock_db.record_decision_journal.return_value = None
+            mock_db.record_account_snapshot.return_value = None
+            mock_llm.decide.return_value = {"selected": [], "reasoning": "Nothing good"}
+
+            pause_file = Path(__file__).resolve().parent.parent / "state" / "PAUSE"
+            if pause_file.exists():
+                pause_file.unlink()
+
+            await bot_module.run_cycle()
+
+            mock_find.assert_called_once()
+
+
+# ===================================================================
 # EXTRA: Shadow-select iron condor scoring (strength=None guard)
 # ===================================================================
 
@@ -1042,3 +1157,55 @@ class TestExitRuleCounterfactuals:
         )
         assert should_close is True
         assert "profit target" in reason
+
+
+# ===================================================================
+# 12. OVERNIGHT EVOLUTION NEVER MUTATES PURE RISK GATES (added 2026-08-29)
+# ===================================================================
+
+class TestEvolutionExcludesRiskGates:
+    """overnight_evolution.py: a real gap flagged 2026-08-28 ("excluir gates
+    de riesgo puro de la mutación") and left unimplemented until now.
+    max_loss_per_spread_pct / min_open_interest / max_bid_ask_spread_pct /
+    stop_loss_multiple are safety ceilings/floors, not return-optimization
+    knobs -- an overnight process driven by one day's simulated replay
+    must never be the thing that loosens them.
+    """
+
+    EXCLUDED = {
+        "max_loss_per_spread_pct", "min_open_interest",
+        "max_bid_ask_spread_pct", "stop_loss_multiple",
+    }
+
+    def test_excluded_params_never_change_across_many_seeds(self):
+        from dataclasses import asdict
+        from evolution_config import StrategyParams
+        from overnight_evolution import generate_variants
+
+        incumbent = StrategyParams()
+        inc_dict = asdict(incumbent)
+        for seed in range(50):
+            for variant in generate_variants(incumbent, seed=seed):
+                vd = asdict(variant)
+                for name in self.EXCLUDED:
+                    assert vd[name] == inc_dict[name], (
+                        f"seed={seed}: {name} changed from {inc_dict[name]} to {vd[name]} "
+                        "-- a pure risk gate was mutated"
+                    )
+
+    def test_mutable_params_do_still_get_explored(self):
+        """Sanity check the exclusion isn't accidentally freezing everything --
+        real mutation must still happen on the params that ARE meant to evolve."""
+        from dataclasses import asdict
+        from evolution_config import MUTABLE_PARAMS, StrategyParams
+        from overnight_evolution import generate_variants
+
+        incumbent = StrategyParams()
+        inc_dict = asdict(incumbent)
+        variants = generate_variants(incumbent, seed=42)
+        changed = any(
+            asdict(v)[name] != inc_dict[name]
+            for v in variants
+            for name in MUTABLE_PARAMS
+        )
+        assert changed, "no mutable param changed across the whole population -- mutation may be broken"
