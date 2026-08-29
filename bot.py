@@ -424,6 +424,8 @@ async def manage_open_spreads(mcp: AlpacaMCP) -> tuple[list[str], bool]:
                     short_call_symbol=spread["call_short_symbol"],
                     long_call_symbol=spread["call_long_symbol"],
                     contracts=spread["contracts"],
+                    current_mark=mark,
+                    max_loss=float(spread["max_loss"]),
                 )
             else:
                 await executor_mcp.close_spread(
@@ -431,6 +433,8 @@ async def manage_open_spreads(mcp: AlpacaMCP) -> tuple[list[str], bool]:
                     short_symbol=spread["short_symbol"],
                     long_symbol=spread["long_symbol"],
                     contracts=spread["contracts"],
+                    current_mark=mark,
+                    max_loss=float(spread["max_loss"]),
                 )
             if mark is None:
                 # Force-closed without ever getting a fresh mark (quote fetch
@@ -714,16 +718,24 @@ async def _pre_trade_check_inner(
     # remnant, or a genuine feed outage) is exactly what produced a
     # nonsensical spread (credit exceeding the strike width) that day —
     # now a hard block, not just a log line.
+    #
+    # Real gap found 2026-08-29 comparing against a competing team's
+    # hardening pass: a MISSING or unparseable timestamp fell through the
+    # `if ts_str:`/except into a silent `pass` — treated as "fine", not
+    # "unknown age" — the exact opposite of fail-closed. Now blocks too.
     for label, snap in [("short", short_snap), ("long", long_snap)]:
         ts_str = snap.get("latestQuote", {}).get("t")
+        age = None
         if ts_str:
             try:
                 quote_ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
                 age = now - quote_ts
-                if age > timedelta(minutes=15):
-                    return False, f"{label} leg quote is {age} old (>15 min) — stale, refusing to trade on it", plan
             except (ValueError, TypeError):
-                pass
+                age = None
+        if age is None:
+            return False, f"{label} leg quote has no usable timestamp — unknown age, refusing to trade", plan
+        if age > timedelta(minutes=15):
+            return False, f"{label} leg quote is {age} old (>15 min) — stale, refusing to trade on it", plan
 
     fresh_credit = round((short_mid - long_mid) * 100, 2)
     if fresh_credit <= 0:
@@ -859,16 +871,22 @@ async def _pre_trade_check_iron_condor_inner(
         mids[sym] = mid
 
     now = datetime.now(timezone.utc)
+    # Same fail-closed fix as the vertical-spread check above (2026-08-29):
+    # a missing/unparseable timestamp now blocks instead of silently
+    # skipping the staleness check.
     for label, sym in legs:
         ts_str = snaps[sym].get("latestQuote", {}).get("t")
+        age = None
         if ts_str:
             try:
                 quote_ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
                 age = now - quote_ts
-                if age > timedelta(minutes=15):
-                    return False, f"{label} leg quote is {age} old (>15 min) — stale, refusing to trade on it", plan
             except (ValueError, TypeError):
-                pass
+                age = None
+        if age is None:
+            return False, f"{label} leg quote has no usable timestamp — unknown age, refusing to trade", plan
+        if age > timedelta(minutes=15):
+            return False, f"{label} leg quote is {age} old (>15 min) — stale, refusing to trade on it", plan
 
     fresh_put_credit = round((mids[plan.short_put_symbol] - mids[plan.long_put_symbol]) * 100, 2)
     fresh_call_credit = round((mids[plan.short_call_symbol] - mids[plan.long_call_symbol]) * 100, 2)

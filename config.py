@@ -259,6 +259,20 @@ class OptionsRiskLimits:
         # risk_gate.should_force_close().
         default_factory=lambda: _env("CONTEST_END_UTC", "2026-09-04T15:00:00+00:00")
     )
+    max_entry_slippage_pct: float = field(
+        # Real gap found 2026-08-29 comparing against a competing team's
+        # hardening pass: executor_mcp.py placed unbounded MARKET orders for
+        # every multi-leg spread (a long-standing TODO in this file, never
+        # closed) -- on a thin iron-condor strike, a market order can fill at
+        # a materially worse net credit/debit than the mid this project's own
+        # pre-trade gate just checked, with no floor. Orders are now
+        # marketable LIMIT orders instead: accept no less than
+        # checked_credit * (1 - this) on open, pay no more than
+        # checked_debit * (1 + this) on close. 10% is deliberately generous
+        # (this is about bounding a bad fill, not chasing best execution) --
+        # not independently backtested.
+        default_factory=lambda: _env_float("MAX_ENTRY_SLIPPAGE_PCT", 0.10)
+    )
 
 
 # Scope note (2026-08-28): Real IV Rank was considered specifically for

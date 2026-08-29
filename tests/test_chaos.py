@@ -1280,3 +1280,145 @@ class TestBetaWeightedDelta:
             f"expected ~1.5 even with a one-sided gap, got {beta} -- "
             "a positional (not date-keyed) alignment bug would corrupt this"
         )
+
+
+class TestMissingQuoteTimestampFailsClosed:
+    """bot._pre_trade_check / _pre_trade_check_iron_condor: real gap found
+    2026-08-29 comparing against a competing team's hardening pass. A quote
+    with no `t` field (or an unparseable one) fell through the staleness
+    check's `if ts_str: ... except: pass` as if it were fine -- unknown age
+    was silently treated as fresh, not blocked. Must fail closed like an
+    actually-stale quote does.
+    """
+
+    @pytest.mark.asyncio
+    async def test_missing_timestamp_blocks_vertical_trade(self):
+        from bot import _pre_trade_check
+
+        mcp = FakeMCP()
+        plan = make_plan()
+        account = {"equity": 100_000, "last_equity": 100_000, "buying_power": 200_000}
+
+        no_ts_snap = {"latestQuote": {"bp": "1.00", "ap": "1.10"}}  # no "t" key
+        mcp.set_response("get_option_snapshot", make_snapshot_response({
+            plan.short_symbol: no_ts_snap,
+            plan.long_symbol: no_ts_snap,
+        }))
+
+        allowed, reason, _ = await _pre_trade_check(mcp, plan, account, 0)
+
+        assert allowed is False
+        assert reason is not None
+        assert "unknown age" in reason.lower() or "no usable timestamp" in reason.lower()
+        assert not mcp.calls_for("place_option_order")
+
+    @pytest.mark.asyncio
+    async def test_unparseable_timestamp_blocks_iron_condor_trade(self):
+        from bot import _pre_trade_check_iron_condor
+
+        mcp = FakeMCP()
+        plan = make_iron_condor_plan()
+        account = {"equity": 100_000, "last_equity": 100_000, "buying_power": 200_000}
+
+        bad_ts_snap = {"latestQuote": {"bp": "1.00", "ap": "1.10", "t": "not-a-timestamp"}}
+        symbols = [plan.short_put_symbol, plan.long_put_symbol,
+                   plan.short_call_symbol, plan.long_call_symbol]
+        mcp.set_response("get_option_snapshot", make_snapshot_response({
+            sym: bad_ts_snap for sym in symbols
+        }))
+
+        allowed, reason, _ = await _pre_trade_check_iron_condor(mcp, plan, account, 0)
+
+        assert allowed is False
+        assert reason is not None
+        assert "unknown age" in reason.lower() or "no usable timestamp" in reason.lower()
+        assert not mcp.calls_for("place_option_order")
+
+
+class TestBoundedLimitOrders:
+    """executor_mcp: real gap found 2026-08-29 comparing against a competing
+    team's hardening pass -- every order (open and close, vertical and iron
+    condor) was an unbounded MARKET order (a TODO left since the project
+    started). Now a marketable LIMIT order, bounded either by the checked
+    credit/debit (open, and close with a fresh mark) or by the position's
+    own max_loss (close with no mark -- e.g. a force-close whose quote
+    fetch failed). A debit above max_loss is never rational.
+    """
+
+    @pytest.mark.asyncio
+    async def test_open_spread_places_limit_not_market(self):
+        import executor_mcp
+
+        mcp = FakeMCP()
+        plan = make_plan(credit_estimate=150.0)  # $1.50/share
+        mcp.set_response("place_option_order", {"data": {"id": "order-1"}})
+
+        await executor_mcp.open_spread(mcp, plan, contracts=1)
+
+        calls = mcp.calls_for("place_option_order")
+        assert len(calls) == 1
+        assert calls[0]["type"] == "limit"
+        # 10% default slippage: 1.50 * 0.9 = 1.35
+        assert calls[0]["limit_price"] == "1.35"
+
+    @pytest.mark.asyncio
+    async def test_open_iron_condor_places_limit_not_market(self):
+        import executor_mcp
+
+        mcp = FakeMCP()
+        plan = make_iron_condor_plan(credit_estimate=200.0)  # $2.00/share
+        mcp.set_response("place_option_order", {"data": {"id": "order-1"}})
+
+        await executor_mcp.open_iron_condor(mcp, plan, contracts=1)
+
+        calls = mcp.calls_for("place_option_order")
+        assert calls[0]["type"] == "limit"
+        assert calls[0]["limit_price"] == "1.80"  # 2.00 * 0.9
+
+    @pytest.mark.asyncio
+    async def test_close_spread_uses_mark_when_available(self):
+        import executor_mcp
+
+        mcp = FakeMCP()
+        mcp.set_response("place_option_order", {"data": {"id": "order-2"}})
+
+        await executor_mcp.close_spread(
+            mcp, "SHORT_SYM", "LONG_SYM", contracts=1,
+            current_mark=100.0, max_loss=500.0,
+        )
+
+        calls = mcp.calls_for("place_option_order")
+        assert calls[0]["type"] == "limit"
+        # 10% default slippage on the debit: 1.00 * 1.1 = 1.10
+        assert calls[0]["limit_price"] == "1.10"
+
+    @pytest.mark.asyncio
+    async def test_close_spread_falls_back_to_max_loss_without_mark(self):
+        """Force-close whose quote fetch failed (mark=None): the ceiling
+        must be the position's own max_loss, uninflated by slippage padding
+        -- paying more than max_loss to exit is never rational."""
+        import executor_mcp
+
+        mcp = FakeMCP()
+        mcp.set_response("place_option_order", {"data": {"id": "order-3"}})
+
+        await executor_mcp.close_spread(
+            mcp, "SHORT_SYM", "LONG_SYM", contracts=1,
+            current_mark=None, max_loss=500.0,
+        )
+
+        calls = mcp.calls_for("place_option_order")
+        assert calls[0]["type"] == "limit"
+        assert calls[0]["limit_price"] == "5.00"  # 500/100, no slippage
+
+    @pytest.mark.asyncio
+    async def test_close_spread_without_mark_or_max_loss_raises(self):
+        """No unbounded fallback exists -- caller must supply a bound."""
+        import executor_mcp
+
+        mcp = FakeMCP()
+        with pytest.raises(ValueError):
+            await executor_mcp.close_spread(
+                mcp, "SHORT_SYM", "LONG_SYM", contracts=1,
+            )
+        assert not mcp.calls_for("place_option_order")

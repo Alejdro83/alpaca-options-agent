@@ -8,6 +8,12 @@ Schema verified directly against the real account 2026-08-26 (via
 `qty` is STRING-typed in the tool's own schema (not int) — passed as
 `str(contracts)` here accordingly. `ratio_qty` per leg follows the same
 string convention.
+
+Orders are submitted as marketable LIMIT orders, not unbounded market
+orders (fixed 2026-08-29, closing a TODO left in this file since the
+project started): a market mleg order on a thin strike can fill at a
+materially worse net credit/debit than the mid the pre-trade gate just
+checked, with no floor at all. See config.risk.max_entry_slippage_pct.
 """
 from __future__ import annotations
 
@@ -15,10 +21,31 @@ import logging
 import uuid
 from datetime import datetime, timezone
 
+from config import config
 from mcp_client import AlpacaMCP
 from spread_builder import IronCondorPlan, SpreadPlan
 
 logger = logging.getLogger(__name__)
+
+
+def limit_credit_price(credit_per_contract: float, slippage_pct: float | None = None) -> str:
+    """Marketable limit for opening a credit spread: accept no less than
+    this net credit. Alpaca's mleg limit price is dollars-PER-SHARE, so a
+    $-per-contract credit is divided by 100. Floored at a cent so a
+    slippage-adjusted price can never go non-positive/negative.
+    """
+    slip = config.risk.max_entry_slippage_pct if slippage_pct is None else slippage_pct
+    per_share = (credit_per_contract / 100.0) * (1.0 - slip)
+    return f"{max(per_share, 0.01):.2f}"
+
+
+def limit_debit_price(debit_per_contract: float, slippage_pct: float | None = None) -> str:
+    """Marketable limit for closing a credit spread: pay no more than this
+    net debit. Same dollars-per-share conversion as limit_credit_price.
+    """
+    slip = config.risk.max_entry_slippage_pct if slippage_pct is None else slippage_pct
+    per_share = (debit_per_contract / 100.0) * (1.0 + slip)
+    return f"{max(per_share, 0.01):.2f}"
 
 
 def _extract_order_ids(result) -> list[str]:
@@ -65,13 +92,18 @@ async def open_spread(mcp: AlpacaMCP, plan: SpreadPlan, contracts: int = 1) -> l
     simultaneously) — never as two independent legs, which would leave a
     naked, undefined-risk position if only one leg filled.
 
+    Marketable limit: accepts no less than plan.credit_estimate minus
+    config.risk.max_entry_slippage_pct (the pre-trade gate already rebuilt
+    this from a fresh mid moments earlier).
+
     Returns the Alpaca order id(s) for the resulting order(s).
     """
     short_cid = _make_client_order_id(plan.underlying, plan.direction)
     long_cid = _make_client_order_id(plan.underlying, plan.direction)
+    limit_price = limit_credit_price(plan.credit_estimate)
     logger.info(
-        "client_order_ids for %s %s: short=%s long=%s",
-        plan.underlying, plan.direction, short_cid, long_cid,
+        "client_order_ids for %s %s: short=%s long=%s limit_credit=%s",
+        plan.underlying, plan.direction, short_cid, long_cid, limit_price,
     )
 
     result = await mcp.call(
@@ -83,7 +115,8 @@ async def open_spread(mcp: AlpacaMCP, plan: SpreadPlan, contracts: int = 1) -> l
             ],
             "qty": str(contracts),
             "order_class": "mleg",
-            "type": "market",  # TODO: support limit orders for better fill control
+            "type": "limit",
+            "limit_price": limit_price,
             "time_in_force": "day",
         },
     )
@@ -92,10 +125,32 @@ async def open_spread(mcp: AlpacaMCP, plan: SpreadPlan, contracts: int = 1) -> l
     return order_ids
 
 
-async def close_spread(mcp: AlpacaMCP, short_symbol: str, long_symbol: str, contracts: int) -> list[str]:
+async def close_spread(
+    mcp: AlpacaMCP,
+    short_symbol: str,
+    long_symbol: str,
+    contracts: int,
+    *,
+    max_loss: float | None = None,
+    current_mark: float | None = None,
+) -> list[str]:
     """Reverses the entry: buy back the short leg, sell the long leg — a
     single multi-leg order for the same fill-both-or-neither reason as entry.
+
+    Marketable limit, bounded either by a fresh mark (mark * (1 +
+    max_entry_slippage_pct), the common case) or, if no mark was available
+    (e.g. a force-close whose quote fetch failed), by the position's own
+    max_loss — a debit above max_loss is never rational since it's strictly
+    worse than just letting the spread expire at its own worst case. One of
+    the two must be given; there is no unbounded fallback.
     """
+    if current_mark is not None:
+        limit_price = limit_debit_price(current_mark)
+    elif max_loss is not None:
+        limit_price = limit_debit_price(max_loss, slippage_pct=0.0)
+    else:
+        raise ValueError("close_spread needs current_mark or max_loss to bound the limit price")
+
     result = await mcp.call(
         "place_option_order",
         {
@@ -105,12 +160,13 @@ async def close_spread(mcp: AlpacaMCP, short_symbol: str, long_symbol: str, cont
             ],
             "qty": str(contracts),
             "order_class": "mleg",
-            "type": "market",
+            "type": "limit",
+            "limit_price": limit_price,
             "time_in_force": "day",
         },
     )
     order_ids = _extract_order_ids(result)
-    logger.info("Closed spread (%s / %s): orders %s", short_symbol, long_symbol, order_ids)
+    logger.info("Closed spread (%s / %s): orders %s limit_debit=%s", short_symbol, long_symbol, order_ids, limit_price)
     return order_ids
 
 
@@ -126,9 +182,10 @@ async def open_iron_condor(mcp: AlpacaMCP, plan: IronCondorPlan, contracts: int 
     long_put_cid = _make_client_order_id(plan.underlying, plan.direction)
     short_call_cid = _make_client_order_id(plan.underlying, plan.direction)
     long_call_cid = _make_client_order_id(plan.underlying, plan.direction)
+    limit_price = limit_credit_price(plan.credit_estimate)
     logger.info(
-        "client_order_ids for %s %s: short_put=%s long_put=%s short_call=%s long_call=%s",
-        plan.underlying, plan.direction, short_put_cid, long_put_cid, short_call_cid, long_call_cid,
+        "client_order_ids for %s %s: short_put=%s long_put=%s short_call=%s long_call=%s limit_credit=%s",
+        plan.underlying, plan.direction, short_put_cid, long_put_cid, short_call_cid, long_call_cid, limit_price,
     )
 
     result = await mcp.call(
@@ -142,7 +199,8 @@ async def open_iron_condor(mcp: AlpacaMCP, plan: IronCondorPlan, contracts: int 
             ],
             "qty": str(contracts),
             "order_class": "mleg",
-            "type": "market",  # TODO: support limit orders for better fill control
+            "type": "limit",
+            "limit_price": limit_price,
             "time_in_force": "day",
         },
     )
@@ -158,10 +216,22 @@ async def close_iron_condor(
     short_call_symbol: str,
     long_call_symbol: str,
     contracts: int,
+    *,
+    max_loss: float | None = None,
+    current_mark: float | None = None,
 ) -> list[str]:
     """Reverses all 4 legs in one multi-leg order — same fill-together
-    reasoning as `close_spread`, just twice as many legs.
+    reasoning as `close_spread`, just twice as many legs. Same bounded-limit
+    rule as `close_spread`: mark-based when a fresh mark exists, otherwise
+    the position's own max_loss as the absolute ceiling.
     """
+    if current_mark is not None:
+        limit_price = limit_debit_price(current_mark)
+    elif max_loss is not None:
+        limit_price = limit_debit_price(max_loss, slippage_pct=0.0)
+    else:
+        raise ValueError("close_iron_condor needs current_mark or max_loss to bound the limit price")
+
     result = await mcp.call(
         "place_option_order",
         {
@@ -173,14 +243,15 @@ async def close_iron_condor(
             ],
             "qty": str(contracts),
             "order_class": "mleg",
-            "type": "market",
+            "type": "limit",
+            "limit_price": limit_price,
             "time_in_force": "day",
         },
     )
     order_ids = _extract_order_ids(result)
     logger.info(
-        "Closed iron condor (%s / %s / %s / %s): orders %s",
-        short_put_symbol, long_put_symbol, short_call_symbol, long_call_symbol, order_ids,
+        "Closed iron condor (%s / %s / %s / %s): orders %s limit_debit=%s",
+        short_put_symbol, long_put_symbol, short_call_symbol, long_call_symbol, order_ids, limit_price,
     )
     return order_ids
 
