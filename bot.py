@@ -45,6 +45,7 @@ import black_scholes
 import db
 import executor_mcp
 import llm_reasoner
+import portfolio_greeks
 import risk_gate
 import shadow_book
 from mcp_client import AlpacaMCP
@@ -1013,6 +1014,15 @@ async def run_cycle() -> None:
             await shadow_book.manage_open(mcp)
         except Exception:
             logger.exception("shadow_book.manage_open failed (non-fatal)")
+
+        # Real broker-computed portfolio Greeks (2026-08-29) -- monitoring
+        # only, never touches a decision or a position. See
+        # portfolio_greeks.py's own docstring for why this is safe to run
+        # every cycle without affecting candidate selection at all.
+        try:
+            await portfolio_greeks.record_portfolio_greeks(mcp)
+        except Exception:
+            logger.exception("portfolio_greeks.record_portfolio_greeks failed (non-fatal)")
 
         try:
             open_spreads = db.get_open_spreads()

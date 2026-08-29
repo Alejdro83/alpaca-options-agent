@@ -384,3 +384,27 @@ def record_account_snapshot(
             """,
             (equity, last_equity, cash, open_spreads_count, daily_pl, daily_pl_pct, spy_price),
         )
+
+
+def record_portfolio_greeks_snapshot(
+    net_delta: float,
+    net_gamma: float,
+    net_theta: float,
+    net_vega: float,
+    net_rho: float,
+    per_spread: list[dict],
+) -> None:
+    """Real broker-computed net portfolio Greeks (2026-08-29) -- see
+    portfolio_greeks.py's own docstring. Monitoring only, best-effort:
+    caller (portfolio_greeks.record_portfolio_greeks) already wraps this
+    non-fatally, so a DB hiccup here never touches the real trading path.
+    """
+    with _connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            f"""
+            insert into {_schema()}.portfolio_greeks_snapshots
+                (net_delta, net_gamma, net_theta, net_vega, net_rho, per_spread)
+            values (%s, %s, %s, %s, %s, %s)
+            """,
+            (net_delta, net_gamma, net_theta, net_vega, net_rho, json.dumps(per_spread)),
+        )

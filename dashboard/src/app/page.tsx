@@ -5,6 +5,7 @@ import { Shell } from '@/components/Shell';
 import { EquitySparkline } from '@/components/EquitySparkline';
 import { ExitRuleComparisonPanel } from '@/components/ExitRuleComparisonPanel';
 import { KpiRow } from '@/components/KpiRow';
+import { PortfolioGreeksPanel } from '@/components/PortfolioGreeksPanel';
 import { RiskGatesPanel } from '@/components/RiskGatesPanel';
 import { ShadowBookPanel } from '@/components/ShadowBookPanel';
 import { StatusBadges } from '@/components/StatusBadges';
@@ -65,6 +66,24 @@ interface DashboardState {
     shadowPnlSeries: Array<{ policy: string; pnl: number; closed_at: string }>;
     llmPnlSeries: Array<{ pnl: number; closed_at: string }>;
   };
+  portfolioGreeks: {
+    net_delta: number | null;
+    net_gamma: number | null;
+    net_theta: number | null;
+    net_vega: number | null;
+    net_rho: number | null;
+    per_spread: Array<{
+      spread_id: number;
+      underlying: string;
+      strategy: string;
+      delta: number;
+      gamma: number;
+      theta: number;
+      vega: number;
+      rho: number;
+    }>;
+    snapshot_at: string;
+  } | null;
 }
 
 type SpreadRow = DashboardState['spreads'][number];
@@ -169,7 +188,7 @@ export default function DashboardPage() {
     );
   }
 
-  const { latestSnapshot, spreads, cycles, equityCurve, shadowBook } = state;
+  const { latestSnapshot, spreads, cycles, equityCurve, shadowBook, portfolioGreeks } = state;
   const openSpreads = spreads.filter((s) => s.status === 'open');
   const closedSpreads = spreads.filter((s) => s.status !== 'open');
   const kpis = computeKpis(spreads);
@@ -220,6 +239,8 @@ export default function DashboardPage() {
             policySeries={shadowBook.shadowPnlSeries}
             llmSeries={shadowBook.llmPnlSeries}
           />
+
+          <PortfolioGreeksPanel data={portfolioGreeks} />
 
           <section className="mb-4">
             <h2 className="text-sm font-semibold text-gray-300 mb-2">Open spreads ({openSpreads.length})</h2>

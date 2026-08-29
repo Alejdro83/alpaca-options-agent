@@ -78,6 +78,25 @@ export interface Cycle {
   error: string | null;
 }
 
+export interface PortfolioGreeksSnapshot {
+  net_delta: number | null;
+  net_gamma: number | null;
+  net_theta: number | null;
+  net_vega: number | null;
+  net_rho: number | null;
+  per_spread: Array<{
+    spread_id: number;
+    underlying: string;
+    strategy: string;
+    delta: number;
+    gamma: number;
+    theta: number;
+    vega: number;
+    rho: number;
+  }>;
+  snapshot_at: string;
+}
+
 export interface ShadowPolicySummary {
   policy: string;
   realized: number;
@@ -167,11 +186,28 @@ export async function getDashboardState() {
       // shadow_positions table may not exist yet -- non-fatal
     }
 
+    // Real portfolio Greeks (2026-08-29) -- monitoring only, see
+    // portfolio_greeks.py. Same defensive try/catch as shadow book above:
+    // a dashboard deployed ahead of the migration must still render
+    // everything else.
+    let portfolioGreeks: PortfolioGreeksSnapshot | null = null;
+    try {
+      const greeksResult = await client.query<PortfolioGreeksSnapshot>(
+        `select net_delta, net_gamma, net_theta, net_vega, net_rho, per_spread, snapshot_at
+         from ${SCHEMA}.portfolio_greeks_snapshots
+         order by snapshot_at desc limit 1`
+      );
+      portfolioGreeks = greeksResult.rows[0] ?? null;
+    } catch {
+      // portfolio_greeks_snapshots table may not exist yet -- non-fatal
+    }
+
     return {
       latestSnapshot: snapshot.rows[0] ?? null,
       spreads: spreads.rows,
       cycles: cycles.rows,
       equityCurve: curve.rows,
+      portfolioGreeks,
       shadowBook: {
         summaries: shadowSummaries,
         shadowPnlSeries,
