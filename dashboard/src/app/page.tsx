@@ -5,6 +5,7 @@ import { Shell } from '@/components/Shell';
 import { EquitySparkline } from '@/components/EquitySparkline';
 import { KpiRow } from '@/components/KpiRow';
 import { RiskGatesPanel } from '@/components/RiskGatesPanel';
+import { ShadowBookPanel } from '@/components/ShadowBookPanel';
 import { StatusBadges } from '@/components/StatusBadges';
 import { computeKpis } from '@/lib/stats';
 
@@ -52,6 +53,17 @@ interface DashboardState {
     error: string | null;
   }>;
   equityCurve: Array<{ equity: number; spy_price: number | null; snapshot_at: string }>;
+  shadowBook: {
+    summaries: Array<{
+      policy: string;
+      realized: number;
+      open_count: number;
+      closed_count: number;
+      win_rate: number;
+    }>;
+    shadowPnlSeries: Array<{ policy: string; pnl: number; closed_at: string }>;
+    llmPnlSeries: Array<{ pnl: number; closed_at: string }>;
+  };
 }
 
 type SpreadRow = DashboardState['spreads'][number];
@@ -156,7 +168,7 @@ export default function DashboardPage() {
     );
   }
 
-  const { latestSnapshot, spreads, cycles, equityCurve } = state;
+  const { latestSnapshot, spreads, cycles, equityCurve, shadowBook } = state;
   const openSpreads = spreads.filter((s) => s.status === 'open');
   const closedSpreads = spreads.filter((s) => s.status !== 'open');
   const kpis = computeKpis(spreads);
@@ -199,6 +211,8 @@ export default function DashboardPage() {
               last updated {new Date(latestSnapshot.snapshot_at).toLocaleString()}
             </p>
           </section>
+
+          <ShadowBookPanel data={shadowBook} />
 
           <section className="mb-4">
             <h2 className="text-sm font-semibold text-gray-300 mb-2">Open spreads ({openSpreads.length})</h2>

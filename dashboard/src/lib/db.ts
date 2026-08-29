@@ -78,6 +78,25 @@ export interface Cycle {
   error: string | null;
 }
 
+export interface ShadowPolicySummary {
+  policy: string;
+  realized: number;
+  open_count: number;
+  closed_count: number;
+  win_rate: number;
+}
+
+export interface ShadowPnlPoint {
+  policy: string;
+  pnl: number;
+  closed_at: string;
+}
+
+export interface LlmPnlPoint {
+  pnl: number;
+  closed_at: string;
+}
+
 export async function getDashboardState() {
   const client = await getPool().connect();
   try {
@@ -103,11 +122,61 @@ export async function getDashboardState() {
       `select equity, spy_price, snapshot_at from ${SCHEMA}.account_snapshots order by snapshot_at asc`
     );
 
+    // Shadow book (2026-08-29) -- per-policy aggregate summaries + P&L time
+    // series for the mechanical-rule and random counterfactual policies,
+    // plus the real LLM/book's own series for the same chart. Wrapped in
+    // try/catch: shadow_positions is a brand-new table, so a dashboard
+    // deployed slightly ahead of its migration must still render everything
+    // else.
+    let shadowSummaries: ShadowPolicySummary[] = [];
+    let shadowPnlSeries: ShadowPnlPoint[] = [];
+    let llmPnlSeries: LlmPnlPoint[] = [];
+    try {
+      const summaryResult = await client.query<ShadowPolicySummary>(
+        `select
+           policy,
+           coalesce(sum(realized_pnl) filter (where status != 'open'), 0) as realized,
+           count(*) filter (where status = 'open') as open_count,
+           count(*) filter (where status != 'open') as closed_count,
+           coalesce(
+             count(*) filter (where status = 'closed_profit')::float /
+             nullif(count(*) filter (where status != 'open'), 0),
+             0
+           ) as win_rate
+         from ${SCHEMA}.shadow_positions
+         group by policy`
+      );
+      shadowSummaries = summaryResult.rows;
+
+      const pnlResult = await client.query<ShadowPnlPoint>(
+        `select policy, realized_pnl as pnl, closed_at
+         from ${SCHEMA}.shadow_positions
+         where status != 'open' and realized_pnl is not null
+         order by closed_at asc`
+      );
+      shadowPnlSeries = pnlResult.rows;
+
+      const llmResult = await client.query<LlmPnlPoint>(
+        `select realized_pnl as pnl, closed_at
+         from ${SCHEMA}.spreads
+         where status != 'open' and realized_pnl is not null
+         order by closed_at asc`
+      );
+      llmPnlSeries = llmResult.rows;
+    } catch {
+      // shadow_positions table may not exist yet -- non-fatal
+    }
+
     return {
       latestSnapshot: snapshot.rows[0] ?? null,
       spreads: spreads.rows,
       cycles: cycles.rows,
       equityCurve: curve.rows,
+      shadowBook: {
+        summaries: shadowSummaries,
+        shadowPnlSeries,
+        llmPnlSeries,
+      },
     };
   } finally {
     client.release();

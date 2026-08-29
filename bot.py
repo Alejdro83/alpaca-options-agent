@@ -45,6 +45,7 @@ import db
 import executor_mcp
 import llm_reasoner
 import risk_gate
+import shadow_book
 from mcp_client import AlpacaMCP
 from spread_builder import IronCondorPlan, SpreadPlan, _mid_from_snapshot, build_iron_condor, build_spread
 
@@ -971,6 +972,18 @@ async def run_cycle() -> None:
     async with AlpacaMCP() as mcp:
         close_notes, near_stop = await manage_open_spreads(mcp)
 
+        # Mark/close yesterday's still-open shadow positions before this
+        # cycle's new ones open -- same sequencing as the real book. Never
+        # allowed to affect the real trading path (shadow_book.manage_open
+        # already wraps itself; the extra try/except here is belt-and-
+        # suspenders, matching this function's own existing convention of
+        # catching per-step rather than letting one non-critical step's
+        # failure take out the whole cycle).
+        try:
+            await shadow_book.manage_open(mcp)
+        except Exception:
+            logger.exception("shadow_book.manage_open failed (non-fatal)")
+
         try:
             open_spreads = db.get_open_spreads()
         except Exception:
@@ -1192,6 +1205,21 @@ async def run_cycle() -> None:
                 )
             except Exception:
                 logger.exception("Failed to record decision journal (non-fatal)")
+
+            # Open virtual positions for the shadow book's two counterfactual
+            # policies (mechanical rule + random pick), on the exact same
+            # gate-approved candidate menu this cycle's real decision saw.
+            try:
+                shadow_book.open_counterfactuals(
+                    cycle_id=cycle_id,
+                    candidates=candidates,
+                    llm_selected=llm_selected,
+                    shadow_selected=shadow_selected,
+                    equity=float(account["equity"]),
+                    max_risk_pct=config.risk.max_loss_per_spread_pct,
+                )
+            except Exception:
+                logger.exception("shadow_book.open_counterfactuals failed (non-fatal)")
 
         # SPY close alongside every snapshot -- a synthetic, non-capital-
         # consuming shadow benchmark (2026-08-29, prompted by reviewing a
