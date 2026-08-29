@@ -14,11 +14,16 @@ export function Shell({ children }: { children: ReactNode }) {
 
   return (
     <div className="min-h-screen bg-gray-950 text-white">
-      <header className="border-b border-gray-800 px-4 py-3">
-        <h1 className="text-lg font-bold bg-gradient-to-r from-amber-400 to-orange-500 bg-clip-text text-transparent">
-          Alpaca Options Agent
-        </h1>
-        <p className="text-xs text-gray-500">lablab.ai × Alpaca — AI Trading Agents Hackathon</p>
+      <header className="border-b border-gray-800 px-4 py-3 flex justify-between items-baseline">
+        <div>
+          <h1 className="text-lg font-bold bg-gradient-to-r from-amber-400 to-orange-500 bg-clip-text text-transparent">
+            Alpaca Options Agent
+          </h1>
+          <p className="text-xs text-gray-500">lablab.ai × Alpaca — AI Trading Agents Hackathon</p>
+        </div>
+        <a href="/lab" className="text-xs text-gray-500 hover:text-amber-400 whitespace-nowrap">
+          Backtest lab →
+        </a>
       </header>
       <main className="max-w-3xl mx-auto px-4 py-4">{children}</main>
     </div>

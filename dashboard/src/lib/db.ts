@@ -113,3 +113,58 @@ export async function getDashboardState() {
     client.release();
   }
 }
+
+// --- Backtest ablation lab (2026-08-29) -- see backtest_ablation.py -------
+
+export interface AblationConfigRow {
+  config: string;
+  n_trades: number;
+  total_pnl: number;
+  avg_pnl: number | null;
+  win_rate: number | null;
+  max_drawdown: number | null;
+  run_at: string;
+}
+
+export interface AblationTradeRow {
+  config: string;
+  symbol: string | null;
+  direction: string | null;
+  entry_date: string | null;
+  exit_date: string | null;
+  credit: number | null;
+  pnl: number | null;
+  exit_reason: string | null;
+}
+
+export async function getAblationState() {
+  const client = await getPool().connect();
+  try {
+    // Only the most recent run -- config rows share one run_at per batch
+    // (see backtest_ablation.py's _record_run). Real bug caught while
+    // wiring this up: fetching run_at into JS then passing it back as a
+    // query param round-trips through a JS Date object, which only has
+    // millisecond precision -- Postgres' timestamptz has microseconds, so
+    // the re-serialized value silently stopped matching any row and this
+    // always returned empty. Fixed by scoping both queries with a
+    // same-query subquery instead, so the timestamp never leaves Postgres.
+    const summary = await client.query<AblationConfigRow>(
+      `select config, n_trades, total_pnl, avg_pnl, win_rate, max_drawdown, run_at
+       from ${SCHEMA}.backtest_ablation
+       where run_at = (select max(run_at) from ${SCHEMA}.backtest_ablation)
+       order by id asc`
+    );
+    if (summary.rows.length === 0) {
+      return { summary: [] as AblationConfigRow[], trades: [] as AblationTradeRow[] };
+    }
+    const trades = await client.query<AblationTradeRow>(
+      `select config, symbol, direction, entry_date, exit_date, credit, pnl, exit_reason
+       from ${SCHEMA}.backtest_ablation_trades
+       where run_at = (select max(run_at) from ${SCHEMA}.backtest_ablation)
+       order by id asc limit 500`
+    );
+    return { summary: summary.rows, trades: trades.rows };
+  } finally {
+    client.release();
+  }
+}
