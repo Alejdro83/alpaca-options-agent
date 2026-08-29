@@ -1209,3 +1209,74 @@ class TestEvolutionExcludesRiskGates:
             for name in MUTABLE_PARAMS
         )
         assert changed, "no mutable param changed across the whole population -- mutation may be broken"
+
+
+# ===================================================================
+# 14. BETA-WEIGHTED DELTA (added 2026-08-29)
+# ===================================================================
+
+class TestBetaWeightedDelta:
+    """portfolio_greeks._compute_beta / _returns_from_closes: beta must be
+    computed from real trailing returns, never a hardcoded table (this
+    project's standing rule against fabricating a number it can instead
+    measure), and must fail closed (return None, not a guess) on
+    insufficient data.
+    """
+
+    def test_perfect_beta_two_recovered_without_noise(self):
+        """A synthetic series built with an EXACT 2x relationship to SPY
+        (no idiosyncratic noise) must recover beta essentially exactly --
+        the real math, not just "doesn't crash"."""
+        import random
+        from portfolio_greeks import _compute_beta, _returns_from_closes
+
+        rng = random.Random(42)
+        spy_closes, stock_closes = {}, {}
+        spy_price, stock_price = 100.0, 50.0
+        for i in range(30):
+            date = f"2026-01-{i + 1:02d}"
+            r = rng.uniform(-0.02, 0.02)
+            spy_price *= 1 + r
+            stock_price *= 1 + 2.0 * r  # exactly beta=2, by construction
+            spy_closes[date] = round(spy_price, 2)
+            stock_closes[date] = round(stock_price, 2)
+
+        beta = _compute_beta(_returns_from_closes(stock_closes), _returns_from_closes(spy_closes))
+        assert beta is not None
+        assert abs(beta - 2.0) < 0.01, f"expected ~2.0, got {beta}"
+
+    def test_insufficient_overlap_returns_none(self):
+        """Too few shared dates -- must fail closed (None), never guess a beta."""
+        from portfolio_greeks import _compute_beta
+
+        beta = _compute_beta({"2026-01-01": 0.01}, {"2026-01-01": 0.01})
+        assert beta is None
+
+    def test_beta_unaffected_by_a_gap_on_only_one_series(self):
+        """A data gap on ONE series only (e.g. a vendor outage for one
+        symbol on one day) must not silently misalign the two return
+        series positionally -- _compute_beta intersects on real shared
+        DATES, not list position, so the gap day is simply excluded from
+        both rather than shifting everything after it by one."""
+        import random
+        from portfolio_greeks import _compute_beta, _returns_from_closes
+
+        rng = random.Random(7)
+        spy_closes, stock_closes = {}, {}
+        spy_price, stock_price = 100.0, 50.0
+        gap_date = "2026-01-15"
+        for i in range(40):
+            date = f"2026-01-{i + 1:02d}" if i < 31 else f"2026-02-{i - 30:02d}"
+            r = rng.uniform(-0.02, 0.02)
+            spy_price *= 1 + r
+            stock_price *= 1 + 1.5 * r  # exactly beta=1.5, by construction
+            spy_closes[date] = round(spy_price, 2)
+            if date != gap_date:  # stock has a real gap here; SPY does not
+                stock_closes[date] = round(stock_price, 2)
+
+        beta = _compute_beta(_returns_from_closes(stock_closes), _returns_from_closes(spy_closes))
+        assert beta is not None
+        assert abs(beta - 1.5) < 0.05, (
+            f"expected ~1.5 even with a one-sided gap, got {beta} -- "
+            "a positional (not date-keyed) alignment bug would corrupt this"
+        )

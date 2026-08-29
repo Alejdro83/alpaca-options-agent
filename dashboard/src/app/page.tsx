@@ -72,6 +72,7 @@ interface DashboardState {
     net_theta: number | null;
     net_vega: number | null;
     net_rho: number | null;
+    beta_weighted_delta: number | null;
     per_spread: Array<{
       spread_id: number;
       underlying: string;
@@ -81,6 +82,8 @@ interface DashboardState {
       theta: number;
       vega: number;
       rho: number;
+      beta: number | null;
+      beta_weighted_delta: number | null;
     }>;
     snapshot_at: string;
   } | null;

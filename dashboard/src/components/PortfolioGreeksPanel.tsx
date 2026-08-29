@@ -9,6 +9,8 @@ interface PerSpreadGreeks {
   theta: number;
   vega: number;
   rho: number;
+  beta: number | null;
+  beta_weighted_delta: number | null;
 }
 
 interface PortfolioGreeksSnapshot {
@@ -17,6 +19,7 @@ interface PortfolioGreeksSnapshot {
   net_theta: number | null;
   net_vega: number | null;
   net_rho: number | null;
+  beta_weighted_delta: number | null;
   per_spread: PerSpreadGreeks[];
   snapshot_at: string;
 }
@@ -57,12 +60,28 @@ export function PortfolioGreeksPanel({ data }: { data: PortfolioGreeksSnapshot |
           </div>
         ))}
       </div>
+
+      {data.beta_weighted_delta !== null && (
+        <div className="rounded-lg bg-gray-900/60 py-2 px-3 mb-3 flex items-center justify-between">
+          <div>
+            <p className="text-xs text-gray-500">Beta-weighted delta</p>
+            <p className="text-[11px] text-gray-600">real trailing-return beta per underlying, not assumed</p>
+          </div>
+          <p className={`text-sm font-semibold ${data.beta_weighted_delta >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+            {fmt(data.beta_weighted_delta, 2)} SPY-eq. shares
+          </p>
+        </div>
+      )}
+
       <div className="space-y-1">
         {data.per_spread.map((s) => (
           <div key={s.spread_id} className="flex justify-between text-xs text-gray-500">
-            <span>{s.underlying} ({s.strategy})</span>
+            <span>
+              {s.underlying} ({s.strategy}){s.beta !== null && <span className="text-gray-600"> β={fmt(s.beta, 2)}</span>}
+            </span>
             <span>
               Δ {fmt(s.delta)} · Θ {fmt(s.theta)} · V {fmt(s.vega)}
+              {s.beta_weighted_delta !== null && <> · βΔ {fmt(s.beta_weighted_delta, 2)}</>}
             </span>
           </div>
         ))}

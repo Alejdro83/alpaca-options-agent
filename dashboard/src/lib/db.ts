@@ -84,6 +84,7 @@ export interface PortfolioGreeksSnapshot {
   net_theta: number | null;
   net_vega: number | null;
   net_rho: number | null;
+  beta_weighted_delta: number | null;
   per_spread: Array<{
     spread_id: number;
     underlying: string;
@@ -93,6 +94,8 @@ export interface PortfolioGreeksSnapshot {
     theta: number;
     vega: number;
     rho: number;
+    beta: number | null;
+    beta_weighted_delta: number | null;
   }>;
   snapshot_at: string;
 }
@@ -193,7 +196,7 @@ export async function getDashboardState() {
     let portfolioGreeks: PortfolioGreeksSnapshot | null = null;
     try {
       const greeksResult = await client.query<PortfolioGreeksSnapshot>(
-        `select net_delta, net_gamma, net_theta, net_vega, net_rho, per_spread, snapshot_at
+        `select net_delta, net_gamma, net_theta, net_vega, net_rho, beta_weighted_delta, per_spread, snapshot_at
          from ${SCHEMA}.portfolio_greeks_snapshots
          order by snapshot_at desc limit 1`
       );
