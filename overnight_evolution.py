@@ -761,6 +761,8 @@ def run_evolution(dry_run: bool = False) -> None:
     candidates = data["candidates"]
     if not candidates:
         logger.warning("0 trades/candidates today — skipping evolution")
+        if dry_run:
+            print(f"🌙 Evolution dry-run — {today.isoformat()}: 0 candidates today, nothing to evolve from.")
         return
 
     logger.info("Collected %d unique candidates from %d journal entries", len(candidates), len(data["journal"]))
@@ -841,10 +843,22 @@ def run_evolution(dry_run: bool = False) -> None:
     write_report(report, dry_run=dry_run)
     logger.info("Evolution complete%s", " [DRY RUN -- nothing applied]" if dry_run else "")
     if dry_run:
-        # Printed (not just logged) so a --no-agent Hermes cron can deliver
-        # this verbatim as the nightly report, without needing to also
-        # read state/evolution_report_dryrun.md off disk.
-        print(report)
+        # A CONCISE summary, printed (not just logged) so a --no-agent
+        # Hermes cron can deliver it straight to Discord/Telegram -- the
+        # full report (with the variant table and full evolution_history)
+        # stays in state/evolution_report_dryrun.md on MSA2, not dumped
+        # into a chat message (the full report has run well past
+        # Discord's 2000-char single-message limit in testing).
+        best_pnl = promoted_result["simulated_pnl"] if promoted_result else incumbent_result["simulated_pnl"]
+        print(
+            f"🌙 Evolution dry-run — {today.isoformat()} [{decision.upper()}]\n"
+            f"{reason}\n"
+            f"Incumbent sim P&L: ${incumbent_result['simulated_pnl']:.2f} -> "
+            f"best variant: ${best_pnl:.2f} "
+            f"({incumbent_result['would_have_opened']} vs "
+            f"{(promoted_result or incumbent_result)['would_have_opened']} would-open trades)\n"
+            f"Full report: state/evolution_report_dryrun.md on MSA2"
+        )
 
 
 if __name__ == "__main__":
