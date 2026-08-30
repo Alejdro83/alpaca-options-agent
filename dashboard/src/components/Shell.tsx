@@ -21,9 +21,14 @@ export function Shell({ children }: { children: ReactNode }) {
           </h1>
           <p className="text-xs text-gray-500">lablab.ai × Alpaca — AI Trading Agents Hackathon</p>
         </div>
-        <a href="/lab" className="text-xs text-gray-500 hover:text-amber-400 whitespace-nowrap">
-          Backtest lab →
-        </a>
+        <div className="flex gap-3">
+          <a href="/compare" className="text-xs text-gray-500 hover:text-amber-400 whitespace-nowrap">
+            3-way compare →
+          </a>
+          <a href="/lab" className="text-xs text-gray-500 hover:text-amber-400 whitespace-nowrap">
+            Backtest lab →
+          </a>
+        </div>
       </header>
       <main className="max-w-3xl mx-auto px-4 py-4">{children}</main>
     </div>

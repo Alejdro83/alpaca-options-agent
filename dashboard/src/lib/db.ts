@@ -276,3 +276,121 @@ export async function getAblationState() {
     client.release();
   }
 }
+
+// --- Three-strategy comparison (2026-08-30) --------------------------------
+//
+// One project, three independent implementations of the same underlying
+// signal/risk backbone: this repo's own LLM+deterministic-gate bot (verticals
+// + iron condor), a parallel autonomous-agent experiment ("Paco", built on
+// the zeroclaw framework, same risk_gate/regime code imported directly --
+// see mcp_risk_proxy/server.py and signals/regime.py), and rookieriot's
+// independent build (verticals-only, narrower ETF/large-cap universe). All
+// three reset to a fresh $100,000 paper account on 2026-08-30 specifically
+// so this comparison starts from the same baseline once real trading begins
+// 2026-08-31.
+//
+// Paco's account is NOT eligible for hackathon judging (it's a repurposed
+// account, not brand-new-and-dedicated) -- it is presented here purely as a
+// research comparison, never as a substitute for this repo's own judged
+// account (`getDashboardState` above, schema `alpaca_hackathon`).
+
+const PACO_SCHEMA = 'zeroclaw_trading';
+const ROOKIERIOT_STATE_URL = 'https://alpaca-trading-rookieriot.vercel.app/api/state';
+
+export interface PacoState {
+  latestSnapshot: {
+    equity: number;
+    daily_pnl: number | null;
+    snapshot_at: string;
+  } | null;
+  equityCurve: Array<{ equity: number; snapshot_at: string }>;
+  openCount: number;
+  strategyMix: Array<{ strategy: string; count: number }>;
+  portfolioGreeks: PortfolioGreeksSnapshot | null;
+}
+
+async function getPacoState(): Promise<PacoState> {
+  const client = await getPool().connect();
+  try {
+    const snapshot = await client.query(
+      `select equity, daily_pnl, ts as snapshot_at
+       from ${PACO_SCHEMA}.account_snapshots order by ts desc limit 1`
+    );
+    const curve = await client.query(
+      `select equity, ts as snapshot_at from ${PACO_SCHEMA}.account_snapshots order by ts asc`
+    );
+    const openCountResult = await client.query(
+      `select count(*)::int as n from ${PACO_SCHEMA}.spreads where status = 'open'`
+    );
+    const mixResult = await client.query(
+      `select strategy, count(*)::int as count from ${PACO_SCHEMA}.spreads
+       where status = 'open' group by strategy`
+    );
+    let portfolioGreeks: PortfolioGreeksSnapshot | null = null;
+    try {
+      const greeksResult = await client.query<PortfolioGreeksSnapshot>(
+        `select net_delta, net_gamma, net_theta, net_vega, net_rho, beta_weighted_delta, per_spread, snapshot_at
+         from ${PACO_SCHEMA}.portfolio_greeks_snapshots order by snapshot_at desc limit 1`
+      );
+      portfolioGreeks = greeksResult.rows[0] ?? null;
+    } catch {
+      // table may not exist yet on an older deploy -- non-fatal
+    }
+    return {
+      latestSnapshot: snapshot.rows[0] ?? null,
+      equityCurve: curve.rows,
+      openCount: openCountResult.rows[0]?.n ?? 0,
+      strategyMix: mixResult.rows,
+      portfolioGreeks,
+    };
+  } finally {
+    client.release();
+  }
+}
+
+export interface RookieriotState {
+  latestSnapshot: {
+    equity: number;
+    daily_pl: number | null;
+    snapshot_at: string;
+  } | null;
+  equityCurve: Array<{ equity: number; spy_price: number | null; snapshot_at: string }>;
+  openCount: number;
+}
+
+async function getRookieriotState(): Promise<RookieriotState | null> {
+  // Their own public read-only endpoint -- same shape this repo's own
+  // /api/state exposes, no shared credentials needed. Best-effort: their
+  // deploy being down must never break this dashboard's own page.
+  try {
+    const res = await fetch(ROOKIERIOT_STATE_URL, { next: { revalidate: 0 } });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return {
+      latestSnapshot: data.latestSnapshot
+        ? {
+            equity: Number(data.latestSnapshot.equity),
+            daily_pl: data.latestSnapshot.daily_pl !== null ? Number(data.latestSnapshot.daily_pl) : null,
+            snapshot_at: data.latestSnapshot.snapshot_at,
+          }
+        : null,
+      equityCurve: (data.equityCurve ?? []).map((p: { equity: string; spy_price: string | null; snapshot_at: string }) => ({
+        equity: Number(p.equity),
+        spy_price: p.spy_price !== null ? Number(p.spy_price) : null,
+        snapshot_at: p.snapshot_at,
+      })),
+      openCount: (data.spreads ?? []).filter((s: { status: string }) => s.status === 'open').length,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function getCompareState() {
+  const [ours, paco, rookieriot] = await Promise.all([
+    getDashboardState(),
+    getPacoState().catch(() => null),
+    getRookieriotState(),
+  ]);
+  return { ours, paco, rookieriot };
+}
