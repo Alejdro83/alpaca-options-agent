@@ -46,6 +46,7 @@ import db
 import executor_mcp
 import llm_reasoner
 import portfolio_greeks
+import reconciler
 import risk_gate
 import shadow_book
 from mcp_client import AlpacaMCP
@@ -1112,12 +1113,30 @@ async def run_cycle() -> None:
                 "skipping candidate screening this cycle", options_level,
             )
 
+        # Broker/local-book reconciliation (2026-08-30, from cross-checking
+        # a competing team's hardening pass): compares Alpaca's actual
+        # option positions against our own `spreads` table. This project
+        # already had one incident from exactly this failure class
+        # (2026-08-27 phantom row, since fixed at the source) -- this is
+        # the ongoing cross-check that would have caught it independently.
+        # Only gates NEW entries; managing/closing already-known-open
+        # spreads (above) never waits on this.
+        try:
+            reconcile_result = reconciler.reconcile(client)
+        except Exception as exc:
+            logger.exception("Reconciliation check itself errored -- fail closed")
+            reconcile_result = reconciler.ReconcileResult(ok=False, reasons=[f"reconciliation check errored: {exc}"])
+        if not reconcile_result.ok:
+            logger.error("Reconciliation mismatch -- skipping candidate screening this cycle: %s", reconcile_result.reason)
+
         open_notes = []
         candidates = []
         slim_candidates: list[dict] = []
         decision = "skipped"
         if not options_level_ok:
             reasoning = f"Options trading level is {options_level!r}, need >=3 for spreads — not screening this cycle."
+        elif not reconcile_result.ok:
+            reasoning = f"Broker/local book reconciliation mismatch — not screening for new candidates this cycle: {reconcile_result.reason}"
         elif market_open:
             reasoning = "No eligible candidates this cycle."
         else:
@@ -1128,7 +1147,7 @@ async def run_cycle() -> None:
         llm_selected: list[str] = []
         cycle_id: int | None = None
 
-        if remaining_budget > 0 and market_open and options_level_ok:
+        if remaining_budget > 0 and market_open and options_level_ok and reconcile_result.ok:
             candidates, gate_rejections = await find_candidates(mcp, client, account, len(open_spreads))
             slim_candidates = [{k: v for k, v in c.items() if k != "_plan"} for c in candidates]
 

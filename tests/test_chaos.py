@@ -731,6 +731,7 @@ class TestMarketClosedShortCircuit:
         with patch.object(bot_module, "AlpacaClient", return_value=fake_client), \
              patch.object(bot_module, "AlpacaMCP") as MockMCP, \
              patch("bot.db") as mock_db, \
+             patch("bot.reconciler") as mock_reconciler, \
              patch("bot.llm_reasoner") as mock_llm, \
              patch("bot.find_candidates", new_callable=AsyncMock) as mock_find:
 
@@ -767,6 +768,7 @@ class TestMarketClosedShortCircuit:
         with patch.object(bot_module, "AlpacaClient", return_value=fake_client), \
              patch.object(bot_module, "AlpacaMCP") as MockMCP, \
              patch("bot.db") as mock_db, \
+             patch("bot.reconciler") as mock_reconciler, \
              patch("bot.llm_reasoner") as mock_llm, \
              patch("bot.find_candidates", new_callable=AsyncMock, return_value=([], [])) as mock_find:
 
@@ -778,6 +780,8 @@ class TestMarketClosedShortCircuit:
             mock_db.record_decision_journal.return_value = None
             mock_db.record_account_snapshot.return_value = None
             mock_llm.decide.return_value = {"selected": [], "reasoning": "Nothing good"}
+            from reconciler import ReconcileResult
+            mock_reconciler.reconcile.return_value = ReconcileResult(ok=True)
 
             pause_file = Path(__file__).resolve().parent.parent / "state" / "PAUSE"
             if pause_file.exists():
@@ -815,6 +819,7 @@ class TestOptionsLevelGate:
         with patch.object(bot_module, "AlpacaClient", return_value=fake_client), \
              patch.object(bot_module, "AlpacaMCP") as MockMCP, \
              patch("bot.db") as mock_db, \
+             patch("bot.reconciler") as mock_reconciler, \
              patch("bot.llm_reasoner") as mock_llm, \
              patch("bot.find_candidates", new_callable=AsyncMock) as mock_find:
 
@@ -850,6 +855,7 @@ class TestOptionsLevelGate:
         with patch.object(bot_module, "AlpacaClient", return_value=fake_client), \
              patch.object(bot_module, "AlpacaMCP") as MockMCP, \
              patch("bot.db") as mock_db, \
+             patch("bot.reconciler") as mock_reconciler, \
              patch("bot.llm_reasoner") as mock_llm, \
              patch("bot.find_candidates", new_callable=AsyncMock) as mock_find:
 
@@ -883,6 +889,7 @@ class TestOptionsLevelGate:
         with patch.object(bot_module, "AlpacaClient", return_value=fake_client), \
              patch.object(bot_module, "AlpacaMCP") as MockMCP, \
              patch("bot.db") as mock_db, \
+             patch("bot.reconciler") as mock_reconciler, \
              patch("bot.llm_reasoner") as mock_llm, \
              patch("bot.find_candidates", new_callable=AsyncMock, return_value=([], [])) as mock_find:
 
@@ -894,6 +901,8 @@ class TestOptionsLevelGate:
             mock_db.record_decision_journal.return_value = None
             mock_db.record_account_snapshot.return_value = None
             mock_llm.decide.return_value = {"selected": [], "reasoning": "Nothing good"}
+            from reconciler import ReconcileResult
+            mock_reconciler.reconcile.return_value = ReconcileResult(ok=True)
 
             pause_file = Path(__file__).resolve().parent.parent / "state" / "PAUSE"
             if pause_file.exists():
@@ -1422,3 +1431,129 @@ class TestBoundedLimitOrders:
                 mcp, "SHORT_SYM", "LONG_SYM", contracts=1,
             )
         assert not mcp.calls_for("place_option_order")
+
+
+class TestBrokerLocalReconciliation:
+    """reconciler.py: real gap found 2026-08-29 comparing against a
+    competing team's hardening pass. This project already had one
+    incident from exactly this failure class (2026-08-27 phantom Supabase
+    row from a rejected order, since fixed at the source) -- this is the
+    ongoing cross-check that would have caught it independently. Alpaca is
+    the source of truth; a divergence from our own `spreads` table must
+    block new entries.
+    """
+
+    def test_matching_book_is_ok(self):
+        from reconciler import reconcile
+
+        with patch("reconciler.db") as mock_db:
+            mock_db.get_open_spreads.return_value = [
+                {"short_symbol": "SPY260905C00450000", "long_symbol": "SPY260905C00455000"},
+            ]
+            client = SimpleNamespace(get_positions=lambda: [
+                {"symbol": "SPY260905C00450000"},
+                {"symbol": "SPY260905C00455000"},
+            ])
+            result = reconcile(client)
+
+        assert result.ok is True
+        assert result.reasons == []
+
+    def test_phantom_db_row_blocks(self):
+        """DB says a spread is open; the broker holds nothing for it --
+        must block, not assume the DB is right."""
+        from reconciler import reconcile
+
+        with patch("reconciler.db") as mock_db:
+            mock_db.get_open_spreads.return_value = [
+                {"short_symbol": "SPY260905C00450000", "long_symbol": "SPY260905C00455000"},
+            ]
+            client = SimpleNamespace(get_positions=lambda: [])
+            result = reconcile(client)
+
+        assert result.ok is False
+        assert "missing at broker" in result.reason
+
+    def test_orphan_broker_position_blocks(self):
+        """The broker holds an option leg our own book doesn't know about
+        -- must block, not silently ignore an untracked position."""
+        from reconciler import reconcile
+
+        with patch("reconciler.db") as mock_db:
+            mock_db.get_open_spreads.return_value = []
+            client = SimpleNamespace(get_positions=lambda: [
+                {"symbol": "SPY260905C00450000"},
+            ])
+            result = reconcile(client)
+
+        assert result.ok is False
+        assert "missing from DB" in result.reason
+
+    def test_iron_condor_call_legs_are_checked_too(self):
+        """A 4-leg iron condor row's call_short_symbol/call_long_symbol
+        columns must be reconciled too, not just the put-side columns
+        vertical spreads also use."""
+        from reconciler import reconcile
+
+        with patch("reconciler.db") as mock_db:
+            mock_db.get_open_spreads.return_value = [{
+                "short_symbol": "SPY260905P00440000", "long_symbol": "SPY260905P00435000",
+                "call_short_symbol": "SPY260905C00460000", "call_long_symbol": "SPY260905C00465000",
+            }]
+            # Broker only has the put side -- the call side is missing.
+            client = SimpleNamespace(get_positions=lambda: [
+                {"symbol": "SPY260905P00440000"},
+                {"symbol": "SPY260905P00435000"},
+            ])
+            result = reconcile(client)
+
+        assert result.ok is False
+        assert "SPY260905C00460000" in result.reason
+
+    def test_broker_fetch_failure_fails_closed(self):
+        from reconciler import reconcile
+
+        client = SimpleNamespace(get_positions=MagicMock(side_effect=RuntimeError("API down")))
+        result = reconcile(client)
+
+        assert result.ok is False
+        assert "broker positions unavailable" in result.reason
+
+    @pytest.mark.asyncio
+    async def test_run_cycle_skips_screening_on_reconciliation_mismatch(self):
+        """End-to-end: run_cycle must not call find_candidates when
+        reconciler.reconcile() reports a mismatch, even with the market
+        open, budget available, and options level sufficient."""
+        import bot as bot_module
+        from reconciler import ReconcileResult
+
+        mcp = FakeMCP()
+        fake_client = FakeClient(clock={"is_open": True, "next_open": "", "next_close": "", "timestamp": ""})
+        fake_client.account["daily_pl"] = 0.0
+        fake_client.account["daily_pl_pct"] = 0.0
+
+        with patch.object(bot_module, "AlpacaClient", return_value=fake_client), \
+             patch.object(bot_module, "AlpacaMCP") as MockMCP, \
+             patch("bot.db") as mock_db, \
+             patch("bot.reconciler") as mock_reconciler, \
+             patch("bot.llm_reasoner") as mock_llm, \
+             patch("bot.find_candidates", new_callable=AsyncMock) as mock_find:
+
+            MockMCP.return_value.__aenter__ = AsyncMock(return_value=mcp)
+            MockMCP.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            mock_db.get_open_spreads.return_value = []
+            mock_db.record_cycle.return_value = 1
+            mock_db.record_decision_journal.return_value = None
+            mock_db.record_account_snapshot.return_value = None
+            mock_reconciler.reconcile.return_value = ReconcileResult(
+                ok=False, reasons=["broker option legs missing from DB: ['SPY260905C00450000']"],
+            )
+
+            pause_file = Path(__file__).resolve().parent.parent / "state" / "PAUSE"
+            if pause_file.exists():
+                pause_file.unlink()
+
+            await bot_module.run_cycle()
+
+            mock_find.assert_not_called()
