@@ -1627,16 +1627,56 @@ class TestBrokerLocalReconciliation:
 
         with patch("reconciler.db") as mock_db:
             mock_db.get_open_spreads.return_value = [
-                {"short_symbol": "SPY260905C00450000", "long_symbol": "SPY260905C00455000"},
+                {"id": 1, "short_symbol": "SPY260905C00450000", "long_symbol": "SPY260905C00455000",
+                 "contracts": 1},
             ]
             client = SimpleNamespace(get_positions=lambda: [
-                {"symbol": "SPY260905C00450000"},
-                {"symbol": "SPY260905C00455000"},
+                {"symbol": "SPY260905C00450000", "side": "short", "qty": 1.0},
+                {"symbol": "SPY260905C00455000", "side": "long", "qty": 1.0},
             ])
             result = reconcile(client)
 
         assert result.ok is True
         assert result.reasons == []
+
+    def test_leg_quantity_mismatch_blocks(self):
+        """A leg quietly filled at a different size than its own DB record
+        used to pass silently -- the old symbol-only check couldn't see
+        it (2026-08-30 fix, found auditing the same pattern in Paco)."""
+        from reconciler import reconcile
+
+        with patch("reconciler.db") as mock_db:
+            mock_db.get_open_spreads.return_value = [
+                {"id": 1, "short_symbol": "SPY260905C00450000", "long_symbol": "SPY260905C00455000",
+                 "contracts": 2},
+            ]
+            client = SimpleNamespace(get_positions=lambda: [
+                {"symbol": "SPY260905C00450000", "side": "short", "qty": 5.0},  # DB says 2
+                {"symbol": "SPY260905C00455000", "side": "long", "qty": 2.0},
+            ])
+            result = reconcile(client)
+
+        assert result.ok is False
+        assert "DB says 2 contract(s), broker says 5.0" in result.reason
+
+    def test_leg_side_mismatch_blocks(self):
+        """A short leg recorded at the broker as long (or vice versa) is
+        a real capital-structure inconsistency, not just a quantity typo."""
+        from reconciler import reconcile
+
+        with patch("reconciler.db") as mock_db:
+            mock_db.get_open_spreads.return_value = [
+                {"id": 1, "short_symbol": "SPY260905C00450000", "long_symbol": "SPY260905C00455000",
+                 "contracts": 1},
+            ]
+            client = SimpleNamespace(get_positions=lambda: [
+                {"symbol": "SPY260905C00450000", "side": "long", "qty": 1.0},  # DB says short
+                {"symbol": "SPY260905C00455000", "side": "long", "qty": 1.0},
+            ])
+            result = reconcile(client)
+
+        assert result.ok is False
+        assert "expected side 'short', broker says 'long'" in result.reason
 
     def test_phantom_db_row_blocks(self):
         """DB says a spread is open; the broker holds nothing for it --
