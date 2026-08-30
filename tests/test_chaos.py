@@ -1557,3 +1557,139 @@ class TestBrokerLocalReconciliation:
             await bot_module.run_cycle()
 
             mock_find.assert_not_called()
+
+
+class TestSpreadMonitorMarkUnits:
+    """spread_monitor.py: real live-path bug found 2026-08-30 comparing
+    against a competing team's own fix for the identical mistake. Alpaca
+    quotes are dollars-per-share; credit_received/should_close's math/
+    realized_pnl are all dollars-per-contract (x100, same convention as
+    executor_mcp.get_spread_mark). _compute_mark returned the raw
+    per-share difference with no x100 -- against a real credit_received
+    like $150, an unmultiplied ~$0.75 mark computes as ~99.5% profit
+    captured on the very first WebSocket tick. Dormant so far only because
+    the one open real position (NVDA's iron condor) is excluded from this
+    monitor; the first real vertical fill would have hit it immediately.
+    """
+
+    def test_compute_mark_multiplies_by_100(self):
+        from spread_monitor import SpreadMonitor
+
+        mon = SpreadMonitor()
+        mon._quotes = {
+            "SHORT_SYM": {"bid": 1.00, "ask": 1.10},
+            "LONG_SYM": {"bid": 0.40, "ask": 0.50},
+        }
+        mark = mon._compute_mark("SHORT_SYM", "LONG_SYM")
+
+        # short mid 1.05, long mid 0.45 -> per-share 0.60 -> per-contract 60.00
+        assert mark == 60.0
+
+    def test_compute_mark_matches_credit_received_units_in_should_close(self):
+        """A mark this small relative to a realistic credit must NOT read
+        as an already-massive profit -- the exact failure mode the missing
+        x100 caused."""
+        from spread_monitor import SpreadMonitor
+        import risk_gate
+
+        mon = SpreadMonitor()
+        # Freshly opened: credit ~$150/contract, spread barely moved.
+        mon._quotes = {
+            "SHORT_SYM": {"bid": 1.48, "ask": 1.50},
+            "LONG_SYM": {"bid": 0.01, "ask": 0.03},
+        }
+        mark = mon._compute_mark("SHORT_SYM", "LONG_SYM")
+
+        should_close, _reason = risk_gate.should_close(credit_received=150.0, current_mark=mark)
+        assert should_close is False, (
+            f"mark={mark} against credit_received=150.0 wrongly triggered a close -- "
+            "units mismatch (missing x100) regression"
+        )
+
+
+class TestEmergencyFlattenBoundedClose:
+    """emergency_flatten.py: real regression this session's own limit-order
+    change (2026-08-29) introduced and left unnoticed -- close_spread/
+    close_iron_condor now require current_mark or max_loss to bound the
+    limit price, but this break-glass tool called them with neither,
+    meaning every real flatten would have raised ValueError and closed
+    nothing. Also adopts a competing team's hardening: shares bot.lock
+    with the cron so a flatten can never race a live cycle.
+    """
+
+    @pytest.mark.asyncio
+    async def test_flatten_closes_vertical_with_a_bounded_price(self):
+        import emergency_flatten
+
+        spread = {
+            "id": 1, "underlying": "SPY", "direction": "bull_put", "contracts": 2,
+            "strategy": "vertical", "short_symbol": "SHORT_SYM", "long_symbol": "LONG_SYM",
+            "credit_received": 150.0, "max_loss": 350.0,
+        }
+
+        mcp = FakeMCP()
+        mcp.set_response("get_option_snapshot", make_snapshot_response({
+            "SHORT_SYM": make_quote(bid=1.00, ask=1.10),
+            "LONG_SYM": make_quote(bid=0.40, ask=0.50),
+        }))
+        mcp.set_response("place_option_order", {"data": {"id": "order-1"}})
+
+        with patch.object(emergency_flatten, "db") as mock_db, \
+             patch.object(emergency_flatten, "reconciler") as mock_reconciler, \
+             patch.object(emergency_flatten, "AlpacaClient") as MockClient, \
+             patch.object(emergency_flatten, "AlpacaMCP") as MockMCP, \
+             patch.object(emergency_flatten.sys, "argv", ["emergency_flatten.py", "--yes"]):
+
+            mock_db.get_open_spreads.return_value = [spread]
+            mock_db.record_spread_close.return_value = None
+            mock_reconciler.reconcile.return_value = SimpleNamespace(
+                ok=True, reason=None, broker_option_symbols=set(),
+            )
+            MockClient.return_value = SimpleNamespace()
+            MockMCP.return_value.__aenter__ = AsyncMock(return_value=mcp)
+            MockMCP.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            await emergency_flatten._flatten_all()
+
+        calls = mcp.calls_for("place_option_order")
+        assert len(calls) == 1
+        assert calls[0]["type"] == "limit"
+        mock_db.record_spread_close.assert_called_once_with(1, "closed_emergency", None)
+
+    @pytest.mark.asyncio
+    async def test_flatten_falls_back_to_max_loss_when_quote_fetch_fails(self):
+        """No live mark available -- must still close, bounded by the
+        position's own max_loss, not raise and leave it open."""
+        import emergency_flatten
+
+        spread = {
+            "id": 2, "underlying": "SPY", "direction": "bull_put", "contracts": 1,
+            "strategy": "vertical", "short_symbol": "SHORT_SYM", "long_symbol": "LONG_SYM",
+            "credit_received": 150.0, "max_loss": 350.0,
+        }
+
+        mcp = FakeMCP()
+        mcp.set_response("get_option_snapshot", RuntimeError("quote feed down"))
+        mcp.set_response("place_option_order", {"data": {"id": "order-2"}})
+
+        with patch.object(emergency_flatten, "db") as mock_db, \
+             patch.object(emergency_flatten, "reconciler") as mock_reconciler, \
+             patch.object(emergency_flatten, "AlpacaClient") as MockClient, \
+             patch.object(emergency_flatten, "AlpacaMCP") as MockMCP, \
+             patch.object(emergency_flatten.sys, "argv", ["emergency_flatten.py", "--yes"]):
+
+            mock_db.get_open_spreads.return_value = [spread]
+            mock_db.record_spread_close.return_value = None
+            mock_reconciler.reconcile.return_value = SimpleNamespace(
+                ok=True, reason=None, broker_option_symbols=set(),
+            )
+            MockClient.return_value = SimpleNamespace()
+            MockMCP.return_value.__aenter__ = AsyncMock(return_value=mcp)
+            MockMCP.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            await emergency_flatten._flatten_all()
+
+        calls = mcp.calls_for("place_option_order")
+        assert len(calls) == 1
+        assert calls[0]["limit_price"] == "3.50"  # max_loss 350/contract -> 3.50/share
+        mock_db.record_spread_close.assert_called_once()
