@@ -515,19 +515,29 @@ def generate_report(
     reason: str,
     all_variants: list[StrategyParams],
     all_results: list[dict],
+    dry_run: bool = False,
 ) -> str:
     """Generate state/evolution_report.md."""
     lines = [
-        f"# Evolution Report — {today.isoformat()}",
+        f"# Evolution Report — {today.isoformat()}" + (" [DRY RUN]" if dry_run else ""),
         "",
         "**Caveat**: This is exploratory analysis on 1 day of data. Not statistically significant.",
+    ]
+    if dry_run:
+        lines.append(
+            "**DRY RUN**: report-only nightly cron (2026-08-30, for the judged week) -- "
+            "nothing below was actually applied. No evolved_params.json write, no real "
+            "auto-revert action. See pendientes.md for why real promotion/revert stays a "
+            "manual, deliberate step this week."
+        )
+    lines.extend([
         "",
         "## Decision",
         f"**{decision.upper()}** — {reason}",
         "",
         "## Parameter Diff (Incumbent vs Best Variant)",
         "",
-    ]
+    ])
 
     if best_variant:
         lines.append(_param_diff_table(incumbent, best_variant))
@@ -566,8 +576,11 @@ def generate_report(
     return "\n".join(lines)
 
 
-def write_report(content: str) -> None:
-    path = BASE_DIR / REPORT_PATH
+def write_report(content: str, dry_run: bool = False) -> None:
+    # Dry-run writes to its own file (never state/evolution_report.md) so
+    # an unattended nightly dry-run can never be mistaken for -- or
+    # silently overwrite -- the report from a real, deliberate manual run.
+    path = BASE_DIR / (REPORT_PATH.replace(".md", "_dryrun.md") if dry_run else REPORT_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content)
     logger.info("Evolution report written to %s", path)
@@ -577,7 +590,7 @@ def write_report(content: str) -> None:
 # 6. AUTO-REVERT (Layer 2 safety net)
 # ---------------------------------------------------------------------------
 
-def check_and_maybe_auto_revert() -> None:
+def check_and_maybe_auto_revert(dry_run: bool = False) -> None:
     """Runs before anything else, every night, regardless of whether
     tonight's replay finds new candidates to evolve from.
 
@@ -594,6 +607,15 @@ def check_and_maybe_auto_revert() -> None:
     own new generation number restoring the previous values (see
     write_evolved_params's docstring for why never by reusing the old
     number), logged to evolution_history same as any other decision here.
+
+    `dry_run=True` (2026-08-30, for an unattended nightly report-only cron
+    during the judged week -- see run_evolution's docstring): computes and
+    logs exactly the same check, but never calls _auto_revert_to's real
+    state changes (no evolved_params.json write, no
+    db.mark_generation_reverted). Still records the counterfactual to
+    evolution_history so the nightly report shows what WOULD have
+    happened, under a decision label ("would_auto_revert") that can never
+    collide with a real "auto_reverted" row.
     """
     path = BASE_DIR / PARAMS_PATH
     if not path.exists():
@@ -631,15 +653,26 @@ def check_and_maybe_auto_revert() -> None:
         return
 
     if current_perf["avg_pnl"] < 0 and previous_perf["avg_pnl"] >= 0:
+        verb = "would auto-revert" if dry_run else "reverting"
         reason = (
             f"auto-revert: generation {current_gen}'s real avg P&L/trade "
             f"(${current_perf['avg_pnl']:.2f} over {current_perf['closed_trades']} closed trades) "
             f"turned negative while generation {previous_gen}'s real avg P&L/trade "
             f"(${previous_perf['avg_pnl']:.2f} over {previous_perf['closed_trades']} closed trades) "
-            f"was not -- reverting to generation {previous_gen}'s parameters"
+            f"was not -- {verb} to generation {previous_gen}'s parameters"
         )
-        logger.warning(reason)
-        _auto_revert_to(previous_gen, current_gen, data, reason, current_perf, previous_perf)
+        logger.warning(("[DRY RUN] " if dry_run else "") + reason)
+        if dry_run:
+            try:
+                db.record_evolution_history(
+                    generation=current_gen, decision="would_auto_revert",
+                    params_before=data, params_after=None, reason="[DRY RUN] " + reason,
+                    real_metrics={"reverted_generation": current_perf, "restored_generation": previous_perf},
+                )
+            except Exception:
+                logger.exception("Failed to record dry-run auto-revert to evolution_history (non-fatal)")
+        else:
+            _auto_revert_to(previous_gen, current_gen, data, reason, current_perf, previous_perf)
     else:
         logger.info(
             "Auto-revert check: generation %d real performance OK (avg P&L $%.2f/trade over %d trades "
@@ -688,11 +721,24 @@ def _auto_revert_to(
 # Main pipeline
 # ---------------------------------------------------------------------------
 
-def run_evolution() -> None:
-    """Full overnight evolution pipeline."""
+def run_evolution(dry_run: bool = False) -> None:
+    """Full overnight evolution pipeline.
+
+    `dry_run=True` (2026-08-30, added specifically to run this unattended
+    as a nightly cron during the judged week without ceding control over
+    live parameters): runs the exact same collection/mutation/replay/
+    promotion-evaluation logic, still writes state/evolution_report.md and
+    still logs every decision to evolution_history for a real audit trail
+    -- but never calls write_evolved_params (the file that actually
+    changes what the live bot does) and never lets the auto-revert check
+    take its real action either. Actually applying a promotion or a
+    revert stays a deliberate, separate, manual step -- see pendientes.md
+    for why, this close to the judged week, with this little real trade
+    history to validate against.
+    """
     today = datetime.now(timezone.utc).date()
     seed = int(today.strftime("%Y%m%d"))
-    logger.info("Starting overnight evolution for %s (seed=%d)", today, seed)
+    logger.info("Starting overnight evolution for %s (seed=%d)%s", today, seed, " [DRY RUN]" if dry_run else "")
 
     # 0. AUTO-REVERT CHECK (Layer 2) -- runs every night regardless of
     # whether there's anything to evolve from tonight; a promoted
@@ -700,7 +746,7 @@ def run_evolution() -> None:
     # accumulating over time, independent of tonight's candidate count.
     logger.info("Step 0: Checking real performance of the active generation")
     try:
-        check_and_maybe_auto_revert()
+        check_and_maybe_auto_revert(dry_run=dry_run)
     except Exception:
         logger.exception("Auto-revert check failed (non-fatal, continuing with tonight's evolution)")
 
@@ -743,26 +789,33 @@ def run_evolution() -> None:
     logger.info("Step 4: Evaluating promotion")
     promoted, promoted_result, reason = evaluate_promotion(incumbent, incumbent_result, variants, variant_results)
 
-    if promoted:
+    if promoted and not dry_run:
         new_generation = write_evolved_params(promoted, reason)
         decision = "promoted"
         logger.info("PROMOTED: %s", reason)
+    elif promoted and dry_run:
+        new_generation = incumbent_generation + 1  # display only -- never reserved/written
+        decision = "would_promote"
+        logger.info("[DRY RUN] WOULD PROMOTE: %s", reason)
     else:
         new_generation = incumbent_generation
-        decision = "shadow"
-        logger.info("NO PROMOTION: %s", reason)
+        decision = "shadow" if not dry_run else "would_hold"
+        logger.info(("[DRY RUN] " if dry_run else "") + "NO PROMOTION: %s", reason)
 
     # Audit trail (Layer 1): every night's decision is a permanent row here,
     # whether or not anything changed -- never overwritten, unlike
     # evolved_params.json (current state only) or evolution_report.md
     # (overwritten each run). See revert_evolution.py to act on this.
+    # Dry-run decisions use their own "would_*" labels (never "promoted"/
+    # "held") so a real revert lookup (_auto_revert_to's `decision ==
+    # "promoted"` match) can never mistake a dry-run row for a real one.
     try:
         db.record_evolution_history(
             generation=new_generation,
-            decision="promoted" if promoted else "held",
+            decision=decision,
             params_before=asdict(incumbent),
             params_after=asdict(promoted) if promoted else None,
-            reason=reason,
+            reason=("[DRY RUN] " + reason) if dry_run else reason,
             simulated_metrics={
                 "incumbent": incumbent_result,
                 "promoted": promoted_result,
@@ -783,14 +836,36 @@ def run_evolution() -> None:
         reason=reason,
         all_variants=variants,
         all_results=variant_results,
+        dry_run=dry_run,
     )
-    write_report(report)
-    logger.info("Evolution complete")
+    write_report(report, dry_run=dry_run)
+    logger.info("Evolution complete%s", " [DRY RUN -- nothing applied]" if dry_run else "")
+    if dry_run:
+        # Printed (not just logged) so a --no-agent Hermes cron can deliver
+        # this verbatim as the nightly report, without needing to also
+        # read state/evolution_report_dryrun.md off disk.
+        print(report)
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help=(
+            "Report-only mode (2026-08-30, for an unattended nightly cron during the "
+            "judged week): runs the full analysis and writes state/evolution_report_dryrun.md "
+            "plus a 'would_promote'/'would_hold'/'would_auto_revert' row in evolution_history, "
+            "but never writes evolved_params.json and never takes the auto-revert's real "
+            "action. Applying a promotion or a revert for real stays a separate, deliberate, "
+            "manual run without this flag."
+        ),
+    )
+    args = parser.parse_args()
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
-    run_evolution()
+    run_evolution(dry_run=args.dry_run)

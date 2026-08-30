@@ -277,7 +277,11 @@ def record_evolution_history(
 ) -> int:
     """Append-only audit trail for overnight_evolution.py — every night's
     run gets a row here, `decision` in ('promoted', 'held', 'auto_reverted',
-    'manual_revert'), whether or not anything actually changed. Unlike
+    'manual_revert') for a real run, or ('would_promote', 'would_hold',
+    'would_auto_revert') for a --dry-run run (2026-08-30) — the "would_*"
+    prefix is deliberate so a real revert lookup (which matches the exact
+    string 'promoted') can never mistake a dry-run row for a real one.
+    Whether or not anything actually changed, this gets a row. Unlike
     evolved_params.json (which only ever holds the *current* state) or
     evolution_report.md (overwritten every run), this is never overwritten
     — the whole point is to be able to look back at every generation ever
