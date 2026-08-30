@@ -62,6 +62,10 @@ class FakeClient:
         "timestamp": "2026-08-29T18:00:00+00:00",
     })
     positions: list[dict] = field(default_factory=list)
+    # order_id -> order dict, for get_order() -- tests configure what a
+    # poll should see (e.g. {"status": "filled", "filled_avg_price": 1.35}).
+    orders: dict[str, dict] = field(default_factory=dict)
+    canceled_order_ids: list[str] = field(default_factory=list)
 
     def get_account(self) -> dict[str, Any]:
         return self.account
@@ -71,6 +75,12 @@ class FakeClient:
 
     def get_positions(self) -> list[dict[str, Any]]:
         return self.positions
+
+    def get_order(self, order_id: str) -> dict[str, Any]:
+        return self.orders.get(order_id, {"status": "accepted"})
+
+    def cancel_order(self, order_id: str) -> None:
+        self.canceled_order_ids.append(order_id)
 
 
 # ---------------------------------------------------------------------------

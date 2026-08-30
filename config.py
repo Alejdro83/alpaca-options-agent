@@ -273,6 +273,22 @@ class OptionsRiskLimits:
         # not independently backtested.
         default_factory=lambda: _env_float("MAX_ENTRY_SLIPPAGE_PCT", 0.10)
     )
+    order_poll_timeout_s: float = field(
+        # Real gap found 2026-08-30 (same cross-check as max_entry_slippage_pct
+        # above): a limit order is not guaranteed an immediate fill the way a
+        # market order during market hours effectively is. Before this, a
+        # spread was recorded "open" with an ESTIMATED credit the instant
+        # Alpaca accepted the order, never confirming it actually filled --
+        # harmless drift under market orders, a real correctness gap now
+        # that entries are marketable limits (see executor_mcp.py). Bounded
+        # short: candidates already passed the liquidity gate, so a
+        # marketable limit should fill in seconds in the normal case: this
+        # is a ceiling against a genuinely stuck order, not an expected wait.
+        default_factory=lambda: _env_float("ORDER_POLL_TIMEOUT_S", 45.0)
+    )
+    order_poll_interval_s: float = field(
+        default_factory=lambda: _env_float("ORDER_POLL_INTERVAL_S", 2.0)
+    )
 
 
 # Scope note (2026-08-28): Real IV Rank was considered specifically for

@@ -14,18 +14,46 @@ orders (fixed 2026-08-29, closing a TODO left in this file since the
 project started): a market mleg order on a thin strike can fill at a
 materially worse net credit/debit than the mid the pre-trade gate just
 checked, with no floor at all. See config.risk.max_entry_slippage_pct.
+
+Opening a spread also confirms the fill for real (2026-08-30, closing a
+gap the limit-order change above exposed): a limit order, unlike a market
+order during market hours, is not guaranteed an immediate fill. Before
+this, a spread was recorded "open" with an ESTIMATED credit the instant
+Alpaca merely ACCEPTED the order -- harmless drift under the old
+unbounded market orders (fill was near-certain and near-immediate), a
+real correctness gap now. `open_spread`/`open_iron_condor` poll the order
+via `client.get_order()` when a client is passed (bot.py's real call
+sites always pass one) and return the REAL fill price; if the order is
+still unfilled after config.risk.order_poll_timeout_s, it's canceled and
+an exception raised rather than ever recording a guessed-at "open"
+position. See db.record_spread_open's callers in bot.py.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import Any
 
 from config import config
 from mcp_client import AlpacaMCP
 from spread_builder import IronCondorPlan, SpreadPlan
 
 logger = logging.getLogger(__name__)
+
+FILLED_STATUSES = {"filled", "done_for_day"}
+TERMINAL_BAD_STATUSES = {"canceled", "cancelled", "expired", "rejected", "replaced"}
+
+
+@dataclass
+class OrderResult:
+    order_ids: list[str]
+    status: str  # "filled" | "dry_run" (unfilled orders never return normally -- see below)
+    fill_credit: float | None = None  # per-contract net credit (open) or debit (close)
+    raw: Any = field(default=None, repr=False)
 
 
 def limit_credit_price(credit_per_contract: float, slippage_pct: float | None = None) -> str:
@@ -81,13 +109,153 @@ def _extract_order_ids(result) -> list[str]:
     raise RuntimeError(f"Could not extract a real order id from place_option_order result: {result}")
 
 
+def _extract_status(result) -> str | None:
+    payload = result.get("data", result) if isinstance(result, dict) else result
+    if isinstance(payload, dict):
+        status = payload.get("status")
+        if status:
+            return str(status).lower()
+    if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+        status = payload[0].get("status")
+        if status:
+            return str(status).lower()
+    return None
+
+
+def _extract_filled_avg_price(result) -> float | None:
+    """Per-share net CREDIT for an OPENING multi-leg order (sell legs minus
+    buy legs). Dollars-PER-SHARE; callers multiply by 100 for the
+    per-contract figure credit_received/max_loss/db columns use everywhere
+    else in this project.
+
+    Real sign bug caught 2026-08-30 verifying this against a REAL filled
+    order (the NVDA iron condor's own opening order, fetched live via the
+    new alpaca_client.get_order()): Alpaca's own top-level
+    `filled_avg_price` for a net-credit mleg order came back NEGATIVE
+    (-0.54) -- a "cost to acquire" convention where a credit position has
+    negative acquisition cost, the OPPOSITE of this project's convention
+    (credit_received is always positive). The per-leg computation below
+    gives the correct sign directly and matched exactly: legs were
+    0.93+0.54 (the two sell/short legs) and 0.59+0.34 (the two buy/long
+    legs) = net credit 0.54 = -(-0.54). Per-leg is tried FIRST for this
+    reason; the top-level field is only a last-resort fallback, negated to
+    match. This function is OPEN-specific -- do not reuse it for a closing
+    order without re-deriving the sign, since which side (buy/sell) is the
+    "credit" leg flips on a close.
+    """
+    payload = result.get("data", result) if isinstance(result, dict) else result
+    orders = payload if isinstance(payload, list) else [payload]
+    for order in orders:
+        if not isinstance(order, dict):
+            continue
+        credits: list[float] = []
+        debits: list[float] = []
+        for leg in order.get("legs") or []:
+            if not isinstance(leg, dict):
+                continue
+            px = leg.get("filled_avg_price")
+            if px is None:
+                continue
+            try:
+                price = float(px)
+            except (TypeError, ValueError):
+                continue
+            side = (leg.get("side") or "").lower()
+            (credits if side == "sell" else debits).append(price)
+        if credits or debits:
+            return sum(credits) - sum(debits)
+        avg = order.get("filled_avg_price")
+        if avg is not None:
+            try:
+                return -float(avg)
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
+async def _poll_order_status(client, order_id: str) -> dict[str, Any] | None:
+    """Poll REST for a single order until a terminal status or timeout.
+    Returns the last known order dict, or None if it was never reachable
+    at all (client has no get_order, or every poll raised)."""
+    if client is None or not hasattr(client, "get_order"):
+        return None
+    deadline = time.monotonic() + config.risk.order_poll_timeout_s
+    last: dict[str, Any] | None = None
+    while True:
+        try:
+            last = client.get_order(order_id)
+        except Exception:
+            logger.exception("Failed to poll order %s", order_id)
+        else:
+            status = str(last.get("status") or "").lower()
+            if status in FILLED_STATUSES or status in TERMINAL_BAD_STATUSES:
+                return last
+        if time.monotonic() >= deadline:
+            return last
+        await asyncio.sleep(config.risk.order_poll_interval_s)
+
+
+async def _confirm_fill(mcp: AlpacaMCP, result, order_ids: list[str], client, *, action: str) -> tuple[str, float | None, Any]:
+    """Shared open/close fill-confirmation path. Returns (status, fill_per_share, raw).
+
+    Raises if the order goes terminal without a fill, or is canceled after
+    sitting unfilled past config.risk.order_poll_timeout_s -- either way,
+    the caller must never record a position based on a guess.
+    """
+    status = _extract_status(result)
+    fill_per_share = _extract_filled_avg_price(result)
+    raw = result
+
+    if client is None:
+        # No client passed: legacy behavior for callers that don't need
+        # confirmed fills (e.g. a caller with no AlpacaClient handy). Never
+        # the case at bot.py's real order-placing call sites.
+        if status in TERMINAL_BAD_STATUSES:
+            raise RuntimeError(f"{action} order terminal without fill: status={status} ids={order_ids}")
+        logger.warning("%s: no client passed, fill not confirmed (status=%s)", action, status)
+        return "filled", fill_per_share, raw
+
+    if status not in FILLED_STATUSES and status not in TERMINAL_BAD_STATUSES:
+        polled = await _poll_order_status(client, order_ids[0])
+        if polled is not None:
+            raw = polled
+            status = str(polled.get("status") or status).lower()
+            # _extract_filled_avg_price is OPEN-specific (see its own
+            # docstring on the real sign bug this avoids) -- only reuse it
+            # for an open. A future close-side confirmation needs its own
+            # correctly-signed extractor, not this one.
+            if fill_per_share is None and action == "open":
+                fill_per_share = _extract_filled_avg_price(polled)
+
+    if status in TERMINAL_BAD_STATUSES:
+        raise RuntimeError(f"{action} order terminal without fill: status={status} ids={order_ids}")
+
+    if status not in FILLED_STATUSES:
+        # Still resting unfilled after the poll window -- cancel it rather
+        # than leave a resting order that could fill later at a price
+        # nothing here re-validated, and never record a position for it.
+        for oid in order_ids:
+            try:
+                client.cancel_order(oid)
+            except Exception:
+                logger.exception("Failed to cancel unfilled %s order %s", action, oid)
+        raise RuntimeError(
+            f"{action} order not filled within {config.risk.order_poll_timeout_s:.0f}s "
+            f"(status={status}) — canceled, no position opened: ids={order_ids}"
+        )
+
+    return "filled", fill_per_share, raw
+
+
 def _make_client_order_id(underlying: str, direction: str) -> str:
     ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     hex8 = uuid.uuid4().hex[:8]
     return f"opt-{underlying}-{direction}-{ts}-{hex8}"
 
 
-async def open_spread(mcp: AlpacaMCP, plan: SpreadPlan, contracts: int = 1) -> list[str]:
+async def open_spread(
+    mcp: AlpacaMCP, plan: SpreadPlan, contracts: int = 1, *, client=None,
+) -> OrderResult:
     """Opens the spread as one multi-leg order (sell short leg, buy long leg
     simultaneously) — never as two independent legs, which would leave a
     naked, undefined-risk position if only one leg filled.
@@ -96,7 +264,12 @@ async def open_spread(mcp: AlpacaMCP, plan: SpreadPlan, contracts: int = 1) -> l
     config.risk.max_entry_slippage_pct (the pre-trade gate already rebuilt
     this from a fresh mid moments earlier).
 
-    Returns the Alpaca order id(s) for the resulting order(s).
+    `client` (an AlpacaClient), when given, confirms the fill for real via
+    polling before returning — see module docstring. Without one, this
+    only confirms the order wasn't immediately rejected, same as before
+    2026-08-30 (no caller in this project omits `client` at a real open).
+
+    Returns an OrderResult with the real per-contract fill credit.
     """
     short_cid = _make_client_order_id(plan.underlying, plan.direction)
     long_cid = _make_client_order_id(plan.underlying, plan.direction)
@@ -121,8 +294,10 @@ async def open_spread(mcp: AlpacaMCP, plan: SpreadPlan, contracts: int = 1) -> l
         },
     )
     order_ids = _extract_order_ids(result)
-    logger.info("Opened %s %s: orders %s", plan.underlying, plan.direction, order_ids)
-    return order_ids
+    status, fill_per_share, raw = await _confirm_fill(mcp, result, order_ids, client, action="open")
+    fill_credit = round(fill_per_share * 100, 2) if fill_per_share is not None else None
+    logger.info("Opened %s %s: orders %s fill_credit=%s", plan.underlying, plan.direction, order_ids, fill_credit)
+    return OrderResult(order_ids=order_ids, status=status, fill_credit=fill_credit, raw=raw)
 
 
 async def close_spread(
@@ -170,13 +345,18 @@ async def close_spread(
     return order_ids
 
 
-async def open_iron_condor(mcp: AlpacaMCP, plan: IronCondorPlan, contracts: int = 1) -> list[str]:
+async def open_iron_condor(
+    mcp: AlpacaMCP, plan: IronCondorPlan, contracts: int = 1, *, client=None,
+) -> OrderResult:
     """Opens the iron condor as ONE 4-leg multi-leg order (sell both short
     legs, buy both long legs simultaneously) — confirmed live via
     `session.list_tools()` that `place_option_order`'s `legs` array supports
     up to 4 entries, so this needs no second order the way a naive
     "two separate verticals" implementation would, and keeps the same
     fill-all-or-nothing guarantee `open_spread` relies on for two legs.
+
+    Same real-fill-confirmation contract as `open_spread` — see there and
+    the module docstring.
     """
     short_put_cid = _make_client_order_id(plan.underlying, plan.direction)
     long_put_cid = _make_client_order_id(plan.underlying, plan.direction)
@@ -205,8 +385,10 @@ async def open_iron_condor(mcp: AlpacaMCP, plan: IronCondorPlan, contracts: int 
         },
     )
     order_ids = _extract_order_ids(result)
-    logger.info("Opened %s iron condor: orders %s", plan.underlying, order_ids)
-    return order_ids
+    status, fill_per_share, raw = await _confirm_fill(mcp, result, order_ids, client, action="open")
+    fill_credit = round(fill_per_share * 100, 2) if fill_per_share is not None else None
+    logger.info("Opened %s iron condor: orders %s fill_credit=%s", plan.underlying, order_ids, fill_credit)
+    return OrderResult(order_ids=order_ids, status=status, fill_credit=fill_credit, raw=raw)
 
 
 async def close_iron_condor(

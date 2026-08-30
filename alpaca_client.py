@@ -213,6 +213,38 @@ class AlpacaClient:
     def cancel_order(self, order_id: str) -> None:
         _retry(self._trading.cancel_order_by_id, order_id)
 
+    def get_order(self, order_id: str) -> dict[str, Any]:
+        """Single-order lookup, including per-leg fill prices for a
+        multi-leg (mleg) order -- used to poll a just-submitted limit order
+        for a real fill before recording a spread as open (2026-08-30).
+        """
+        order = _retry(self._trading.get_order_by_id, order_id)
+        return {
+            "id": str(order.id),
+            "client_order_id": getattr(order, "client_order_id", None),
+            "status": order.status.value if hasattr(order.status, "value") else str(order.status),
+            "filled_avg_price": (
+                float(order.filled_avg_price)
+                if getattr(order, "filled_avg_price", None) is not None
+                else None
+            ),
+            "legs": [
+                {
+                    "symbol": leg.symbol,
+                    "side": leg.side.value if leg.side else None,
+                    "position_intent": (
+                        leg.position_intent.value if getattr(leg, "position_intent", None) else None
+                    ),
+                    "filled_avg_price": (
+                        float(leg.filled_avg_price)
+                        if getattr(leg, "filled_avg_price", None) is not None
+                        else None
+                    ),
+                }
+                for leg in (order.legs or [])
+            ] if getattr(order, "legs", None) else None,
+        }
+
     def get_bars(
         self,
         symbol: str,

@@ -1211,9 +1211,44 @@ async def run_cycle() -> None:
                         break
 
                     if is_iron_condor:
-                        order_ids = await executor_mcp.open_iron_condor(mcp, plan, contracts=contracts)
+                        order = await executor_mcp.open_iron_condor(mcp, plan, contracts=contracts, client=client)
                     else:
-                        order_ids = await executor_mcp.open_spread(mcp, plan, contracts=contracts)
+                        order = await executor_mcp.open_spread(mcp, plan, contracts=contracts, client=client)
+                    order_ids = order.order_ids
+
+                    # Real fill confirmation (2026-08-30, closing a gap the
+                    # limit-order change exposed): executor_mcp already
+                    # polled client.get_order() until a real fill, cancel-
+                    # and-raise on timeout -- reaching here means it filled
+                    # for real. Use the REAL fill credit, not the pre-trade
+                    # estimate, for what gets recorded. width_x100 is
+                    # implicit from the plan's own already-consistent
+                    # max_loss/credit_estimate (max_loss = width*100 -
+                    # credit by construction in spread_builder.py), so this
+                    # doesn't need to re-derive width from strikes.
+                    credit_received = plan.credit_estimate
+                    max_loss_recorded = plan.max_loss
+                    if order.fill_credit is None:
+                        logger.warning(
+                            "%s %s filled but no real fill price could be parsed from the order "
+                            "response -- recording the pre-trade estimate instead",
+                            plan.underlying, plan.direction,
+                        )
+                    else:
+                        width_x100 = plan.max_loss + plan.credit_estimate
+                        real_max_loss = width_x100 - order.fill_credit
+                        if real_max_loss <= 0:
+                            logger.error(
+                                "%s %s real fill credit $%.2f implies non-positive max_loss "
+                                "($%.2f) against plan width -- recording the pre-trade estimate "
+                                "instead rather than a nonsensical number (position is real "
+                                "either way, this only affects what's recorded)",
+                                plan.underlying, plan.direction, order.fill_credit, real_max_loss,
+                            )
+                        else:
+                            credit_received = order.fill_credit
+                            max_loss_recorded = real_max_loss
+
                     try:
                         if is_iron_condor:
                             db.record_spread_open(
@@ -1225,8 +1260,8 @@ async def run_cycle() -> None:
                                 short_symbol=plan.short_put_symbol,
                                 long_symbol=plan.long_put_symbol,
                                 contracts=contracts,
-                                credit_received=plan.credit_estimate,
-                                max_loss=plan.max_loss,
+                                credit_received=credit_received,
+                                max_loss=max_loss_recorded,
                                 alpaca_order_ids=order_ids,
                                 cycle_id=cycle_id,
                                 generation=_current_generation,
@@ -1246,8 +1281,8 @@ async def run_cycle() -> None:
                                 short_symbol=plan.short_symbol,
                                 long_symbol=plan.long_symbol,
                                 contracts=contracts,
-                                credit_received=plan.credit_estimate,
-                                max_loss=plan.max_loss,
+                                credit_received=credit_received,
+                                max_loss=max_loss_recorded,
                                 alpaca_order_ids=order_ids,
                                 cycle_id=cycle_id,
                                 generation=_current_generation,
@@ -1257,9 +1292,9 @@ async def run_cycle() -> None:
                         logger.exception("Failed to record spread open to DB (order already sent to Alpaca)")
                     open_notes.append(
                         f"Opened {plan.underlying} {plan.direction} x{contracts} contract(s): "
-                        f"credit ${plan.credit_estimate * contracts:.2f} total "
-                        f"(${plan.credit_estimate:.2f}/contract), "
-                        f"max loss ${plan.max_loss * contracts:.2f} total"
+                        f"credit ${credit_received * contracts:.2f} total "
+                        f"(${credit_received:.2f}/contract), "
+                        f"max loss ${max_loss_recorded * contracts:.2f} total"
                     )
                     decision = "opened"
                     # Update running tallies so the next candidate's
@@ -1267,7 +1302,7 @@ async def run_cycle() -> None:
                     # exposure we just added (same 2026-08-28 audit fix
                     # discipline as the initial tally above).
                     running_spread_count += 1
-                    max_loss_just_opened = plan.max_loss * contracts
+                    max_loss_just_opened = max_loss_recorded * contracts
                     running_exposure[plan.underlying] = running_exposure.get(plan.underlying, 0) + max_loss_just_opened
                     just_opened_cluster = correlation_clusters.cluster_for(plan.underlying)
                     if just_opened_cluster is not None:

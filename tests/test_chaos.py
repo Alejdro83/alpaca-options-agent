@@ -1433,6 +1433,185 @@ class TestBoundedLimitOrders:
         assert not mcp.calls_for("place_option_order")
 
 
+class TestRealFillConfirmation:
+    """executor_mcp.open_spread/open_iron_condor: real gap found 2026-08-30,
+    exposed by this project's own limit-order change (2026-08-29). A limit
+    order, unlike a market order during market hours, is not guaranteed an
+    immediate fill -- before this, a spread was recorded "open" with an
+    ESTIMATED credit the instant Alpaca merely accepted the order, never
+    confirming a real fill. Now polls client.get_order() until a real fill
+    or a bounded timeout, and cancels + raises rather than ever letting a
+    caller record a guessed-at position.
+    """
+
+    def test_top_level_filled_avg_price_sign_is_negated(self):
+        """The exact bug caught live while building this fix: verified
+        against alpaca_client.get_order() on the real, already-filled NVDA
+        iron condor order, Alpaca's top-level filled_avg_price for a
+        net-credit mleg order is -0.54 ("cost to acquire" convention) --
+        the OPPOSITE of this project's always-positive credit_received
+        convention. Only reached when no per-leg data exists at all; a
+        naive `float(avg)` here (this function's first version) would have
+        recorded every real fill as a NEGATIVE credit."""
+        from executor_mcp import _extract_filled_avg_price
+
+        result = {"data": {"id": "order-1", "status": "filled", "filled_avg_price": "-0.54"}}
+        assert _extract_filled_avg_price(result) == 0.54
+
+    def test_per_leg_computation_matches_the_real_nvda_order(self):
+        """Same real order, but via per-leg data (what's actually used in
+        practice -- the top-level fallback above is last-resort only)."""
+        from executor_mcp import _extract_filled_avg_price
+
+        result = {"data": {"id": "order-1", "status": "filled", "legs": [
+            {"symbol": "NVDA260909P00205000", "side": "sell", "filled_avg_price": "0.93"},
+            {"symbol": "NVDA260909P00200000", "side": "buy", "filled_avg_price": "0.59"},
+            {"symbol": "NVDA260909C00240000", "side": "sell", "filled_avg_price": "0.54"},
+            {"symbol": "NVDA260909C00245000", "side": "buy", "filled_avg_price": "0.34"},
+        ]}}
+        assert _extract_filled_avg_price(result) == pytest.approx(0.54)
+
+    @pytest.mark.asyncio
+    async def test_immediate_fill_in_submit_response_needs_no_polling(self):
+        import executor_mcp
+
+        mcp = FakeMCP()
+        plan = make_plan(credit_estimate=150.0)
+        # Negative, matching Alpaca's real top-level convention for a net
+        # credit ("cost to acquire" -- negative for a credit position). See
+        # _extract_filled_avg_price's docstring: verified live 2026-08-30
+        # against the real NVDA iron condor order (-0.54 for a real $0.54
+        # credit) -- a naive positive-sign assumption here was the bug.
+        mcp.set_response("place_option_order", {
+            "data": {"id": "order-1", "status": "filled", "filled_avg_price": "-1.40"},
+        })
+        client = FakeClient()  # get_order should never be needed
+
+        order = await executor_mcp.open_spread(mcp, plan, contracts=1, client=client)
+
+        assert order.status == "filled"
+        assert order.fill_credit == 140.0  # 1.40/share -> 140.00/contract
+
+    @pytest.mark.asyncio
+    async def test_polls_until_a_real_fill_confirms(self):
+        import executor_mcp
+        import config as config_module
+
+        mcp = FakeMCP()
+        plan = make_plan(credit_estimate=150.0)
+        mcp.set_response("place_option_order", {"data": {"id": "order-1", "status": "accepted"}})
+        client = FakeClient(orders={
+            "order-1": {"status": "filled", "filled_avg_price": "-1.32"},  # real sign, see above
+        })
+        original_interval = config_module.config.risk.order_poll_interval_s
+        original_timeout = config_module.config.risk.order_poll_timeout_s
+        object.__setattr__(config_module.config.risk, "order_poll_interval_s", 0.01)
+        object.__setattr__(config_module.config.risk, "order_poll_timeout_s", 1.0)
+        try:
+            order = await executor_mcp.open_spread(mcp, plan, contracts=1, client=client)
+        finally:
+            object.__setattr__(config_module.config.risk, "order_poll_interval_s", original_interval)
+            object.__setattr__(config_module.config.risk, "order_poll_timeout_s", original_timeout)
+
+        assert order.status == "filled"
+        assert order.fill_credit == 132.0
+
+    @pytest.mark.asyncio
+    async def test_never_fills_gets_canceled_and_raises(self):
+        """An order still resting past the poll timeout must be canceled
+        and must raise -- never recorded as an open position."""
+        import executor_mcp
+        import config as config_module
+
+        mcp = FakeMCP()
+        plan = make_plan(credit_estimate=150.0)
+        mcp.set_response("place_option_order", {"data": {"id": "order-1", "status": "accepted"}})
+        client = FakeClient(orders={"order-1": {"status": "accepted"}})  # never fills
+        original_interval = config_module.config.risk.order_poll_interval_s
+        original_timeout = config_module.config.risk.order_poll_timeout_s
+        object.__setattr__(config_module.config.risk, "order_poll_interval_s", 0.01)
+        object.__setattr__(config_module.config.risk, "order_poll_timeout_s", 0.05)
+        try:
+            with pytest.raises(RuntimeError, match="not filled within"):
+                await executor_mcp.open_spread(mcp, plan, contracts=1, client=client)
+        finally:
+            object.__setattr__(config_module.config.risk, "order_poll_interval_s", original_interval)
+            object.__setattr__(config_module.config.risk, "order_poll_timeout_s", original_timeout)
+
+        assert "order-1" in client.canceled_order_ids
+
+    @pytest.mark.asyncio
+    async def test_terminal_rejection_after_polling_raises(self):
+        import executor_mcp
+        import config as config_module
+
+        mcp = FakeMCP()
+        plan = make_plan(credit_estimate=150.0)
+        mcp.set_response("place_option_order", {"data": {"id": "order-1", "status": "accepted"}})
+        client = FakeClient(orders={"order-1": {"status": "rejected"}})
+        original_interval = config_module.config.risk.order_poll_interval_s
+        original_timeout = config_module.config.risk.order_poll_timeout_s
+        object.__setattr__(config_module.config.risk, "order_poll_interval_s", 0.01)
+        object.__setattr__(config_module.config.risk, "order_poll_timeout_s", 1.0)
+        try:
+            with pytest.raises(RuntimeError, match="terminal without fill"):
+                await executor_mcp.open_spread(mcp, plan, contracts=1, client=client)
+        finally:
+            object.__setattr__(config_module.config.risk, "order_poll_interval_s", original_interval)
+            object.__setattr__(config_module.config.risk, "order_poll_timeout_s", original_timeout)
+
+        # Already terminal -- no point canceling an order that's already dead.
+        assert client.canceled_order_ids == []
+
+    @pytest.mark.asyncio
+    async def test_open_iron_condor_confirms_fill_across_4_legs_real_shape(self):
+        """Per-leg data shaped exactly like the real NVDA iron condor's own
+        opening order (fetched live 2026-08-30 via alpaca_client.get_order()
+        while building this fix): short put 0.93, long put 0.59, short call
+        0.54, long call 0.34 -> net credit 0.54/share, $54/contract. The
+        order's own top-level filled_avg_price in that real response was
+        -0.54 (see _extract_filled_avg_price's docstring) -- per-leg data
+        is what's actually used and gives the right sign directly.
+        """
+        import executor_mcp
+
+        mcp = FakeMCP()
+        plan = make_iron_condor_plan(credit_estimate=200.0)
+        mcp.set_response("place_option_order", {
+            "data": {
+                "id": "order-1", "status": "filled",
+                "legs": [
+                    {"symbol": "NVDA260909P00205000", "side": "sell", "filled_avg_price": "0.93"},
+                    {"symbol": "NVDA260909P00200000", "side": "buy", "filled_avg_price": "0.59"},
+                    {"symbol": "NVDA260909C00240000", "side": "sell", "filled_avg_price": "0.54"},
+                    {"symbol": "NVDA260909C00245000", "side": "buy", "filled_avg_price": "0.34"},
+                ],
+            },
+        })
+        client = FakeClient()
+
+        order = await executor_mcp.open_iron_condor(mcp, plan, contracts=1, client=client)
+
+        assert order.status == "filled"
+        assert order.fill_credit == 54.0  # matches the real order this fixture mirrors
+
+    @pytest.mark.asyncio
+    async def test_no_client_preserves_legacy_assume_filled_behavior(self):
+        """A caller that genuinely has no AlpacaClient handy (none exist in
+        this project) still gets the pre-2026-08-30 behavior: no polling,
+        no exception, just whatever the submit response said."""
+        import executor_mcp
+
+        mcp = FakeMCP()
+        plan = make_plan(credit_estimate=150.0)
+        mcp.set_response("place_option_order", {"data": {"id": "order-1"}})  # no status at all
+
+        order = await executor_mcp.open_spread(mcp, plan, contracts=1)
+
+        assert order.status == "filled"
+        assert order.order_ids == ["order-1"]
+
+
 class TestBrokerLocalReconciliation:
     """reconciler.py: real gap found 2026-08-29 comparing against a
     competing team's hardening pass. This project already had one
@@ -1557,6 +1736,128 @@ class TestBrokerLocalReconciliation:
             await bot_module.run_cycle()
 
             mock_find.assert_not_called()
+
+
+class TestBotRecordsRealFillNotEstimate:
+    """bot.run_cycle()'s open path: the real fill price from
+    executor_mcp.OrderResult (now polled/confirmed for real, see
+    TestRealFillConfirmation) must be what gets recorded to the DB and
+    used for running exposure tallies -- not the pre-trade credit
+    estimate, now that fills are no longer a near-certainty as they were
+    under unbounded market orders.
+    """
+
+    @pytest.mark.asyncio
+    async def test_real_fill_credit_overrides_the_estimate(self):
+        import bot as bot_module
+        from executor_mcp import OrderResult
+
+        plan = make_plan(underlying="SPY", direction="bear_call", credit_estimate=150.0, max_loss=350.0)
+        candidate = {"ticker": "SPY", "_plan": plan, "credit_estimate": 150.0, "max_loss": 350.0, "strength": 1.0}
+
+        mcp = FakeMCP()
+        fake_client = FakeClient(clock={"is_open": True, "next_open": "", "next_close": "", "timestamp": ""})
+        fake_client.account["daily_pl"] = 0.0
+        fake_client.account["daily_pl_pct"] = 0.0
+
+        with patch.object(bot_module, "AlpacaClient", return_value=fake_client), \
+             patch.object(bot_module, "AlpacaMCP") as MockMCP, \
+             patch("bot.db") as mock_db, \
+             patch("bot.reconciler") as mock_reconciler, \
+             patch("bot.llm_reasoner") as mock_llm, \
+             patch("bot.find_candidates", new_callable=AsyncMock, return_value=([candidate], [])), \
+             patch("bot._pre_trade_check", new_callable=AsyncMock, return_value=(True, None, plan)), \
+             patch("bot.executor_mcp") as mock_executor:
+
+            MockMCP.return_value.__aenter__ = AsyncMock(return_value=mcp)
+            MockMCP.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            mock_db.get_open_spreads.return_value = []
+            mock_db.record_cycle.return_value = 1
+            mock_db.record_decision_journal.return_value = None
+            mock_db.record_account_snapshot.return_value = None
+            mock_db.record_spread_open.return_value = 1
+            mock_llm.decide.return_value = {"selected": ["SPY"], "reasoning": "test pick"}
+            from reconciler import ReconcileResult
+            mock_reconciler.reconcile.return_value = ReconcileResult(ok=True)
+
+            # Real fill came in $10/contract better than the pre-trade
+            # estimate (150.0 -> 160.0) -- a plausible, in-bounds outcome
+            # for a marketable limit that filled at a better price than
+            # its floor.
+            mock_executor.open_spread = AsyncMock(
+                return_value=OrderResult(order_ids=["order-1"], status="filled", fill_credit=160.0)
+            )
+
+            pause_file = Path(__file__).resolve().parent.parent / "state" / "PAUSE"
+            if pause_file.exists():
+                pause_file.unlink()
+
+            await bot_module.run_cycle()
+
+        mock_db.record_spread_open.assert_called_once()
+        kwargs = mock_db.record_spread_open.call_args.kwargs
+        assert kwargs["credit_received"] == 160.0, "must record the REAL fill, not the 150.0 estimate"
+        # width_x100 = max_loss(350) + credit_estimate(150) = 500;
+        # real_max_loss = 500 - 160 = 340.
+        assert kwargs["max_loss"] == 340.0
+
+    @pytest.mark.asyncio
+    async def test_nonsensical_fill_falls_back_to_the_estimate(self):
+        """A fill price that would imply non-positive max_loss (should be
+        essentially impossible for a real, arbitrage-free market, but this
+        codebase's convention is never to trust a computed max_loss <= 0)
+        must fall back to the known-good pre-trade estimate rather than
+        record a nonsensical number -- the position is real either way, so
+        it must still be recorded, just not with bad numbers."""
+        import bot as bot_module
+        from executor_mcp import OrderResult
+
+        plan = make_plan(underlying="SPY", direction="bear_call", credit_estimate=150.0, max_loss=350.0)
+        candidate = {"ticker": "SPY", "_plan": plan, "credit_estimate": 150.0, "max_loss": 350.0, "strength": 1.0}
+
+        mcp = FakeMCP()
+        fake_client = FakeClient(clock={"is_open": True, "next_open": "", "next_close": "", "timestamp": ""})
+        fake_client.account["daily_pl"] = 0.0
+        fake_client.account["daily_pl_pct"] = 0.0
+
+        with patch.object(bot_module, "AlpacaClient", return_value=fake_client), \
+             patch.object(bot_module, "AlpacaMCP") as MockMCP, \
+             patch("bot.db") as mock_db, \
+             patch("bot.reconciler") as mock_reconciler, \
+             patch("bot.llm_reasoner") as mock_llm, \
+             patch("bot.find_candidates", new_callable=AsyncMock, return_value=([candidate], [])), \
+             patch("bot._pre_trade_check", new_callable=AsyncMock, return_value=(True, None, plan)), \
+             patch("bot.executor_mcp") as mock_executor:
+
+            MockMCP.return_value.__aenter__ = AsyncMock(return_value=mcp)
+            MockMCP.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            mock_db.get_open_spreads.return_value = []
+            mock_db.record_cycle.return_value = 1
+            mock_db.record_decision_journal.return_value = None
+            mock_db.record_account_snapshot.return_value = None
+            mock_db.record_spread_open.return_value = 1
+            mock_llm.decide.return_value = {"selected": ["SPY"], "reasoning": "test pick"}
+            from reconciler import ReconcileResult
+            mock_reconciler.reconcile.return_value = ReconcileResult(ok=True)
+
+            # width_x100 = 500; a fill_credit of 600 would imply max_loss
+            # of -100 -- impossible in a real market, must be rejected.
+            mock_executor.open_spread = AsyncMock(
+                return_value=OrderResult(order_ids=["order-1"], status="filled", fill_credit=600.0)
+            )
+
+            pause_file = Path(__file__).resolve().parent.parent / "state" / "PAUSE"
+            if pause_file.exists():
+                pause_file.unlink()
+
+            await bot_module.run_cycle()
+
+        mock_db.record_spread_open.assert_called_once()
+        kwargs = mock_db.record_spread_open.call_args.kwargs
+        assert kwargs["credit_received"] == 150.0, "nonsensical fill must fall back to the pre-trade estimate"
+        assert kwargs["max_loss"] == 350.0
 
 
 class TestSpreadMonitorMarkUnits:
