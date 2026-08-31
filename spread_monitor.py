@@ -78,6 +78,22 @@ class SpreadMonitor:
         self._running = True
         self._mcp: AlpacaMCP | None = None
         self._ws: websockets.ClientConnection | None = None
+        # Real bug fixed 2026-08-31: _shutdown() used to only flip
+        # self._running, which _wait_for_spreads/_refresh_loop only recheck
+        # after a plain asyncio.sleep(REFRESH_INTERVAL) (up to 300s), and
+        # _ws_session's `async for raw in ws` never rechecks it at all --
+        # confirmed live in the systemd journal 3+ times ("stop-sigterm
+        # timed out. Killing.") every single time this service was
+        # restarted. This event makes every wait point cancellable
+        # immediately instead of polling a flag.
+        self._shutdown_event = asyncio.Event()
+
+    async def _sleep_or_shutdown(self, seconds: float) -> None:
+        """Sleep up to `seconds`, but wake immediately if _shutdown() fires."""
+        try:
+            await asyncio.wait_for(self._shutdown_event.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            pass
 
     def _all_leg_symbols(self) -> set[str]:
         symbols: set[str] = set()
@@ -310,20 +326,20 @@ class SpreadMonitor:
                 if not self._running:
                     break
                 logger.warning("WebSocket disconnected: %s — reconnecting in %ds", exc, delay)
-                await asyncio.sleep(delay)
+                await self._sleep_or_shutdown(delay)
                 delay = min(delay * 2, MAX_RECONNECT_DELAY)
             except Exception:
                 if not self._running:
                     break
                 logger.exception("Unexpected WS error — reconnecting in %ds", delay)
-                await asyncio.sleep(delay)
+                await self._sleep_or_shutdown(delay)
                 delay = min(delay * 2, MAX_RECONNECT_DELAY)
             finally:
                 self._ws = None
 
     async def _refresh_loop(self) -> None:
         while self._running:
-            await asyncio.sleep(REFRESH_INTERVAL)
+            await self._sleep_or_shutdown(REFRESH_INTERVAL)
             if not self._running:
                 break
             await self._refresh_spreads()
@@ -335,7 +351,7 @@ class SpreadMonitor:
             if self._spreads:
                 return
             logger.debug("No open spreads, checking again in %ds", REFRESH_INTERVAL)
-            await asyncio.sleep(REFRESH_INTERVAL)
+            await self._sleep_or_shutdown(REFRESH_INTERVAL)
 
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
@@ -373,6 +389,11 @@ class SpreadMonitor:
     def _shutdown(self) -> None:
         print("\nspread_monitor: shutting down...")
         self._running = False
+        self._shutdown_event.set()
+        if self._ws is not None:
+            # async for raw in ws never rechecks _running on its own --
+            # closing the connection is what actually breaks it out.
+            asyncio.ensure_future(self._ws.close())
 
 
 async def main() -> None:
