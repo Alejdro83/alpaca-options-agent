@@ -114,7 +114,12 @@ class OptionsRiskLimits:
         default_factory=lambda: _env_float("MAX_DAILY_LOSS_PCT", 0.03)
     )
     max_concurrent_spreads: int = field(
-        default_factory=lambda: _env_int("MAX_CONCURRENT_SPREADS", 5)
+        # 5 -> 7 (2026-08-31, Alex): deliberate volume-over-quality lever --
+        # more small parallel bets instead of fewer larger ones, same
+        # per-trade risk. Not independently backtested; concentration/
+        # cluster caps (max_concentration_pct/max_cluster_concentration_pct)
+        # already bound how correlated those extra slots can get.
+        default_factory=lambda: _env_int("MAX_CONCURRENT_SPREADS", 7)
     )
     min_dte: int = field(
         # PENDING COMPARISON, 2026-08-28: set to 7 here to follow the
@@ -144,7 +149,16 @@ class OptionsRiskLimits:
         # long-run expectancy. 16-delta is separately cited as close to the
         # theta-per-day sweet spot, so this isn't purely a win-rate-over-EV
         # trade-off for our case (2026-08-26 research pass).
-        default_factory=lambda: _evolved_or_env_float("short_leg_target_delta", "SHORT_LEG_TARGET_DELTA", 0.17)
+        # 0.17 -> 0.13 (2026-08-31, Alex): pushes further in the same
+        # direction as the research above -- smaller, higher-probability
+        # wins, more of them, instead of chasing bigger premium per trade.
+        # Deliberately a modest step, not a leap: the 2026-08-27 backtest
+        # regression (0.17 vs 0.20, reverted after verify_backtest.py found
+        # up to ~60% strike-rounding delta error on low-priced names) is the
+        # concrete reason not to swing further without the same synthetic-
+        # case verification. Not independently backtested at 0.13 --
+        # watch real per-generation P&L via the evolution audit trail.
+        default_factory=lambda: _evolved_or_env_float("short_leg_target_delta", "SHORT_LEG_TARGET_DELTA", 0.13)
     )
     spread_width_dollars: float = field(
         # Distance between short and long strikes. $5 wide is a clean,
@@ -165,9 +179,14 @@ class OptionsRiskLimits:
         default_factory=lambda: _env_float("VOLATILE_TRENDING_WIDTH_DOLLARS", 10.0)
     )
     profit_target_pct: float = field(
-        # Close early once 50% of max credit is captured — standard credit-
-        # spread management, reduces tail-risk exposure to gamma near expiry.
-        default_factory=lambda: _evolved_or_env_float("profit_target_pct", "PROFIT_TARGET_PCT", 0.50)
+        # 0.50 -> 0.30 (2026-08-31, Alex): standard credit-spread management
+        # already reduces tail-risk exposure to gamma near expiry at 50%;
+        # closing earlier at 30% is the same volume-over-quality lever as
+        # the lower delta above -- recycles capital into a new trade sooner
+        # instead of holding out for the last bit of theta, more completed
+        # trades over the judged week rather than fewer, fuller ones. Not
+        # independently backtested at 0.30 -- watch real per-generation P&L.
+        default_factory=lambda: _evolved_or_env_float("profit_target_pct", "PROFIT_TARGET_PCT", 0.30)
     )
     stop_loss_multiple: float = field(
         # Close if the spread's mark-to-market loss reaches this multiple of

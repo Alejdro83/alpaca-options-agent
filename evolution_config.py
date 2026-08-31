@@ -5,7 +5,11 @@ from dataclasses import dataclass, field
 
 @dataclass
 class StrategyParams:
-    short_leg_target_delta: float = 0.17
+    # 0.17 -> 0.13 (2026-08-31, Alex): volume-over-quality lever, kept in
+    # sync with config.py's own default so the evolution incumbent baseline
+    # matches what's actually running -- see config.py's comment for the
+    # full reasoning and the 2026-08-27 backtest-regression caution.
+    short_leg_target_delta: float = 0.13
     # PENDING COMPARISON, 2026-08-28: matches config.RiskLimits.min_dte/
     # max_dte's own pending-comparison flag (was 10/21, following this
     # project's own backtest; overridden to 7/14 to follow the external
@@ -15,7 +19,11 @@ class StrategyParams:
     min_dte: int = 7
     max_dte: int = 14
     spread_width_dollars: float = 5.0
-    profit_target_pct: float = 0.50
+    # 0.50 -> 0.30 (2026-08-31, Alex): same volume-over-quality lever, kept
+    # in sync with config.py's own default -- see its comment for the
+    # reasoning (recycle capital into a new trade sooner rather than
+    # holding out for the last bit of theta).
+    profit_target_pct: float = 0.30
     stop_loss_multiple: float = 2.0
     max_loss_per_spread_pct: float = 0.02
     min_open_interest: int = 100
@@ -36,7 +44,11 @@ PARAM_RANGES: dict[str, tuple[float, float] | tuple[int, int]] = {
     "min_dte": (7, 14),
     "max_dte": (14, 30),
     "spread_width_dollars": (3.0, 10.0),
-    "profit_target_pct": (0.30, 0.70),
+    # Lower bound widened 0.30 -> 0.20 (2026-08-31): the new 0.30 default
+    # sat exactly on the old floor, which would have clamped every downward
+    # mutation to the baseline itself -- real room to explore even-earlier
+    # profit-taking now exists on both sides of the new default.
+    "profit_target_pct": (0.20, 0.70),
     "stop_loss_multiple": (1.5, 3.0),
     "max_loss_per_spread_pct": (0.01, 0.05),
     "min_open_interest": (50, 200),
