@@ -49,7 +49,17 @@ class AlpacaMCP:
         self._stack = AsyncExitStack()
         params = StdioServerParameters(
             command="uvx",
-            args=["alpaca-mcp-server"],
+            # Real outage 2026-08-31: fastmcp 4.0.0 (a breaking major version)
+            # published on PyPI at 18:20 UTC that same day -- alpaca-mcp-server
+            # has no upper bound on its own fastmcp dependency, so `uvx`
+            # (which re-resolves on every invocation, no lockfile) picked up
+            # the new major version within minutes and every cycle since
+            # failed at session.initialize() with "Connection closed"
+            # (confirmed root cause: `ModuleNotFoundError: No module named
+            # 'fastmcp.tools.tool'` when running the subprocess directly).
+            # Pinned below 4.0.0 until alpaca-mcp-server itself is confirmed
+            # compatible with the new major version.
+            args=["--with", "fastmcp<4.0.0", "alpaca-mcp-server"],
             env={
                 "ALPACA_API_KEY": config.alpaca.api_key,
                 "ALPACA_SECRET_KEY": config.alpaca.secret_key,
