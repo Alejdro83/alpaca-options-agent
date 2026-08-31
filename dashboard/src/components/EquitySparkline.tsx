@@ -10,22 +10,9 @@ export function EquitySparkline({ points }: { points: Point[] }) {
     return <div className="text-sm text-gray-500">Not enough data yet for a curve.</div>;
   }
   const values = points.map((p) => p.equity);
-  const min = Math.min(...values);
-  const max = Math.max(...values);
-  const range = max - min || 1;
   const width = 600;
   const height = 120;
   const step = width / (points.length - 1);
-
-  const path = points
-    .map((p, i) => {
-      const x = i * step;
-      const y = height - ((p.equity - min) / range) * height;
-      return `${i === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`;
-    })
-    .join(' ');
-
-  const up = values[values.length - 1] >= values[0];
 
   // SPY overlay (2026-08-29): a synthetic, non-capital-consuming shadow
   // benchmark -- "skill vs market" instead of a bare equity curve a rising
@@ -40,16 +27,50 @@ export function EquitySparkline({ points }: { points: Point[] }) {
     .map((p, i) => ({ i, price: p.spy_price }))
     .filter((p): p is { i: number; price: number } => p.price != null);
 
-  let spyPath: string | null = null;
+  const impliedEquities: number[] = [];
+  let basePrice: number | null = null;
+  let anchorEquity: number | null = null;
   if (spyPoints.length >= 2) {
-    const basePrice = spyPoints[0].price;
-    const anchorEquity = points[spyPoints[0].i].equity;
+    basePrice = spyPoints[0].price;
+    anchorEquity = points[spyPoints[0].i].equity;
+    for (const p of spyPoints) {
+      const pctMove = (p.price - basePrice) / basePrice;
+      impliedEquities.push(anchorEquity * (1 + pctMove));
+    }
+  }
+
+  // Real bug fixed 2026-08-31: min/max/range used to come from `values`
+  // (the real equity curve) alone. With zero trades since the account
+  // reset, equity sits perfectly flat at exactly $100,000 -- min===max, so
+  // `range` fell back to the literal `|| 1`. The SPY overlay's dollar swings
+  // (hundreds of dollars) then got divided by that `1` instead of a real
+  // range, blowing its y-coordinates thousands of pixels outside the
+  // viewBox -- the line was still being drawn, just entirely off-screen,
+  // which read as "the SPY curve looks static" (it wasn't static, it was
+  // invisible). Fixed by including the SPY-implied values in the same
+  // min/max the real equity line uses, so both curves always share one
+  // sane scale regardless of whether real equity has moved yet.
+  const allValues = impliedEquities.length > 0 ? [...values, ...impliedEquities] : values;
+  const min = Math.min(...allValues);
+  const max = Math.max(...allValues);
+  const range = max - min || 1;
+
+  const path = points
+    .map((p, i) => {
+      const x = i * step;
+      const y = height - ((p.equity - min) / range) * height;
+      return `${i === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .join(' ');
+
+  const up = values[values.length - 1] >= values[0];
+
+  let spyPath: string | null = null;
+  if (impliedEquities.length >= 2) {
     spyPath = spyPoints
       .map((p, idx) => {
         const x = p.i * step;
-        const pctMove = (p.price - basePrice) / basePrice;
-        const impliedEquity = anchorEquity * (1 + pctMove);
-        const y = height - ((impliedEquity - min) / range) * height;
+        const y = height - ((impliedEquities[idx] - min) / range) * height;
         return `${idx === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`;
       })
       .join(' ');
