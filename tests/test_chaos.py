@@ -980,6 +980,89 @@ class TestShadowSelectIronCondor:
 
 
 # ===================================================================
+# IRON CONDOR -> VERTICAL FALLBACK (2026-08-31)
+# ===================================================================
+
+class TestIronCondorVerticalFallback:
+    """find_candidates(): real case that prompted this (2026-08-31, VIXY
+    percentile 0.01% -- an extremely calm tape): a RANGING candidate's iron
+    condor got rejected below the 33% min-credit-to-width floor and the
+    candidate was discarded outright, even though the underlying swing
+    signal already carries a real directional bias (regime only chose the
+    STRUCTURE, not whether a direction exists). A directional vertical
+    often clears that same floor when a symmetric IC can't, since it only
+    needs ONE side's credit. Never lowers any quality bar -- the fallback
+    vertical goes through the exact same liquidity/delta/credit-width/
+    risk-gate checks as any other vertical.
+    """
+
+    @pytest.mark.asyncio
+    async def test_failed_iron_condor_falls_back_to_vertical(self):
+        from bot import find_candidates
+        from signals.regime import Regime
+        from signals.swing import Signal
+
+        plan = make_plan(underlying="NVDA", direction="bull_put")
+        sig = Signal(ticker="NVDA", direction="bull_put", strength=0.6, indicators={}, reasoning=["real signal"])
+        with patch("bot.get_universe", return_value=[]), \
+             patch("bot.filter_universe", return_value=[]), \
+             patch("bot.generate_swing_signals", return_value=[]), \
+             patch("bot._apply_trend_and_volatility_filters", return_value=[(sig, 0.20, Regime.RANGING)]), \
+             patch("bot._vixy_regime_percentile", return_value=None), \
+             patch("bot.db.get_open_spreads", return_value=[]), \
+             patch("bot.build_iron_condor", new_callable=AsyncMock, return_value=None) as mock_ic, \
+             patch("bot.build_spread", new_callable=AsyncMock, return_value=plan) as mock_vert, \
+             patch("bot.risk_gate.check_new_spread", return_value=SimpleNamespace(allowed=True, reasons=[])):
+            fake_client = SimpleNamespace(
+                get_snapshots=lambda tickers: {},
+                get_latest_quote=lambda ticker: {"ask_price": 100.5, "bid_price": 99.5},
+            )
+            candidates, rejections = await find_candidates(
+                mcp=AsyncMock(), client=fake_client, account={"equity": 100_000.0, "daily_pl_pct": 0.0}, open_count=0,
+            )
+
+        assert mock_ic.await_count == 1, "iron condor must still be attempted first"
+        assert mock_vert.await_count == 1, "vertical fallback must be attempted after the IC fails"
+        assert mock_vert.call_args.args[2] == "bull_put", "fallback must reuse the signal's real direction, not guess one"
+        assert len(candidates) == 1
+        assert candidates[0]["strategy"] == "vertical", "must relabel as vertical, not leave it as iron_condor"
+        assert candidates[0]["direction"] == "bull_put", "a successful fallback has a real direction, unlike an IC"
+        assert candidates[0]["fact_ids"].get("NVDA_SIGNAL_STRENGTH") == 0.6, \
+            "SIGNAL_STRENGTH fact must appear once relabeled as vertical (iron condors omit it)"
+
+    @pytest.mark.asyncio
+    async def test_successful_iron_condor_never_falls_back(self):
+        """Sanity: the fallback must not fire when the iron condor builds
+        fine -- build_spread should never even be called."""
+        from bot import find_candidates
+        from signals.swing import Signal
+        from signals.regime import Regime as RegimeEnum
+
+        ic_plan = make_iron_condor_plan(underlying="NVDA")
+        sig = Signal(ticker="NVDA", direction="bull_put", strength=0.6, indicators={}, reasoning=["real signal"])
+        with patch("bot.get_universe", return_value=[]), \
+             patch("bot.filter_universe", return_value=[]), \
+             patch("bot.generate_swing_signals", return_value=[]), \
+             patch("bot._apply_trend_and_volatility_filters", return_value=[(sig, 0.20, RegimeEnum.RANGING)]), \
+             patch("bot._vixy_regime_percentile", return_value=None), \
+             patch("bot.db.get_open_spreads", return_value=[]), \
+             patch("bot.build_iron_condor", new_callable=AsyncMock, return_value=ic_plan), \
+             patch("bot.build_spread", new_callable=AsyncMock) as mock_vert, \
+             patch("bot.risk_gate.check_new_spread", return_value=SimpleNamespace(allowed=True, reasons=[])):
+            fake_client = SimpleNamespace(
+                get_snapshots=lambda tickers: {},
+                get_latest_quote=lambda ticker: {"ask_price": 100.5, "bid_price": 99.5},
+            )
+            candidates, _ = await find_candidates(
+                mcp=AsyncMock(), client=fake_client, account={"equity": 100_000.0, "daily_pl_pct": 0.0}, open_count=0,
+            )
+
+        assert mock_vert.await_count == 0, "a working iron condor must never trigger the vertical fallback"
+        assert len(candidates) == 1
+        assert candidates[0]["strategy"] == "iron_condor"
+
+
+# ===================================================================
 # EXTRA: spread_builder credit/max_loss at build time
 # ===================================================================
 

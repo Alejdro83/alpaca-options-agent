@@ -569,6 +569,26 @@ async def find_candidates(
                 spot_mid = (spot["ask_price"] + spot["bid_price"]) / 2
             if is_iron_condor:
                 plan = await build_iron_condor(mcp, sig.ticker, spot_price=spot_mid, realized_vol=realized_vol, target_delta_override=ic_target_delta_override)
+                if plan is None:
+                    # Fallback (2026-08-31, real case that prompted this: NVDA
+                    # iron condor credit $91.50 rejected below the 33%
+                    # min-credit-to-width floor on a $500 width, VIXY
+                    # percentile 0.01% -- an extremely calm tape where a
+                    # symmetric IC often can't clear the floor at all). A
+                    # RANGING candidate already carries a real directional
+                    # swing signal (regime only chose the STRUCTURE, not
+                    # whether a direction exists) -- reusing it instead of
+                    # discarding the candidate outright often clears the same
+                    # floor, since a one-sided vertical only needs ONE side's
+                    # credit, not two. This never lowers any quality bar: the
+                    # vertical goes through the exact same liquidity/delta/
+                    # credit-width/risk-gate checks as any other vertical,
+                    # it's a different structure on an already-vetted signal,
+                    # not a looser one.
+                    logger.info("%s iron condor failed to build, falling back to a directional vertical on the same signal", sig.ticker)
+                    plan = await build_spread(mcp, sig.ticker, sig.direction, spot_price=spot_mid, realized_vol=realized_vol)
+                    if plan is not None:
+                        is_iron_condor = False
             else:
                 # VOLATILE_TRENDING regime: use a wider spread width to
                 # capture more premium in elevated-vol conditions (see
