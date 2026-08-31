@@ -71,6 +71,55 @@ real trading days to accumulate before it can be filled with real numbers.*
 - Manual (`emergency_flatten.py`) and automatic (`kill_switch.py`) circuit
   breakers, independent of the per-cycle gate above.
 
+## Design philosophy: where code decides vs. where the LLM decides — measured, not asserted
+
+The hard question behind any "AI trading agent" is how much of the actual
+decision gets made by the model versus by deterministic code around it.
+This project answers it explicitly, in both directions, and then measures
+whether the answer was right with real money-shaped data instead of just
+arguing for it.
+
+- **Two different architectures, same risk backbone.** This judged bot is a
+  deterministic pipeline (screening → regime → liquidity/vol filters →
+  strike selection, all code) with the LLM scoped narrowly to the *final
+  pick* among candidates that already passed every check. In parallel, we
+  built **Paco** — a separate, genuinely autonomous agent (the zeroclaw
+  framework) that reasons through the *entire* cycle itself: which name to
+  look at, which strikes to build, when to act. Paco imports this same
+  repo's `risk_gate.py` and `signals/regime.py` directly (never
+  reimplemented) as a hard veto layer, so both share one risk backbone
+  while differing completely in how a trade idea gets proposed in the
+  first place. Paco's account isn't eligible for judging (it's a
+  repurposed account, not brand-new) — it exists purely as a live research
+  comparison, shown on this project's own dashboard (`/compare`) alongside
+  a third, independently-built sibling implementation (verticals-only,
+  narrower universe) for a genuine three-way read on decision architecture.
+- **The backstops are ceilings, not a recipe — and we can tell you exactly
+  how wide each one is.** Portfolio-level limits (2% max loss/trade, 20%/
+  40% concentration caps, the -3% circuit breaker) are identical for both
+  architectures by construction — same imported code, no daylight between
+  them. But the *trade-quality* sanity checks are deliberately looser than
+  this bot's own targeting: the judged bot only ever builds a candidate
+  with short-leg delta in [0.02, 0.32] (target 0.17 ± 0.15); Paco's
+  backstop allows up to 0.45 — real, quantified headroom to select a
+  meaningfully more aggressive strike than this bot's own code would ever
+  propose, while still being provably incapable of blowing through the
+  portfolio-level caps. That gap is deliberate, not an oversight: it's
+  the actual surface area the comparison is measuring.
+- **Every threshold is classified, not just chosen.** Some parameters here
+  are backed by published research (16-17 delta *below* the textbook
+  25-30, chosen specifically because a ~5-day judged window is dominated by
+  variance, not long-run expected value; 50%/2x profit-target/stop, inside
+  the commonly-cited professional range). Others are explicitly flagged in
+  code as unvalidated starting points (the 40% cluster cap, the DTE
+  window). A nightly dry-run evolution job already separates these two
+  classes for real: performance dials (DTE, target delta, width) are
+  eligible for data-driven tuning against real per-generation P&L; safety
+  floors (max loss %, liquidity minimum, stop multiple) are hard-excluded
+  from ever being auto-tuned, on purpose. It logs what it *would* change
+  and why, every night, months before it's ever allowed to touch anything
+  for real.
+
 ## Alpaca infrastructure
 
 - **100% of options reads and writes go through Alpaca's official MCP
@@ -93,7 +142,9 @@ real trading days to accumulate before it can be filled with real numbers.*
 - Supabase/Postgres backing store in its own isolated schema.
 - Public dashboard (Next.js, dual web + Telegram Mini App) reading that
   store live: equity curve, open positions, per-cycle reasoning with cited
-  facts, the shadow-book comparison, and portfolio Greeks.
+  facts, the shadow-book comparison, and portfolio Greeks — plus a
+  dedicated `/compare` page showing this bot, Paco, and the third sibling
+  implementation side by side (see design philosophy above).
 
 ## Results
 
