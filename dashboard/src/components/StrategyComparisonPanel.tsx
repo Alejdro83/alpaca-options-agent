@@ -28,13 +28,23 @@ function fmtStrategyLabel(strategy: string, structure: string): string {
   return structure === 'debit' ? `${base} (debit)` : base;
 }
 
+// Postgres NUMERIC columns arrive as STRINGS through the pg driver --
+// established bug pattern in this project (dashboard/src/lib/db.ts's own
+// daily_pl fix, 2026-08-28). fmtMoney already tolerated it by accident
+// (String.prototype.toLocaleString exists, just ignores the formatting
+// options), but fmtG did not: greeks values are used inside a real
+// v.toFixed(3) call, which strings don't have at all -- a genuine
+// TypeError that crashes the whole panel. Real trigger 2026-09-01: Paco's
+// portfolio_greeks_snapshots table was empty until today, so this never
+// fired for that track before. Number() here first for both, matching
+// the fix already applied in PortfolioGreeksPanel.tsx's own fmt().
 function fmtMoney(v: number | null): string {
   if (v === null) return '—';
-  return `$${v.toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+  return `$${Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
 }
 
 function fmtG(v: number | null): string {
-  return v === null || v === undefined ? '—' : v.toFixed(3);
+  return v === null || v === undefined ? '—' : Number(v).toFixed(3);
 }
 
 function TrackCard({ track }: { track: Track }) {
@@ -141,7 +151,9 @@ export function StrategyComparisonPanel({ data }: { data: CompareState }) {
           name: 'Paco (research)',
           subtitle: 'Autonomous zeroclaw agent, same risk backbone — not judged',
           equity: data.paco.latestSnapshot ? Number(data.paco.latestSnapshot.equity) : null,
-          dailyPl: data.paco.latestSnapshot?.daily_pnl ?? null,
+          dailyPl: data.paco.latestSnapshot?.daily_pnl !== null && data.paco.latestSnapshot?.daily_pnl !== undefined
+            ? Number(data.paco.latestSnapshot.daily_pnl)
+            : null,
           openCount: data.paco.openCount,
           curve: data.paco.equityCurve,
           greeks: data.paco.portfolioGreeks,
