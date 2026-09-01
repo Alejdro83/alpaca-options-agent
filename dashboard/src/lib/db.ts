@@ -303,7 +303,7 @@ export interface PacoState {
     daily_pnl: number | null;
     snapshot_at: string;
   } | null;
-  equityCurve: Array<{ equity: number; snapshot_at: string }>;
+  equityCurve: Array<{ equity: number; spy_price: number | null; snapshot_at: string }>;
   openCount: number;
   strategyMix: Array<{ strategy: string; count: number }>;
   portfolioGreeks: PortfolioGreeksSnapshot | null;
@@ -316,8 +316,12 @@ async function getPacoState(): Promise<PacoState> {
       `select equity, daily_pnl, ts as snapshot_at
        from ${PACO_SCHEMA}.account_snapshots order by ts desc limit 1`
     );
+    // spy_price added 2026-09-01 (Alex noticed Paco's curve had no dashed
+    // SPY overlay like the judged bot's -- it wasn't a missing feature,
+    // account_snapshot_paco.py just started recording this column).
     const curve = await client.query(
-      `select equity, ts as snapshot_at from ${PACO_SCHEMA}.account_snapshots order by ts asc`
+      `select equity, spy_price, ts as snapshot_at
+       from ${PACO_SCHEMA}.account_snapshots order by ts asc`
     );
     const openCountResult = await client.query(
       `select count(*)::int as n from ${PACO_SCHEMA}.spreads where status = 'open'`
