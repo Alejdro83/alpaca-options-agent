@@ -305,7 +305,7 @@ export interface PacoState {
   } | null;
   equityCurve: Array<{ equity: number; spy_price: number | null; snapshot_at: string }>;
   openCount: number;
-  strategyMix: Array<{ strategy: string; count: number }>;
+  strategyMix: Array<{ strategy: string; structure: string; count: number }>;
   portfolioGreeks: PortfolioGreeksSnapshot | null;
 }
 
@@ -326,9 +326,14 @@ async function getPacoState(): Promise<PacoState> {
     const openCountResult = await client.query(
       `select count(*)::int as n from ${PACO_SCHEMA}.spreads where status = 'open'`
     );
+    // structure added 2026-09-01 (Paco can now build directional debit
+    // spreads alongside its usual credit ones -- without this the
+    // dashboard couldn't tell them apart, both just say "vertical").
+    // strategyMix itself was already being fetched but never actually
+    // rendered anywhere -- fixed in StrategyComparisonPanel at the same time.
     const mixResult = await client.query(
-      `select strategy, count(*)::int as count from ${PACO_SCHEMA}.spreads
-       where status = 'open' group by strategy`
+      `select strategy, structure, count(*)::int as count from ${PACO_SCHEMA}.spreads
+       where status = 'open' group by strategy, structure`
     );
     let portfolioGreeks: PortfolioGreeksSnapshot | null = null;
     try {

@@ -15,7 +15,17 @@ interface Track {
     net_vega: number | null;
     beta_weighted_delta: number | null;
   } | null;
+  // Open-position breakdown by strategy/structure (2026-09-01) -- was
+  // already being fetched for Paco before this but never rendered
+  // anywhere; needed now so a directional debit spread doesn't just look
+  // like an ordinary credit vertical on the dashboard.
+  strategyMix?: Array<{ strategy: string; structure: string; count: number }>;
   unavailable?: string;
+}
+
+function fmtStrategyLabel(strategy: string, structure: string): string {
+  const base = strategy === 'iron_condor' ? 'iron condor' : 'vertical';
+  return structure === 'debit' ? `${base} (debit)` : base;
 }
 
 function fmtMoney(v: number | null): string {
@@ -48,6 +58,12 @@ function TrackCard({ track }: { track: Track }) {
           <p className="text-xl font-bold text-white mb-1">{fmtMoney(track.equity)}</p>
           <p className="text-[11px] text-gray-500 mb-2">
             {track.openCount === null ? '—' : `${track.openCount} open position${track.openCount === 1 ? '' : 's'}`}
+            {track.strategyMix && track.strategyMix.length > 0 && (
+              <span className="text-gray-600">
+                {' '}
+                ({track.strategyMix.map((m) => `${m.count} ${fmtStrategyLabel(m.strategy, m.structure)}`).join(', ')})
+              </span>
+            )}
           </p>
           <EquitySparkline points={track.curve} />
           {track.greeks && (
@@ -80,9 +96,9 @@ export interface CompareState {
   };
   paco: {
     latestSnapshot: { equity: number; daily_pnl: number | null } | null;
-    equityCurve: Array<{ equity: number; snapshot_at: string }>;
+    equityCurve: Array<{ equity: number; spy_price?: number | null; snapshot_at: string }>;
     openCount: number;
-    strategyMix: Array<{ strategy: string; count: number }>;
+    strategyMix: Array<{ strategy: string; structure: string; count: number }>;
     portfolioGreeks: {
       net_delta: number | null;
       net_theta: number | null;
@@ -129,6 +145,7 @@ export function StrategyComparisonPanel({ data }: { data: CompareState }) {
           openCount: data.paco.openCount,
           curve: data.paco.equityCurve,
           greeks: data.paco.portfolioGreeks,
+          strategyMix: data.paco.strategyMix,
         }
       : {
           name: 'Paco (research)',
