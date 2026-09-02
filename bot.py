@@ -903,6 +903,21 @@ async def _pre_trade_check_inner(
             # Same sanity check as spread_builder.build_spread — a fresh
             # requote can hit this too, not just the initial build.
             return False, f"fresh max_loss is non-positive (${updated_max_loss:.2f}), refusing to trade", plan
+
+        # Min credit-to-width floor on the fresh requote (2026-09-02) —
+        # mirrors spread_builder.build_spread's build-time floor, so a
+        # vertical that has decayed to near-zero credit between build and
+        # execution is caught here too (same as the iron-condor recheck in
+        # _pre_trade_check_iron_condor).
+        min_credit = width_dollars * config.risk.min_vertical_credit_to_width_pct
+        if raw_diff < min_credit:
+            return (
+                False,
+                f"fresh credit ${raw_diff:.2f} is below the "
+                f"{config.risk.min_vertical_credit_to_width_pct:.0%} min-credit-to-width "
+                f"floor (${min_credit:.2f} on a ${width_dollars:.2f} width)",
+                plan,
+            )
         fresh_credit_estimate = raw_diff
 
     # Buying-power floor (2026-08-29, prompted by reviewing a teammate's
