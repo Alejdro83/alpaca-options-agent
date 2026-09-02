@@ -129,7 +129,8 @@ export interface CompareState {
 // this repo's own LLM+deterministic-gate bot (verticals + iron condor, the
 // account submitted for judging), a parallel autonomous-agent experiment
 // ("Paco" -- zeroclaw framework, same risk_gate/regime code imported
-// directly, NOT eligible for judging -- see AGENTS.md), and rookieriot's
+// directly, runs end-to-end with no deterministic decision layer, on its
+// own separate research account -- see AGENTS.md), and rookieriot's
 // independent build (verticals-only, narrower universe).
 export function StrategyComparisonPanel({ data }: { data: CompareState }) {
   const ourOpenSpreads = data.ours.spreads.filter((s) => s.status === 'open');
@@ -165,7 +166,7 @@ export function StrategyComparisonPanel({ data }: { data: CompareState }) {
     data.paco
       ? {
           name: 'Paco (research)',
-          subtitle: 'Autonomous zeroclaw agent, same risk backbone — not judged',
+          subtitle: 'Autonomous zeroclaw agent, own account — same risk backbone, no deterministic gate',
           equity: data.paco.latestSnapshot ? Number(data.paco.latestSnapshot.equity) : null,
           dailyPl: data.paco.latestSnapshot?.daily_pnl !== null && data.paco.latestSnapshot?.daily_pnl !== undefined
             ? Number(data.paco.latestSnapshot.daily_pnl)
@@ -177,7 +178,7 @@ export function StrategyComparisonPanel({ data }: { data: CompareState }) {
         }
       : {
           name: 'Paco (research)',
-          subtitle: 'Autonomous zeroclaw agent, same risk backbone — not judged',
+          subtitle: 'Autonomous zeroclaw agent, own account — same risk backbone, no deterministic gate',
           equity: null,
           dailyPl: null,
           openCount: null,
@@ -211,10 +212,22 @@ export function StrategyComparisonPanel({ data }: { data: CompareState }) {
     <section className="rounded-xl border border-gray-800 bg-gray-900/40 p-4 mb-4">
       <h2 className="text-sm font-semibold text-gray-300 mb-1">Three strategies, one risk backbone</h2>
       <p className="text-xs text-gray-500 mb-3">
-        Same signal/regime code, same deterministic risk gate — three independent decision layers,
-        compared side by side. All three reset to a fresh $100,000 account on 2026-08-30; real
-        trading starts together on 2026-08-31. Paco&apos;s account is a research experiment, not
-        eligible for hackathon judging.
+        Same signal-generation, regime-detection and deterministic risk-gate code — imported
+        directly by every track, not reimplemented — under three fully independent decision layers.
+        All three reset to a fresh $100,000 paper account on 2026-08-30 and began trading together
+        on 2026-08-31.
+      </p>
+      <p className="text-xs text-gray-500 mb-3">
+        <span className="text-gray-400">Ours (judged)</span> is the submitted agent: the
+        deterministic gate clears candidates first, then an LLM picks among the survivors and can
+        never override it. <span className="text-gray-400">Paco (research)</span> is a parallel
+        experiment on its own separate account and a different runtime — the zeroclaw agent
+        framework — reasoning through each full cycle autonomously, end to end, with no
+        deterministic decision layer. It&apos;s the proving ground where new structures, like the
+        directional debit-spread overlay, are validated before being ported to the judged bot.
+        <span className="text-gray-400"> rookieriot</span> is a teammate&apos;s independent build.
+        Keeping the signal and risk math identical across all three isolates how much the decision
+        layer alone changes the outcome.
       </p>
       <div className="flex flex-col sm:flex-row gap-3">
         {tracks.map((t) => (
