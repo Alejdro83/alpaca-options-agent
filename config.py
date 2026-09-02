@@ -76,15 +76,28 @@ class AlpacaConfig:
 @dataclass(frozen=True)
 class ScreeningFilters:
     """Same liquid-universe filter values validated in trading_bot/ — carried
-    over unchanged since the underlying-selection problem (liquid, mid/large
-    cap, reasonable price, real ATR) doesn't change just because the
-    executed instrument is now an options spread instead of shares.
+    over from the equity strategy. Two loosened 2026-09-02 (a teammate
+    flagged both as "leftover" stock-screen filters mis-sized for options):
+
+    - max_price 300 -> 1500: a $300 cap was calibrated for buying *shares*;
+      for a defined-risk options spread the underlying's absolute price
+      barely matters (a $5-wide spread on a $600 name is the same trade),
+      and $300 silently dropped every liquid name above it (LLY, AVGO,
+      NFLX, COST, NVDA on its higher days). 1500 keeps a sanity ceiling
+      (NVR/BKNG-tier names have thin chains and coarse strikes) while
+      letting the rest of the S&P/NDX universe through.
+    - min_avg_volume 500k -> 100k: this thresholds the *free* IEX feed's
+      reported volume, ~2-3% of consolidated tape, so 500k reported was
+      really "~20M real shares/day" -- far stricter than intended. 100k
+      reported (~3-5M real) still screens out illiquid names.
+
+    Both stay env-overridable; revert with MAX_PRICE=300 / MIN_AVG_VOLUME=500000.
     """
-    min_avg_volume: int = field(default_factory=lambda: _env_int("MIN_AVG_VOLUME", 500_000))
+    min_avg_volume: int = field(default_factory=lambda: _env_int("MIN_AVG_VOLUME", 100_000))
     min_market_cap: float = field(default_factory=lambda: _env_float("MIN_MARKET_CAP", 5e9))
     max_market_cap: float = field(default_factory=lambda: _env_float("MAX_MARKET_CAP", 2e12))
     min_price: float = field(default_factory=lambda: _env_float("MIN_PRICE", 10.0))
-    max_price: float = field(default_factory=lambda: _env_float("MAX_PRICE", 300.0))
+    max_price: float = field(default_factory=lambda: _env_float("MAX_PRICE", 1500.0))
     max_spread_pct: float = field(default_factory=lambda: _env_float("MAX_SPREAD_PCT", 0.5))
     min_atr_pct: float = field(default_factory=lambda: _env_float("MIN_ATR_PCT", 0.5))
 
@@ -242,10 +255,25 @@ class OptionsRiskLimits:
         # Iron-condor-specific floor: reject if total credit is below this
         # fraction of the (equal) wing width -- e.g. 1/3 of a $5 wing is
         # $1.67. A cited tastytrade rule of thumb for whether the premium
-        # collected is worth the defined risk taken on; verticals don't have
-        # an equivalent check today, kept iron-condor-only rather than
-        # applied retroactively without the same research backing it there.
+        # collected is worth the defined risk taken on; verticals have their
+        # own, looser floor below (min_vertical_credit_to_width_pct) rather
+        # than sharing this iron-condor-calibrated 1/3.
         default_factory=lambda: _env_float("MIN_CREDIT_TO_WIDTH_PCT", 1 / 3)
+    )
+    min_vertical_credit_to_width_pct: float = field(
+        # Directional-vertical floor: reject a credit vertical whose credit
+        # is below this fraction of the strike width. Added 2026-09-02 after
+        # the judged bot opened a bear-call SMCI C43/C48 collecting $0.10 on
+        # a $5 width (2% credit-to-width, ~49:1 risk/reward, structurally
+        # negative EV) -- nothing in the deterministic gate rejected it,
+        # because this check was iron-condor-only (see min_credit_to_width_pct).
+        # A single 2-leg vertical at a ~0.13-delta short leg collects far
+        # less than an iron condor's combined two spreads, so this is set
+        # well below the IC's 1/3: 0.10 blocks the degenerate near-zero-credit
+        # spreads without shutting off the strategy. NOT independently
+        # backtested -- watch real fills and tune via env; same "a human
+        # decides" discipline as every other threshold in this file.
+        default_factory=lambda: _env_float("MIN_VERTICAL_CREDIT_TO_WIDTH_PCT", 0.10)
     )
     max_iron_condor_equity_pct: float = field(
         # Real equity-percentage cap on total iron condor exposure — the
