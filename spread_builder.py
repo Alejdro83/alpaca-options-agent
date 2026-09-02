@@ -344,6 +344,23 @@ async def build_spread(
         )
         return None
 
+    # Minimum credit-to-width floor (2026-09-02). max_loss > 0 still lets
+    # through a spread collecting near-nothing for its defined risk -- the
+    # judged bot opened a bear-call SMCI C43/C48 at $0.10 credit on a $5
+    # width (2%, ~49:1 risk/reward). Mirrors the iron-condor floor in
+    # build_iron_condor below, at the looser vertical-specific threshold
+    # (see config.OptionsRiskLimits.min_vertical_credit_to_width_pct).
+    min_credit = width_dollars * config.risk.min_vertical_credit_to_width_pct
+    if credit_estimate < min_credit:
+        logger.info(
+            "%s vertical credit $%.2f is below the %.0f%% min-credit-to-width "
+            "floor ($%.2f on a $%.2f width) -- skipping, premium not worth the risk",
+            ticker, credit_estimate,
+            config.risk.min_vertical_credit_to_width_pct * 100,
+            min_credit, width_dollars,
+        )
+        return None
+
     return SpreadPlan(
         underlying=ticker,
         direction="bull_put" if is_bull_put else "bear_call",
