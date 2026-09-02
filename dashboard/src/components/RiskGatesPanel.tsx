@@ -27,8 +27,13 @@ const GATES: Array<[string, string]> = [
 // since it's a genuinely different structure (buys the near-the-money leg,
 // profits from real movement instead of time decay) with its own entry
 // bar and exit formula, not just a variant of the credit gates above.
+// Signal-strength bar 0.65 -> 0.40 (same day): checked against every real
+// decision_journal row since this account's reset -- the highest real
+// signal strength ever observed was 0.428, so 0.65 would likely have never
+// cleared once; 0.40 is a real, reachable value 2 of those candidates
+// would have cleared.
 const DEBIT_GATES: Array<[string, string]> = [
-  ['Barra de entrada', 'ADX > 35 y fuerza de señal ≥ 0.65'],
+  ['Barra de entrada', 'ADX > 35 y fuerza de señal ≥ 0.40'],
   ['Delta objetivo (pata comprada)', '0.60 (rango sano 0.35 – 0.80)'],
   ['Profit target', '30% de la ganancia máxima (ancho − débito pagado)'],
   ['Stop', 'proceeds caen al 50% del débito pagado'],

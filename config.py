@@ -350,8 +350,22 @@ class OptionsRiskLimits:
         # `strength` is a 0-1 scale (min(abs(score)/2.0, 1.0)). Both this
         # AND debit_min_adx must clear before a debit spread is even
         # attempted; never fabricates conviction the way a lower bar would.
-        # Not independently backtested.
-        default_factory=lambda: _env_float("DEBIT_MIN_SIGNAL_STRENGTH", 0.65)
+        #
+        # 0.65 -> 0.40 (2026-09-02, Alex, same day the overlay shipped):
+        # the initial 0.65 was ported from Paco's overlay without checking
+        # it against THIS bot's own real signal history. Checked directly
+        # against every real decision_journal row since this account's
+        # 2026-08-30 reset (96 cycles): only 7 directional candidates ever
+        # had a real `strength` value at all, and the single highest ever
+        # observed was 0.428 (SMCI) -- none reached even 0.50. At 0.65 this
+        # bar would very likely have NEVER cleared once in this bot's real
+        # trading history, making the overlay dead on arrival regardless of
+        # ADX. 0.40 is the exact value 2 of those 7 real candidates would
+        # have cleared -- still a real conviction requirement, just one
+        # this universe/signal engine can actually reach. Not independently
+        # backtested at this exact number -- watch real per-generation P&L
+        # like every other new threshold in this file.
+        default_factory=lambda: _env_float("DEBIT_MIN_SIGNAL_STRENGTH", 0.40)
     )
     debit_profit_target_pct: float = field(
         # Debit-spread equivalent of profit_target_pct, but against MAX
