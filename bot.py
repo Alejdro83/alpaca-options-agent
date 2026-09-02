@@ -508,6 +508,17 @@ async def find_candidates(
     cluster_exposure: dict[str, float] = {}
     open_iron_condor_count = 0
     iron_condor_total_exposure = 0.0
+    # Exact leg-symbol sets of everything already open, so a freshly built
+    # plan that is a carbon copy of an existing position (same underlying,
+    # strikes, expiration, structure) can be dropped. 2026-09-02: the bot
+    # opened the identical SMCI C43/C48 bear call twice, ~10 min apart
+    # (cycles 208 and 210) -- doubling the exact same strikes/expiry adds
+    # no diversification, just concentrates the single-name move, and the
+    # two rows netted into one broker position that the per-row reconcile
+    # check then choked on. A different strike or expiration on the same
+    # name is still fine (the 20%-per-underlying concentration cap in
+    # risk_gate.check_new_spread governs that).
+    open_leg_sets: set[frozenset[str]] = set()
     for s in db.get_open_spreads():
         underlying = s["underlying"]
         # Real bug found 2026-08-28 (while fixing the audit's pre-trade-
@@ -526,6 +537,13 @@ async def find_candidates(
         if s.get("strategy") == "iron_condor":
             open_iron_condor_count += 1
             iron_condor_total_exposure += max_loss_total
+        legs = frozenset(
+            s[col]
+            for col in ("short_symbol", "long_symbol", "call_short_symbol", "call_long_symbol")
+            if s.get(col)
+        )
+        if legs:
+            open_leg_sets.add(legs)
 
     candidates = []
     gate_rejections: list[dict] = []
@@ -662,6 +680,19 @@ async def find_candidates(
             )
             continue
         if plan is None:
+            continue
+        if isinstance(plan, IronCondorPlan):
+            plan_legs = frozenset((
+                plan.short_put_symbol, plan.long_put_symbol,
+                plan.short_call_symbol, plan.long_call_symbol,
+            ))
+        else:
+            plan_legs = frozenset((plan.short_symbol, plan.long_symbol))
+        if plan_legs in open_leg_sets:
+            logger.info(
+                "%s: a spread with these exact legs is already open (%s) -- skipping the duplicate",
+                sig.ticker, sorted(plan_legs),
+            )
             continue
         check = risk_gate.check_new_spread(
             equity=float(account["equity"]),
