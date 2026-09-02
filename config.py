@@ -308,6 +308,68 @@ class OptionsRiskLimits:
     order_poll_interval_s: float = field(
         default_factory=lambda: _env_float("ORDER_POLL_INTERVAL_S", 2.0)
     )
+    debit_leg_target_delta: float = field(
+        # Directional DEBIT spread overlay (2026-09-02): ported from the
+        # complementary strategy validated first on Paco/mcp_risk_proxy
+        # (see mcp_risk_proxy/server.py's own debit-spread comments and
+        # AGENTS.md's "Debit-spread overlay" section) after real trading
+        # produced zero fills for several days under credit-only verticals
+        # + iron condors. A debit vertical BUYS the near-the-money leg (the
+        # actual directional bet, unlike a credit spread's sold leg) and
+        # SELLS a further-OTM leg to reduce cost -- profits from real price
+        # movement, not time decay, which is the opposite exposure of this
+        # project's existing two structures. 0.60 targets a leg with real
+        # directional payoff (higher delta = more like owning the
+        # underlying) while still capping cost via the sold leg. Not
+        # independently backtested -- watch real per-generation P&L like
+        # every other threshold in this file.
+        default_factory=lambda: _evolved_or_env_float("debit_leg_target_delta", "DEBIT_LEG_TARGET_DELTA", 0.60)
+    )
+    debit_delta_sanity_min: float = field(
+        # Sanity band on the BUY leg's computed delta (mirrors
+        # MAX_DELTA_DEVIATION's role for credit spreads, but as an absolute
+        # band rather than a deviation-from-target, matching the band
+        # already proven on Paco's mcp_risk_proxy -- see its
+        # _DEBIT_DELTA_SANITY_MIN/MAX constants).
+        default_factory=lambda: _env_float("DEBIT_DELTA_SANITY_MIN", 0.35)
+    )
+    debit_delta_sanity_max: float = field(
+        default_factory=lambda: _env_float("DEBIT_DELTA_SANITY_MAX", 0.80)
+    )
+    debit_min_adx: float = field(
+        # Stricter than RegimeDetector's own ADX>25 TRENDING threshold
+        # (signals/regime.py) -- a debit spread pays real premium up front
+        # and only profits from actual movement, so it needs real
+        # conviction behind it, not just "trending enough for a credit
+        # vertical". Mirrors Paco's AGENTS.md "Debit-spread overlay" rule
+        # (ADX > 35). Not independently backtested.
+        default_factory=lambda: _env_float("DEBIT_MIN_ADX", 35.0)
+    )
+    debit_min_signal_strength: float = field(
+        # Second half of the same conviction bar -- signals.swing's
+        # `strength` is a 0-1 scale (min(abs(score)/2.0, 1.0)). Both this
+        # AND debit_min_adx must clear before a debit spread is even
+        # attempted; never fabricates conviction the way a lower bar would.
+        # Not independently backtested.
+        default_factory=lambda: _env_float("DEBIT_MIN_SIGNAL_STRENGTH", 0.65)
+    )
+    debit_profit_target_pct: float = field(
+        # Debit-spread equivalent of profit_target_pct, but against MAX
+        # GAIN (width - debit paid) rather than max credit, since a debit
+        # spread's economics are the mirror image of a credit spread's --
+        # see risk_gate.should_close's debit branch. Mirrors the value
+        # already in use on Paco's AGENTS.md closing-formula section. Not
+        # independently backtested.
+        default_factory=lambda: _evolved_or_env_float("debit_profit_target_pct", "DEBIT_PROFIT_TARGET_PCT", 0.30)
+    )
+    debit_stop_pct: float = field(
+        # Stop once proceeds-from-closing fall to this fraction of the
+        # original debit paid (a FLOOR, the mirror image of
+        # stop_loss_multiple's ceiling on a credit spread's cost to close).
+        # Mirrors the value already in use on Paco. Not independently
+        # backtested.
+        default_factory=lambda: _evolved_or_env_float("debit_stop_pct", "DEBIT_STOP_PCT", 0.50)
+    )
 
 
 # Scope note (2026-08-28): Real IV Rank was considered specifically for

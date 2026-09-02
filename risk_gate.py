@@ -146,14 +146,31 @@ def should_close(
     credit_received: float,
     current_mark: float,
     is_credit_spread: bool = True,
+    width: float | None = None,
     stop_loss_multiple_override: float | None = None,
     disable_stop: bool = False,
 ) -> tuple[bool, str] | tuple[bool, None]:
-    """`current_mark` is the current cost to close (debit to buy back the
-    spread). Credit spreads profit as this shrinks toward zero.
+    """For a CREDIT spread (is_credit_spread=True, the default -- unchanged
+    behavior): `current_mark` is the current cost to close (debit to buy
+    back the spread). Profits as this shrinks toward zero.
+
+    For a DEBIT spread (is_credit_spread=False, added 2026-09-02 alongside
+    the debit-spread overlay -- see spread_builder.build_debit_spread):
+    `credit_received` is NEGATIVE (this project's storage convention --
+    its magnitude is the debit paid), `current_mark` means PROCEEDS from
+    closing right now (the mirror image of a credit spread's "cost to
+    close" -- see executor_mcp.get_spread_mark's structure param), and
+    `width` (the strike width in dollars, e.g. 500 for a $5-wide spread) is
+    required to know the max possible gain. Mirrors the exact formula
+    already proven on Paco's AGENTS.md closing procedure: profit target is
+    measured against MAX GAIN (width - debit paid), not max credit, since a
+    debit spread has no "credit" to capture a percentage of; the stop is a
+    FLOOR on proceeds (they fall toward zero, not a ceiling they rise
+    toward).
 
     `stop_loss_multiple_override`/`disable_stop` (2026-08-29, research
-    pass): a single-source but concrete backtest finding suggested a
+    pass, credit-spread-only -- see shadow_book.py's counterfactual
+    policies): a single-source but concrete backtest finding suggested a
     MIDDLE stop-loss multiple like this project's real default (2x) may be
     the worst of both worlds for short-DTE credit spreads specifically --
     a tight stop (~1x) or no stop at all each outperformed a 2x stop in
@@ -163,9 +180,36 @@ def should_close(
     counterfactual policies against real live decisions, same "let real
     data decide" approach already used for vertical-vs-iron-condor and
     shadow-vs-random. Default behavior (no args passed) is completely
-    unchanged.
+    unchanged. `disable_stop` also works for a debit spread's floor;
+    `stop_loss_multiple_override` has no debit-spread equivalent yet (no
+    counterfactual policy needs it there today).
     """
     limits = config.risk
+
+    if not is_credit_spread:
+        if width is None:
+            raise ValueError("should_close needs `width` for a debit spread (max possible gain at expiration)")
+        debit_paid = -credit_received
+        if debit_paid <= 0:
+            # Malformed (credit_received wasn't actually negative) -- never
+            # actionable, same "don't guess" discipline as the credit path.
+            return False, None
+        max_gain = width - debit_paid
+        profit_captured_pct = (current_mark - debit_paid) / max_gain if max_gain > 0 else 0
+        if profit_captured_pct >= limits.debit_profit_target_pct:
+            return True, (
+                f"profit target hit: {profit_captured_pct:.0%} of max gain captured "
+                f"(proceeds ${current_mark:.2f} vs debit paid ${debit_paid:.2f})"
+            )
+        if not disable_stop:
+            stop_floor = debit_paid * limits.debit_stop_pct
+            if current_mark <= stop_floor:
+                return True, (
+                    f"stop hit: proceeds (${current_mark:.2f}) fell to "
+                    f"{limits.debit_stop_pct:.0%} of debit paid (${debit_paid:.2f})"
+                )
+        return False, None
+
     profit_captured_pct = 1 - (current_mark / credit_received) if credit_received else 0
     if profit_captured_pct >= limits.profit_target_pct:
         return True, f"profit target hit: {profit_captured_pct:.0%} of max credit captured"

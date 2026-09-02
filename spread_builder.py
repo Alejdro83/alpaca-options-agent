@@ -49,7 +49,7 @@ _contract_cache: dict[tuple, list[dict]] = {}
 @dataclass
 class SpreadPlan:
     underlying: str
-    direction: str  # 'bull_put' | 'bear_call'
+    direction: str  # 'bull_put' | 'bear_call' (credit) | 'bull_call' | 'bear_put' (debit)
     expiration: date
     short_strike: float
     long_strike: float
@@ -57,6 +57,17 @@ class SpreadPlan:
     long_symbol: str
     credit_estimate: float
     max_loss: float
+    # 'credit' (default, unchanged behavior) | 'debit' (2026-09-02 overlay,
+    # see build_debit_spread). For a debit spread, `short_strike`/
+    # `short_symbol` mean the leg this project BUYS (the near-the-money,
+    # delta-targeted leg) and `long_strike`/`long_symbol` mean the leg it
+    # SELLS (further OTM, reduces cost) -- the OPPOSITE of what those names
+    # mean for a credit spread. `credit_estimate` is NEGATIVE for a debit
+    # spread (money paid, not received) -- see executor_mcp.py/risk_gate.py
+    # for how each side of this project reads that sign. `max_loss` stays
+    # uniformly positive (the debit paid itself, capped) regardless of
+    # structure, so risk_gate/position-sizing need no changes at all.
+    structure: str = "credit"
 
 
 @dataclass
@@ -343,6 +354,119 @@ async def build_spread(
         long_symbol=long_contract["symbol"],
         credit_estimate=credit_estimate,
         max_loss=max_loss,
+    )
+
+
+async def build_debit_spread(
+    mcp: AlpacaMCP,
+    ticker: str,
+    signal_direction: str,
+    spot_price: float,
+    realized_vol: float,
+) -> SpreadPlan | None:
+    """Directional DEBIT vertical (2026-09-02 overlay) -- bull call spread on
+    a 'long' signal, bear put spread on a 'short' signal. BUYS the near-the-
+    money leg (delta near config.risk.debit_leg_target_delta -- the actual
+    directional bet) and SELLS a further-OTM leg `spread_width_dollars`
+    away to reduce cost, the mirror image of build_spread's credit vertical.
+
+    Reuses `_select_vertical_leg` unchanged: its "delta-targeted leg near
+    the money" + "width-offset leg further OTM" geometry is IDENTICAL for a
+    debit spread, only the buy/sell roles invert -- what that function calls
+    the "short" (delta-targeted) contract is the leg THIS function buys, and
+    what it calls "long" (width-offset) is the leg this function sells. Its
+    returned `(short_mid - long_mid)` is therefore (buy_mid - sell_mid) here
+    -- the debit paid per contract, not a credit -- which this function
+    negates before storing, matching SpreadPlan.structure='debit' convention
+    (see its own docstring).
+
+    Same "a skipped cycle is safer than a guessed one" discipline as
+    build_spread: returns None (never a half-built or economically
+    nonsensical spread) if the chain lacks a liquid pair, if the resulting
+    debit isn't positive, if the delta of the leg being bought falls outside
+    [debit_delta_sanity_min, debit_delta_sanity_max] (mirrors the exact band
+    already proven on Paco's mcp_risk_proxy backstop), or if the debit paid
+    would be >= the strike width (arbitrage-nonsensical, almost certainly a
+    stale/crossed quote).
+    """
+    limits = config.risk
+    today = datetime.now(timezone.utc).date()
+    min_exp = today + timedelta(days=limits.min_dte)
+    max_exp = today + timedelta(days=limits.max_dte)
+
+    is_bull_call = signal_direction == "long"
+    option_type = "call" if is_bull_call else "put"
+    # Further-OTM = higher strike for a call, lower strike for a put --
+    # same geometry build_spread already relies on, just keyed off
+    # option_type directly here since both directions map to the same rule.
+    is_lower_long = option_type == "put"
+
+    contracts = await _fetch_contracts(mcp, ticker, option_type, min_exp, max_exp)
+    if not contracts:
+        logger.info("No %s contracts for %s in [%s, %s] (debit spread)", option_type, ticker, min_exp, max_exp)
+        return None
+
+    contracts.sort(key=lambda c: c.get("expiration_date", ""))
+    chosen_expiration = contracts[0]["expiration_date"]
+    exp_contracts = [c for c in contracts if c.get("expiration_date") == chosen_expiration]
+    dte_days = (datetime.strptime(chosen_expiration, "%Y-%m-%d").date() - today).days
+
+    symbols = [c["symbol"] for c in exp_contracts]
+    snap_by_symbol = await _fetch_snapshots(mcp, symbols)
+
+    leg = _select_vertical_leg(
+        ticker, option_type, exp_contracts, snap_by_symbol,
+        spot_price, dte_days, realized_vol, is_lower_long=is_lower_long,
+        target_delta_override=limits.debit_leg_target_delta,
+    )
+    if leg is None:
+        return None
+    buy_contract, sell_contract, buy_strike, sell_strike, raw_diff = leg
+
+    # _select_vertical_leg's MAX_DELTA_DEVIATION check already confirms the
+    # buy leg's delta is within 0.15 of debit_leg_target_delta -- this is an
+    # ADDITIONAL absolute sanity band (mirrors Paco's proven
+    # _DEBIT_DELTA_SANITY_MIN/MAX), independent of whatever the target
+    # happens to be configured to.
+    buy_delta = abs(bs_delta(
+        spot=spot_price, strike=buy_strike, dte_days=dte_days,
+        volatility=realized_vol, option_type=option_type,
+    ))
+    if not (limits.debit_delta_sanity_min <= buy_delta <= limits.debit_delta_sanity_max):
+        logger.info(
+            "%s debit %s buy leg delta (%.2f) outside the sane [%.2f, %.2f] "
+            "range, skipping",
+            ticker, option_type, buy_delta, limits.debit_delta_sanity_min, limits.debit_delta_sanity_max,
+        )
+        return None
+
+    # raw_diff = buy_mid - sell_mid (the shared helper's "credit" formula,
+    # here interpreted as debit paid since we buy the near-the-money leg).
+    debit_paid = raw_diff
+    if debit_paid <= 0:
+        logger.info("%s debit spread has non-positive debit (%.2f), skipping", ticker, debit_paid)
+        return None
+
+    width_dollars = abs(buy_strike - sell_strike) * 100
+    if debit_paid >= width_dollars:
+        logger.warning(
+            "%s debit spread paid $%.2f for a $%.2f-wide structure -- "
+            "arbitrage-nonsensical, almost certainly a stale/crossed quote, skipping",
+            ticker, debit_paid, width_dollars,
+        )
+        return None
+
+    return SpreadPlan(
+        underlying=ticker,
+        direction="bull_call" if is_bull_call else "bear_put",
+        expiration=datetime.strptime(chosen_expiration, "%Y-%m-%d").date(),
+        short_strike=buy_strike,
+        long_strike=sell_strike,
+        short_symbol=buy_contract["symbol"],
+        long_symbol=sell_contract["symbol"],
+        credit_estimate=round(-debit_paid, 2),
+        max_loss=round(debit_paid, 2),
+        structure="debit",
     )
 
 

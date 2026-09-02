@@ -116,6 +116,7 @@ def record_spread_open(
     cycle_id: int,
     generation: int = 0,
     strategy: str = "vertical",
+    structure: str = "credit",
     call_short_strike: float | None = None,
     call_long_strike: float | None = None,
     call_short_symbol: str | None = None,
@@ -128,6 +129,13 @@ def record_spread_open(
     matches. `strategy` defaults to 'vertical' to match the DB column's own
     default, but is passed explicitly here rather than relying on that
     default alone from the application code.
+
+    `structure` ('credit' default | 'debit', 2026-09-02 overlay — see
+    spread_builder.build_debit_spread / supabase/
+    alpaca_hackathon_schema_debit.sql): for 'debit', `credit_received` is
+    NEGATIVE (the debit paid) and `short_strike`/`short_symbol` mean the
+    leg this project BOUGHT rather than sold — see SpreadPlan's own
+    docstring for the full sign/role convention.
     """
     with _connection() as conn, conn.cursor() as cur:
         cur.execute(
@@ -135,16 +143,16 @@ def record_spread_open(
             insert into {_schema()}.spreads
                 (underlying, direction, expiration, short_strike, long_strike,
                  short_symbol, long_symbol, contracts, credit_received, max_loss,
-                 alpaca_order_ids, cycle_id, status, generation, strategy,
+                 alpaca_order_ids, cycle_id, status, generation, strategy, structure,
                  call_short_strike, call_long_strike, call_short_symbol, call_long_symbol)
-            values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'open', %s, %s, %s, %s, %s, %s)
+            values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'open', %s, %s, %s, %s, %s, %s, %s)
             returning id
             """,
             (
                 underlying, direction, expiration, short_strike, long_strike,
                 short_symbol, long_symbol,
                 contracts, credit_received, max_loss, json.dumps(alpaca_order_ids), cycle_id,
-                generation, strategy,
+                generation, strategy, structure,
                 call_short_strike, call_long_strike, call_short_symbol, call_long_symbol,
             ),
         )

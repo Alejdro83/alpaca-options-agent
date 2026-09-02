@@ -999,15 +999,16 @@ class TestIronCondorVerticalFallback:
     @pytest.mark.asyncio
     async def test_failed_iron_condor_falls_back_to_vertical(self):
         from bot import find_candidates
-        from signals.regime import Regime
+        from signals.regime import Regime, RegimeResult
         from signals.swing import Signal
 
         plan = make_plan(underlying="NVDA", direction="bull_put")
         sig = Signal(ticker="NVDA", direction="bull_put", strength=0.6, indicators={}, reasoning=["real signal"])
+        regime_result = RegimeResult(regime=Regime.RANGING, adx=15.0, vol_20d=0.01, vol_60d_avg=0.01, vol_ratio=1.0, is_high_vol=False, is_strong_trend=False)
         with patch("bot.get_universe", return_value=[]), \
              patch("bot.filter_universe", return_value=[]), \
              patch("bot.generate_swing_signals", return_value=[]), \
-             patch("bot._apply_trend_and_volatility_filters", return_value=[(sig, 0.20, Regime.RANGING)]), \
+             patch("bot._apply_trend_and_volatility_filters", return_value=[(sig, 0.20, regime_result)]), \
              patch("bot._vixy_regime_percentile", return_value=None), \
              patch("bot.db.get_open_spreads", return_value=[]), \
              patch("bot.build_iron_condor", new_callable=AsyncMock, return_value=None) as mock_ic, \
@@ -1037,13 +1038,15 @@ class TestIronCondorVerticalFallback:
         from bot import find_candidates
         from signals.swing import Signal
         from signals.regime import Regime as RegimeEnum
+        from signals.regime import RegimeResult
 
         ic_plan = make_iron_condor_plan(underlying="NVDA")
         sig = Signal(ticker="NVDA", direction="bull_put", strength=0.6, indicators={}, reasoning=["real signal"])
+        regime_result = RegimeResult(regime=RegimeEnum.RANGING, adx=15.0, vol_20d=0.01, vol_60d_avg=0.01, vol_ratio=1.0, is_high_vol=False, is_strong_trend=False)
         with patch("bot.get_universe", return_value=[]), \
              patch("bot.filter_universe", return_value=[]), \
              patch("bot.generate_swing_signals", return_value=[]), \
-             patch("bot._apply_trend_and_volatility_filters", return_value=[(sig, 0.20, RegimeEnum.RANGING)]), \
+             patch("bot._apply_trend_and_volatility_filters", return_value=[(sig, 0.20, regime_result)]), \
              patch("bot._vixy_regime_percentile", return_value=None), \
              patch("bot.db.get_open_spreads", return_value=[]), \
              patch("bot.build_iron_condor", new_callable=AsyncMock, return_value=ic_plan), \
@@ -2117,3 +2120,328 @@ class TestEmergencyFlattenBoundedClose:
         assert len(calls) == 1
         assert calls[0]["limit_price"] == "3.50"  # max_loss 350/contract -> 3.50/share
         mock_db.record_spread_close.assert_called_once()
+
+
+# ===================================================================
+# 24. DIRECTIONAL DEBIT SPREAD OVERLAY (added 2026-09-02)
+# ===================================================================
+# Complementary structure ported from the debit-spread overlay validated
+# first on Paco/mcp_risk_proxy after several real days of zero fills under
+# credit-only verticals + iron condors. Covers the sign/role inversion
+# (SpreadPlan.structure='debit', credit_estimate negative, short_symbol
+# means the BUY leg) end to end: build -> risk_gate.should_close -> the
+# real order legs sent to Alpaca -> find_candidates' overlay/fallback
+# routing.
+
+class TestDebitSpreadBuilder:
+    @pytest.mark.asyncio
+    async def test_build_debit_spread_bear_put_happy_path(self):
+        from spread_builder import build_debit_spread, _contract_cache
+        _contract_cache.clear()
+
+        today = date.today()
+        exp = (today + timedelta(days=10)).isoformat()
+        # spot=450, dte=10, vol=0.20 -> put delta at 455 strike is -0.6103
+        # (abs 0.61, within [0.35, 0.80] and within 0.15 of the 0.60 target).
+        contracts = [
+            make_option_contract("SPY260905P00455000", 455.0, "put", exp, 500),  # buy (near ATM)
+            make_option_contract("SPY260905P00450000", 450.0, "put", exp, 500),  # sell (further OTM)
+        ]
+        snap_by_symbol = {
+            "SPY260905P00455000": make_quote(bid=8.00, ask=8.20),
+            "SPY260905P00450000": make_quote(bid=5.50, ask=5.70),
+        }
+        mcp = FakeMCP()
+        mcp.set_response("get_option_contracts", make_contracts_response(contracts))
+        mcp.set_response("get_option_snapshot", make_snapshot_response(snap_by_symbol))
+
+        result = await build_debit_spread(mcp, "SPY", "short", spot_price=450.0, realized_vol=0.20)
+
+        assert result is not None
+        assert result.structure == "debit"
+        assert result.direction == "bear_put"
+        assert result.short_symbol == "SPY260905P00455000"  # the BUY leg
+        assert result.long_symbol == "SPY260905P00450000"   # the SELL leg
+        # (8.10 mid - 5.60 mid) * 100 = 250.00 debit paid
+        assert result.credit_estimate == -250.0
+        assert result.max_loss == 250.0
+
+    @pytest.mark.asyncio
+    async def test_build_debit_spread_rejects_delta_outside_sane_band(self):
+        """A deep-ITM buy leg (delta far above the [0.35, 0.80] band) must
+        be refused — same discipline as the credit-spread MAX_DELTA_DEVIATION
+        guard, just an absolute band instead of a deviation-from-target.
+        """
+        from spread_builder import build_debit_spread, _contract_cache
+        _contract_cache.clear()
+
+        today = date.today()
+        exp = (today + timedelta(days=10)).isoformat()
+        # put delta at strike 470 (spot 450, dte 10, vol 0.20) is deep ITM,
+        # well above 0.80 -- forced liquid-only via wide OTM bid=0 quotes,
+        # same technique TestDeltaDeviationGuard already uses.
+        contracts = [
+            make_option_contract("SPY260905P00470000", 470.0, "put", exp, 500),
+            make_option_contract("SPY260905P00465000", 465.0, "put", exp, 500),
+            make_option_contract("SPY260905P00450000", 450.0, "put", exp, 500),
+        ]
+        snap_by_symbol = {
+            "SPY260905P00470000": make_quote(bid=19.00, ask=19.50),
+            "SPY260905P00465000": make_quote(bid=14.00, ask=14.50),
+            "SPY260905P00450000": make_quote(bid=0.0, ask=0.0),
+        }
+        mcp = FakeMCP()
+        mcp.set_response("get_option_contracts", make_contracts_response(contracts))
+        mcp.set_response("get_option_snapshot", make_snapshot_response(snap_by_symbol))
+
+        result = await build_debit_spread(mcp, "SPY", "short", spot_price=450.0, realized_vol=0.20)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_build_debit_spread_rejects_non_positive_debit(self):
+        """Crossed/stale quotes making the far-OTM leg pricier than the
+        near-the-money leg would produce a non-positive "debit" -- never a
+        real debit spread, must be refused rather than recorded as free
+        money.
+        """
+        from spread_builder import build_debit_spread, _contract_cache
+        _contract_cache.clear()
+
+        today = date.today()
+        exp = (today + timedelta(days=10)).isoformat()
+        contracts = [
+            make_option_contract("SPY260905P00455000", 455.0, "put", exp, 500),
+            make_option_contract("SPY260905P00450000", 450.0, "put", exp, 500),
+        ]
+        snap_by_symbol = {
+            "SPY260905P00455000": make_quote(bid=5.00, ask=5.20),  # buy leg cheaper than sell leg
+            "SPY260905P00450000": make_quote(bid=6.50, ask=6.70),
+        }
+        mcp = FakeMCP()
+        mcp.set_response("get_option_contracts", make_contracts_response(contracts))
+        mcp.set_response("get_option_snapshot", make_snapshot_response(snap_by_symbol))
+
+        result = await build_debit_spread(mcp, "SPY", "short", spot_price=450.0, realized_vol=0.20)
+        assert result is None
+
+
+class TestDebitSpreadRiskGate:
+    def test_should_close_debit_profit_target(self):
+        """debit_paid=250, width=500 -> max_gain=250. Proceeds of 325 is
+        30% of max_gain above the debit paid (325-250)/250=0.30 -- exactly
+        the default debit_profit_target_pct.
+        """
+        import risk_gate
+        should_close, reason = risk_gate.should_close(
+            credit_received=-250.0, current_mark=325.0, is_credit_spread=False, width=500.0,
+        )
+        assert should_close is True
+        assert "profit target" in reason
+
+    def test_should_close_debit_stop(self):
+        """debit_paid=250, default debit_stop_pct=0.50 -> stop floor=125.
+        Proceeds fallen to 100 (below the floor) must trigger the stop.
+        """
+        import risk_gate
+        should_close, reason = risk_gate.should_close(
+            credit_received=-250.0, current_mark=100.0, is_credit_spread=False, width=500.0,
+        )
+        assert should_close is True
+        assert "stop" in reason
+
+    def test_should_close_debit_neither(self):
+        import risk_gate
+        should_close, reason = risk_gate.should_close(
+            credit_received=-250.0, current_mark=200.0, is_credit_spread=False, width=500.0,
+        )
+        assert should_close is False
+        assert reason is None
+
+    def test_should_close_debit_requires_width(self):
+        import risk_gate
+        with pytest.raises(ValueError):
+            risk_gate.should_close(credit_received=-250.0, current_mark=200.0, is_credit_spread=False)
+
+    def test_should_close_credit_path_unaffected(self):
+        """Default is_credit_spread=True (no other kwargs) must behave
+        exactly as before this change -- no regression on the existing,
+        real, judged trading path. credit_received=150, default
+        stop_loss_multiple=2.0 -> stop threshold=300; mark=310 clears it.
+        """
+        import risk_gate
+        should_close, reason = risk_gate.should_close(credit_received=150.0, current_mark=310.0)
+        assert should_close is True
+        assert "stop" in reason
+
+
+class TestDebitSpreadExecutor:
+    @pytest.mark.asyncio
+    async def test_open_spread_debit_sends_correct_sides_and_limit(self):
+        """A debit plan must BUY short_symbol / SELL long_symbol (inverted
+        from a credit spread) and bound the limit price by the debit paid,
+        not the credit received.
+        """
+        import executor_mcp
+        plan = make_plan(
+            underlying="SPY", direction="bear_put", structure="debit",
+            short_symbol="BUY_SYM", long_symbol="SELL_SYM",
+            credit_estimate=-250.0, max_loss=250.0,
+        )
+        mcp = FakeMCP()
+        mcp.set_response("place_option_order", {"data": {"id": "order-1", "status": "filled", "filled_avg_price": "-2.50", "legs": []}})
+
+        await executor_mcp.open_spread(mcp, plan, contracts=1)
+
+        calls = mcp.calls_for("place_option_order")
+        assert len(calls) == 1
+        legs = calls[0]["legs"]
+        buy_leg = next(l for l in legs if l["symbol"] == "BUY_SYM")
+        sell_leg = next(l for l in legs if l["symbol"] == "SELL_SYM")
+        assert buy_leg["side"] == "buy" and buy_leg["position_intent"] == "buy_to_open"
+        assert sell_leg["side"] == "sell" and sell_leg["position_intent"] == "sell_to_open"
+        # limit_debit_price(250.0) with default 10% slippage -> pay no more
+        # than 250*1.10/100 = 2.75/share.
+        assert calls[0]["limit_price"] == "2.75"
+
+    @pytest.mark.asyncio
+    async def test_close_spread_debit_sends_correct_sides(self):
+        """Closing a debit spread must SELL_TO_CLOSE the owned (short_symbol)
+        leg and BUY_TO_CLOSE the short (long_symbol) leg -- inverted from a
+        credit spread's close.
+        """
+        import executor_mcp
+        mcp = FakeMCP()
+        mcp.set_response("place_option_order", {"data": {"id": "order-2", "status": "filled"}})
+
+        await executor_mcp.close_spread(
+            mcp, short_symbol="BUY_SYM", long_symbol="SELL_SYM", contracts=1,
+            structure="debit", current_mark=300.0,
+        )
+
+        calls = mcp.calls_for("place_option_order")
+        legs = calls[0]["legs"]
+        owned_leg = next(l for l in legs if l["symbol"] == "BUY_SYM")
+        short_leg = next(l for l in legs if l["symbol"] == "SELL_SYM")
+        assert owned_leg["side"] == "sell" and owned_leg["position_intent"] == "sell_to_close"
+        assert short_leg["side"] == "buy" and short_leg["position_intent"] == "buy_to_close"
+        # limit_credit_price(300.0) -- accept no less than 300*0.90/100 = 2.70/share.
+        assert calls[0]["limit_price"] == "2.70"
+
+    @pytest.mark.asyncio
+    async def test_get_spread_mark_debit_formula(self):
+        """Debit mark = short_bid - long_ask (proceeds from closing), the
+        mirror image of the credit formula (short_ask - long_bid, cost to
+        close)."""
+        import executor_mcp
+        mcp = FakeMCP()
+        mcp.set_response("get_option_snapshot", make_snapshot_response({
+            "BUY_SYM": make_quote(bid=6.50, ask=6.70),
+            "SELL_SYM": make_quote(bid=3.20, ask=3.40),
+        }))
+        mark = await executor_mcp.get_spread_mark(mcp, "BUY_SYM", "SELL_SYM", structure="debit")
+        # (6.50 - 3.40) * 100 = 310.00
+        assert mark == 310.0
+
+
+class TestDebitSpreadOverlayRouting:
+    @pytest.mark.asyncio
+    async def test_find_candidates_uses_debit_when_adx_and_strength_clear_the_bar(self):
+        from bot import find_candidates
+        from signals.regime import Regime, RegimeResult
+        from signals.swing import Signal
+
+        debit_plan = make_plan(underlying="NVDA", direction="bear_put", structure="debit",
+                                credit_estimate=-250.0, max_loss=250.0)
+        sig = Signal(ticker="NVDA", direction="short", strength=0.80, indicators={}, reasoning=["strong trend"])
+        # ADX=40 > debit_min_adx (35), strength=0.80 >= debit_min_signal_strength (0.65)
+        regime_result = RegimeResult(regime=Regime.TRENDING, adx=40.0, vol_20d=0.01, vol_60d_avg=0.01, vol_ratio=1.0, is_high_vol=False, is_strong_trend=True)
+
+        with patch("bot.get_universe", return_value=[]), \
+             patch("bot.filter_universe", return_value=[]), \
+             patch("bot.generate_swing_signals", return_value=[]), \
+             patch("bot._apply_trend_and_volatility_filters", return_value=[(sig, 0.20, regime_result)]), \
+             patch("bot._vixy_regime_percentile", return_value=None), \
+             patch("bot.db.get_open_spreads", return_value=[]), \
+             patch("bot.build_debit_spread", new_callable=AsyncMock, return_value=debit_plan) as mock_debit, \
+             patch("bot.build_spread", new_callable=AsyncMock) as mock_credit, \
+             patch("bot.risk_gate.check_new_spread", return_value=SimpleNamespace(allowed=True, reasons=[])):
+            fake_client = SimpleNamespace(
+                get_snapshots=lambda tickers: {},
+                get_latest_quote=lambda ticker: {"ask_price": 100.5, "bid_price": 99.5},
+            )
+            candidates, _ = await find_candidates(
+                mcp=AsyncMock(), client=fake_client, account={"equity": 100_000.0, "daily_pl_pct": 0.0}, open_count=0,
+            )
+
+        assert mock_debit.await_count == 1
+        assert mock_credit.await_count == 0, "the credit-vertical builder must not be tried when the debit build succeeds"
+        assert len(candidates) == 1
+        assert candidates[0]["structure"] == "debit"
+
+    @pytest.mark.asyncio
+    async def test_find_candidates_falls_back_to_credit_when_debit_build_fails(self):
+        from bot import find_candidates
+        from signals.regime import Regime, RegimeResult
+        from signals.swing import Signal
+
+        credit_plan = make_plan(underlying="NVDA", direction="bear_call", structure="credit")
+        sig = Signal(ticker="NVDA", direction="short", strength=0.80, indicators={}, reasoning=["strong trend"])
+        regime_result = RegimeResult(regime=Regime.TRENDING, adx=40.0, vol_20d=0.01, vol_60d_avg=0.01, vol_ratio=1.0, is_high_vol=False, is_strong_trend=True)
+
+        with patch("bot.get_universe", return_value=[]), \
+             patch("bot.filter_universe", return_value=[]), \
+             patch("bot.generate_swing_signals", return_value=[]), \
+             patch("bot._apply_trend_and_volatility_filters", return_value=[(sig, 0.20, regime_result)]), \
+             patch("bot._vixy_regime_percentile", return_value=None), \
+             patch("bot.db.get_open_spreads", return_value=[]), \
+             patch("bot.build_debit_spread", new_callable=AsyncMock, return_value=None) as mock_debit, \
+             patch("bot.build_spread", new_callable=AsyncMock, return_value=credit_plan) as mock_credit, \
+             patch("bot.risk_gate.check_new_spread", return_value=SimpleNamespace(allowed=True, reasons=[])):
+            fake_client = SimpleNamespace(
+                get_snapshots=lambda tickers: {},
+                get_latest_quote=lambda ticker: {"ask_price": 100.5, "bid_price": 99.5},
+            )
+            candidates, _ = await find_candidates(
+                mcp=AsyncMock(), client=fake_client, account={"equity": 100_000.0, "daily_pl_pct": 0.0}, open_count=0,
+            )
+
+        assert mock_debit.await_count == 1
+        assert mock_credit.await_count == 1, "must fall back to the credit vertical on the same signal"
+        assert len(candidates) == 1
+        assert candidates[0]["structure"] == "credit"
+
+    @pytest.mark.asyncio
+    async def test_find_candidates_never_attempts_debit_below_the_conviction_bar(self):
+        """ADX/strength below debit_min_adx/debit_min_signal_strength must
+        never even attempt build_debit_spread -- never fabricates
+        conviction that isn't there.
+        """
+        from bot import find_candidates
+        from signals.regime import Regime, RegimeResult
+        from signals.swing import Signal
+
+        credit_plan = make_plan(underlying="NVDA", direction="bull_put", structure="credit")
+        sig = Signal(ticker="NVDA", direction="long", strength=0.40, indicators={}, reasoning=["modest trend"])
+        # ADX=30 is TRENDING (>25) but below debit_min_adx (35).
+        regime_result = RegimeResult(regime=Regime.TRENDING, adx=30.0, vol_20d=0.01, vol_60d_avg=0.01, vol_ratio=1.0, is_high_vol=False, is_strong_trend=True)
+
+        with patch("bot.get_universe", return_value=[]), \
+             patch("bot.filter_universe", return_value=[]), \
+             patch("bot.generate_swing_signals", return_value=[]), \
+             patch("bot._apply_trend_and_volatility_filters", return_value=[(sig, 0.20, regime_result)]), \
+             patch("bot._vixy_regime_percentile", return_value=None), \
+             patch("bot.db.get_open_spreads", return_value=[]), \
+             patch("bot.build_debit_spread", new_callable=AsyncMock) as mock_debit, \
+             patch("bot.build_spread", new_callable=AsyncMock, return_value=credit_plan), \
+             patch("bot.risk_gate.check_new_spread", return_value=SimpleNamespace(allowed=True, reasons=[])):
+            fake_client = SimpleNamespace(
+                get_snapshots=lambda tickers: {},
+                get_latest_quote=lambda ticker: {"ask_price": 100.5, "bid_price": 99.5},
+            )
+            candidates, _ = await find_candidates(
+                mcp=AsyncMock(), client=fake_client, account={"equity": 100_000.0, "daily_pl_pct": 0.0}, open_count=0,
+            )
+
+        assert mock_debit.await_count == 0
+        assert len(candidates) == 1
+        assert candidates[0]["structure"] == "credit"

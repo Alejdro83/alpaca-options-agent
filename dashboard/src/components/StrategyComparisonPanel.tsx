@@ -96,7 +96,7 @@ export interface CompareState {
   ours: {
     latestSnapshot: { equity: number; daily_pl: number | null } | null;
     equityCurve: Array<{ equity: number; spy_price: number | null; snapshot_at: string }>;
-    spreads: Array<{ status: string }>;
+    spreads: Array<{ status: string; strategy: string; structure: string }>;
     portfolioGreeks: {
       net_delta: number | null;
       net_theta: number | null;
@@ -132,12 +132,27 @@ export interface CompareState {
 // directly, NOT eligible for judging -- see AGENTS.md), and rookieriot's
 // independent build (verticals-only, narrower universe).
 export function StrategyComparisonPanel({ data }: { data: CompareState }) {
-  const ourOpenCount = data.ours.spreads.filter((s) => s.status === 'open').length;
+  const ourOpenSpreads = data.ours.spreads.filter((s) => s.status === 'open');
+  const ourOpenCount = ourOpenSpreads.length;
+  // Open-position breakdown by strategy/structure, computed client-side
+  // from the same spreads list rather than a second query -- mirrors
+  // Paco's server-computed strategyMix (db.ts's getPacoState), added here
+  // 2026-09-02 alongside the debit-spread overlay so a debit vertical
+  // doesn't just look like an ordinary credit vertical on our own track.
+  const ourStrategyMixMap = new Map<string, number>();
+  for (const s of ourOpenSpreads) {
+    const key = `${s.strategy}|${s.structure || 'credit'}`;
+    ourStrategyMixMap.set(key, (ourStrategyMixMap.get(key) || 0) + 1);
+  }
+  const ourStrategyMix = Array.from(ourStrategyMixMap.entries()).map(([key, count]) => {
+    const [strategy, structure] = key.split('|');
+    return { strategy, structure, count };
+  });
 
   const tracks: Track[] = [
     {
       name: 'Ours (judged)',
-      subtitle: 'Verticals + iron condor, LLM + deterministic gate',
+      subtitle: 'Verticals + debit spreads + iron condor, LLM + deterministic gate',
       equity: data.ours.latestSnapshot ? Number(data.ours.latestSnapshot.equity) : null,
       dailyPl: data.ours.latestSnapshot?.daily_pl !== null && data.ours.latestSnapshot?.daily_pl !== undefined
         ? Number(data.ours.latestSnapshot.daily_pl)
@@ -145,6 +160,7 @@ export function StrategyComparisonPanel({ data }: { data: CompareState }) {
       openCount: data.ours.latestSnapshot ? ourOpenCount : null,
       curve: data.ours.equityCurve,
       greeks: data.ours.portfolioGreeks,
+      strategyMix: ourStrategyMix,
     },
     data.paco
       ? {

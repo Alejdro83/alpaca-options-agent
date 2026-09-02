@@ -129,6 +129,7 @@ def make_plan(
     long_symbol: str = "SPY260905C00455000",
     credit_estimate: float = 1.50,
     max_loss: float = 3.50,
+    structure: str = "credit",
 ):
     from spread_builder import SpreadPlan
     return SpreadPlan(
@@ -141,6 +142,7 @@ def make_plan(
         long_symbol=long_symbol,
         credit_estimate=credit_estimate,
         max_loss=max_loss,
+        structure=structure,
     )
 
 

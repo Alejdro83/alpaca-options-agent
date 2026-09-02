@@ -52,6 +52,23 @@ regimes: TRENDING, VOLATILE_TRENDING, RANGING, VOLATILE_RANGING):
   penalize it for lacking a `direction`/`strength` signal — that absence is exactly \
   why it's an iron condor instead of a vertical.
 
+Every candidate also carries a `structure` field, 'credit' or 'debit' (2026-09-02): \
+- 'credit' (the default, always true for 'iron_condor'): the existing structure — \
+  sells the near-the-money leg, buys a further-OTM leg for protection, collects a \
+  net premium up front (`credit_estimate` is POSITIVE), profits from time decay and \
+  the underlying staying away from the short strike.
+- 'debit' (only possible for 'vertical', and only offered when the underlying's \
+  trend is unusually strong — ADX well above the regime threshold — with real signal \
+  strength behind it): BUYS the near-the-money leg (the actual directional bet) and \
+  sells a further-OTM leg to reduce cost. `credit_estimate` is NEGATIVE — this is \
+  CORRECT, not an error: it means premium was PAID, not received. `max_loss` is that \
+  same debit, capped, exactly as for a credit spread. This structure profits from \
+  real price movement, the OPPOSITE exposure of a credit spread — do not treat a \
+  negative `credit_estimate` as a red flag or a reason to reject a 'debit' candidate; \
+  judge it on the strength of the directional case (`direction`, `strength`, \
+  `signal_reasoning`) exactly like a 'vertical'/'credit' candidate, just with the \
+  opposite premium sign.
+
 Each candidate also carries a `fact_ids` dict: short, deterministic, UPPERCASE \
 identifiers (pattern: TICKER_FIELD, e.g. AAPL_CREDIT_EST, AAPL_MAX_LOSS, AAPL_DTE, \
 AAPL_SIGNAL_STRENGTH) mapped to their numeric values. These are the ground-truth \
@@ -86,7 +103,7 @@ so make it genuinely informative, not generic filler."""
 
 
 def decide(candidates: list[dict], remaining_budget: int) -> dict:
-    """`candidates` items: {ticker, strategy, direction, strength,
+    """`candidates` items: {ticker, strategy, structure, direction, strength,
     signal_reasoning, credit_estimate, max_loss, expiration, fact_ids} —
     `direction`/`strength`/`signal_reasoning` are only meaningful for
     strategy='vertical' candidates (an 'iron_condor' candidate has no

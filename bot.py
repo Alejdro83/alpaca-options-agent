@@ -39,7 +39,7 @@ from screening.filters import filter_universe
 from signals.indicators import compute_atr
 from signals.swing import generate_swing_signals
 from signals.trend_filter import TrendFilter
-from signals.regime import Regime, RegimeDetector
+from signals.regime import Regime, RegimeDetector, RegimeResult
 
 import black_scholes
 import db
@@ -50,7 +50,7 @@ import reconciler
 import risk_gate
 import shadow_book
 from mcp_client import AlpacaMCP
-from spread_builder import IronCondorPlan, SpreadPlan, _mid_from_snapshot, build_iron_condor, build_spread
+from spread_builder import IronCondorPlan, SpreadPlan, _mid_from_snapshot, build_debit_spread, build_iron_condor, build_spread
 
 from pathlib import Path
 import json as _json
@@ -158,11 +158,14 @@ def _vixy_regime_percentile(client: AlpacaClient) -> float | None:
 
 
 def _apply_trend_and_volatility_filters(client: AlpacaClient, signals: list) -> list[tuple]:
-    """Returns (signal, realized_vol, regime) triples for survivors —
+    """Returns (signal, realized_vol, regime_result) triples for survivors —
     realized_vol is the annualized estimate `spread_builder.build_spread`/
     `build_iron_condor` feed into `black_scholes.bs_delta` as the IV proxy,
     computed here (not re-fetched later) since this is already pulling the
-    daily bars it needs. `regime` is a `signals.regime.Regime` enum value.
+    daily bars it needs. `regime_result` is the full `signals.regime.RegimeResult`
+    (not just its `.regime` enum, since 2026-09-02 -- find_candidates' debit-
+    spread overlay needs the raw ADX value too, not just the TRENDING/
+    RANGING classification derived from it).
 
     Real bug fixed 2026-08-28 (first pass): this used to thread
     `trend_direction` ('bullish'/'bearish'/'neutral') through, routing
@@ -196,7 +199,7 @@ def _apply_trend_and_volatility_filters(client: AlpacaClient, signals: list) -> 
     """
     trend_filter = TrendFilter()
     regime_detector = RegimeDetector()
-    trend_survivors: list[tuple] = []  # (sig, bars_df, regime)
+    trend_survivors: list[tuple] = []  # (sig, bars_df, regime_result)
     for sig in signals:
         try:
             bars_df = _fetch_daily_bars(client, sig.ticker)
@@ -224,17 +227,19 @@ def _apply_trend_and_volatility_filters(client: AlpacaClient, signals: list) -> 
             continue
 
         try:
-            regime = regime_detector.detect(bars_df).regime
+            regime_result = regime_detector.detect(bars_df)
         except Exception:
             logger.exception("Regime detection failed for %s, treating as RANGING", sig.ticker)
             # Unknown regime: route to an iron condor (no directional view
             # required) rather than silently trusting the swing model's own
             # guessed direction with zero regime confirmation behind it --
             # same conservative "don't guess a direction you can't confirm"
-            # choice made elsewhere in this project.
-            regime = Regime.RANGING
+            # choice made elsewhere in this project. adx=0.0 keeps the
+            # debit-spread overlay's ADX check (find_candidates) correctly
+            # unmet on this fallback path -- no real trend was confirmed.
+            regime_result = RegimeResult(regime=Regime.RANGING, adx=0.0, vol_20d=0.0, vol_60d_avg=0.0, vol_ratio=1.0, is_high_vol=False, is_strong_trend=False)
 
-        trend_survivors.append((sig, bars_df, regime))
+        trend_survivors.append((sig, bars_df, regime_result))
 
     min_percentile = config.volatility.min_percentile
 
@@ -262,7 +267,7 @@ def _apply_trend_and_volatility_filters(client: AlpacaClient, signals: list) -> 
                 min_percentile = config.volatility.relaxed_min_percentile
 
     kept = []
-    for sig, bars_df, regime in trend_survivors:
+    for sig, bars_df, regime_result in trend_survivors:
         if config.volatility.enabled:
             try:
                 pct = _realized_vol_percentile(bars_df)
@@ -277,7 +282,7 @@ def _apply_trend_and_volatility_filters(client: AlpacaClient, signals: list) -> 
                 continue
 
         realized_vol = black_scholes.realized_vol_from_bars(bars_df)
-        kept.append((sig, realized_vol, regime))
+        kept.append((sig, realized_vol, regime_result))
     return kept
 
 
@@ -383,6 +388,10 @@ async def manage_open_spreads(mcp: AlpacaMCP) -> tuple[list[str], bool]:
         # doesn't yet know) must still fall onto the pre-existing 2-symbol
         # path rather than erroring or silently doing nothing.
         is_iron_condor = spread.get("strategy") == "iron_condor"
+        # 'structure' likewise defaults to 'credit' at the DB column level
+        # (2026-09-02 migration) -- an old row predating the debit-spread
+        # overlay reads back as 'credit', the correct/unchanged behavior.
+        is_credit_spread = spread.get("structure", "credit") != "debit"
 
         try:
             if is_iron_condor:
@@ -394,7 +403,10 @@ async def manage_open_spreads(mcp: AlpacaMCP) -> tuple[list[str], bool]:
                     long_call_symbol=spread["call_long_symbol"],
                 )
             else:
-                mark = await executor_mcp.get_spread_mark(mcp, spread["short_symbol"], spread["long_symbol"])
+                mark = await executor_mcp.get_spread_mark(
+                    mcp, spread["short_symbol"], spread["long_symbol"],
+                    structure="credit" if is_credit_spread else "debit",
+                )
         except Exception:
             logger.exception("Failed to get mark for spread %s", spread["id"])
             if not force_close:
@@ -409,8 +421,17 @@ async def manage_open_spreads(mcp: AlpacaMCP) -> tuple[list[str], bool]:
             should_close, reason = risk_gate.should_close(
                 credit_received=float(spread["credit_received"]),
                 current_mark=mark,
+                is_credit_spread=is_credit_spread,
+                width=None if is_credit_spread else abs(float(spread["short_strike"]) - float(spread["long_strike"])) * 100,
             )
-            if not should_close and risk_gate.is_near_stop(
+            # Debit spreads: is_near_stop's formula assumes a cost-to-close
+            # CEILING (a credit spread's shape), not a proceeds FLOOR --
+            # skipped here rather than building an inverted variant under
+            # time pressure. This only affects the adaptive cron's pacing
+            # (it just won't speed up as a debit spread nears its own
+            # stop), never should_close's real profit-target/stop decision
+            # above, which is already fully debit-aware.
+            if not should_close and is_credit_spread and risk_gate.is_near_stop(
                 credit_received=float(spread["credit_received"]), current_mark=mark,
             ):
                 near_stop = True
@@ -434,6 +455,7 @@ async def manage_open_spreads(mcp: AlpacaMCP) -> tuple[list[str], bool]:
                     short_symbol=spread["short_symbol"],
                     long_symbol=spread["long_symbol"],
                     contracts=spread["contracts"],
+                    structure="credit" if is_credit_spread else "debit",
                     current_mark=mark,
                     max_loss=float(spread["max_loss"]),
                 )
@@ -450,8 +472,18 @@ async def manage_open_spreads(mcp: AlpacaMCP) -> tuple[list[str], bool]:
                 # never multiplies by position size) — multiply by the real
                 # contracts held or P&L is understated whenever contracts>1,
                 # the same class of bug fixed in the entry path above.
+                #
+                # For a debit spread, credit_received is NEGATIVE (the
+                # debit paid) and `mark` means PROCEEDS from closing (see
+                # get_spread_mark's structure param) -- real P&L is
+                # proceeds minus debit paid = mark - (-credit_received) =
+                # mark + credit_received, the mirror image of the credit
+                # formula below.
                 contracts_held = int(spread.get("contracts") or 1)
-                realized_pnl = (float(spread["credit_received"]) - mark) * contracts_held
+                if is_credit_spread:
+                    realized_pnl = (float(spread["credit_received"]) - mark) * contracts_held
+                else:
+                    realized_pnl = (mark + float(spread["credit_received"])) * contracts_held
                 status = "closed_expiry" if force_close else ("closed_profit" if realized_pnl > 0 else "closed_stop")
                 notes.append(f"Closed {spread['underlying']} {spread['direction']}: {reason} (P&L ${realized_pnl:+.2f})")
             db.record_spread_close(spread["id"], status, realized_pnl)
@@ -530,7 +562,8 @@ async def find_candidates(
         logger.exception("Failed to batch-fetch snapshots, falling back to per-symbol quotes")
         snapshots = {}
 
-    for sig, realized_vol, regime in signals_with_vol:
+    for sig, realized_vol, regime_result in signals_with_vol:
+        regime = regime_result.regime
         # Regime -> strategy, per signals.regime.RegimeDetector (2x2 on ADX
         # and vol_ratio=vol_20d/vol_60d_avg, matching a teammate's strategy
         # research 2026-08-28 -- see _apply_trend_and_volatility_filters'
@@ -590,12 +623,38 @@ async def find_candidates(
                     if plan is not None:
                         is_iron_condor = False
             else:
-                # VOLATILE_TRENDING regime: use a wider spread width to
-                # capture more premium in elevated-vol conditions (see
-                # config.risk.volatile_trending_width_dollars). TRENDING
-                # keeps the standard width (no override).
-                w_override = config.risk.volatile_trending_width_dollars if regime == Regime.VOLATILE_TRENDING else None
-                plan = await build_spread(mcp, sig.ticker, sig.direction, spot_price=spot_mid, realized_vol=realized_vol, width_override=w_override)
+                # Directional DEBIT spread overlay (2026-09-02, added after
+                # several real days of zero fills under credit-only
+                # verticals + iron condors): a debit vertical pays real
+                # premium up front and only profits from actual price
+                # movement, so it needs real conviction behind it, not just
+                # "trending enough for a credit vertical" -- stricter ADX
+                # bar (debit_min_adx=35 vs RegimeDetector's own 25) AND a
+                # real signal-strength floor, both required. Never fires in
+                # RANGING/VOLATILE_RANGING (this branch only runs when
+                # is_iron_condor is False, i.e. regime is TRENDING or
+                # VOLATILE_TRENDING already). Falls back to the standard
+                # credit vertical on the SAME signal if the debit spread
+                # fails to build (liquidity/delta-band/quote issues) --
+                # same "never lower a quality bar, just try a different
+                # structure" discipline as the iron-condor-to-vertical
+                # fallback above.
+                plan = None
+                if regime_result.adx > config.risk.debit_min_adx and sig.strength >= config.risk.debit_min_signal_strength:
+                    plan = await build_debit_spread(mcp, sig.ticker, sig.direction, spot_price=spot_mid, realized_vol=realized_vol)
+                    if plan is None:
+                        logger.info(
+                            "%s met the debit-spread overlay bar (ADX %.1f, strength %.2f) "
+                            "but failed to build one, falling back to the standard credit vertical",
+                            sig.ticker, regime_result.adx, sig.strength,
+                        )
+                if plan is None:
+                    # VOLATILE_TRENDING regime: use a wider spread width to
+                    # capture more premium in elevated-vol conditions (see
+                    # config.risk.volatile_trending_width_dollars). TRENDING
+                    # keeps the standard width (no override).
+                    w_override = config.risk.volatile_trending_width_dollars if regime == Regime.VOLATILE_TRENDING else None
+                    plan = await build_spread(mcp, sig.ticker, sig.direction, spot_price=spot_mid, realized_vol=realized_vol, width_override=w_override)
         except Exception:
             logger.exception(
                 "Failed to build %s for %s",
@@ -642,6 +701,11 @@ async def find_candidates(
         candidates.append({
             "ticker": sig.ticker,
             "strategy": "iron_condor" if is_iron_condor else "vertical",
+            # 'credit' (default) | 'debit' -- see the debit-spread overlay
+            # above / SpreadPlan's own docstring. IronCondorPlan has no
+            # .structure attribute (it's always credit-shaped), hence the
+            # getattr fallback.
+            "structure": getattr(plan, "structure", "credit"),
             # direction/strength/signal_reasoning come from the directional
             # swing signal -- meaningless for an iron condor (it has no
             # directional view by construction), so left None rather than
@@ -758,24 +822,57 @@ async def _pre_trade_check_inner(
         if age > timedelta(minutes=15):
             return False, f"{label} leg quote is {age} old (>15 min) — stale, refusing to trade on it", plan
 
-    fresh_credit = round((short_mid - long_mid) * 100, 2)
-    if fresh_credit <= 0:
-        return False, f"fresh credit is non-positive (${fresh_credit:.2f})", plan
+    # raw_diff = short_mid - long_mid, the same shared formula for both
+    # structures (see spread_builder.build_debit_spread's docstring on why
+    # this is deliberate) -- a positive number is "sane" either way: a
+    # credit spread's short (sold, near-the-money) leg costing more than
+    # its long (bought, far-OTM) leg, or a debit spread's short (bought,
+    # near-the-money) leg costing more than its long (sold, far-OTM) leg.
+    raw_diff = round((short_mid - long_mid) * 100, 2)
+    is_debit = plan.structure == "debit"
 
-    shrink_pct = (plan.credit_estimate - fresh_credit) / plan.credit_estimate
-    if shrink_pct > 0.20:
-        return (
-            False,
-            f"credit shrank {shrink_pct:.0%} (original ${plan.credit_estimate:.2f} → fresh ${fresh_credit:.2f})",
-            plan,
-        )
+    if is_debit:
+        if raw_diff <= 0:
+            return False, f"fresh debit is non-positive (${raw_diff:.2f})", plan
+        original_magnitude = -plan.credit_estimate  # original debit paid, positive
+        # For a debit spread, "shrink" would mean the trade got MORE
+        # expensive to enter (bad) -- the mirror image of a credit spread's
+        # credit getting smaller. Reject if the debit paid would GROW more
+        # than 20% versus the original estimate, same tolerance as the
+        # credit-spread shrink check below.
+        growth_pct = (raw_diff - original_magnitude) / original_magnitude if original_magnitude else 0
+        if growth_pct > 0.20:
+            return (
+                False,
+                f"debit grew {growth_pct:.0%} (original ${original_magnitude:.2f} → fresh ${raw_diff:.2f})",
+                plan,
+            )
+        width_dollars = abs(plan.short_strike - plan.long_strike) * 100
+        if raw_diff >= width_dollars:
+            # Same sanity check as spread_builder.build_debit_spread — a
+            # fresh requote can hit this too, not just the initial build.
+            return False, f"fresh debit (${raw_diff:.2f}) is >= the ${width_dollars:.2f} strike width, refusing to trade", plan
+        fresh_credit_estimate = round(-raw_diff, 2)
+        updated_max_loss = round(raw_diff, 2)
+    else:
+        if raw_diff <= 0:
+            return False, f"fresh credit is non-positive (${raw_diff:.2f})", plan
 
-    width_dollars = abs(plan.short_strike - plan.long_strike) * 100
-    updated_max_loss = round(width_dollars - fresh_credit, 2)
-    if updated_max_loss <= 0:
-        # Same sanity check as spread_builder.build_spread — a fresh
-        # requote can hit this too, not just the initial build.
-        return False, f"fresh max_loss is non-positive (${updated_max_loss:.2f}), refusing to trade", plan
+        shrink_pct = (plan.credit_estimate - raw_diff) / plan.credit_estimate
+        if shrink_pct > 0.20:
+            return (
+                False,
+                f"credit shrank {shrink_pct:.0%} (original ${plan.credit_estimate:.2f} → fresh ${raw_diff:.2f})",
+                plan,
+            )
+
+        width_dollars = abs(plan.short_strike - plan.long_strike) * 100
+        updated_max_loss = round(width_dollars - raw_diff, 2)
+        if updated_max_loss <= 0:
+            # Same sanity check as spread_builder.build_spread — a fresh
+            # requote can hit this too, not just the initial build.
+            return False, f"fresh max_loss is non-positive (${updated_max_loss:.2f}), refusing to trade", plan
+        fresh_credit_estimate = raw_diff
 
     # Buying-power floor (2026-08-29, prompted by reviewing a teammate's
     # equivalent gate): equity alone doesn't say collateral is actually
@@ -801,8 +898,9 @@ async def _pre_trade_check_inner(
         long_strike=plan.long_strike,
         short_symbol=plan.short_symbol,
         long_symbol=plan.long_symbol,
-        credit_estimate=fresh_credit,
+        credit_estimate=fresh_credit_estimate,
         max_loss=updated_max_loss,
+        structure=plan.structure,
     )
 
     today = now.date()
@@ -1241,20 +1339,43 @@ async def run_cycle() -> None:
                     # polled client.get_order() until a real fill, cancel-
                     # and-raise on timeout -- reaching here means it filled
                     # for real. Use the REAL fill credit, not the pre-trade
-                    # estimate, for what gets recorded. width_x100 is
-                    # implicit from the plan's own already-consistent
-                    # max_loss/credit_estimate (max_loss = width*100 -
-                    # credit by construction in spread_builder.py), so this
-                    # doesn't need to re-derive width from strikes.
+                    # estimate, for what gets recorded.
                     credit_received = plan.credit_estimate
                     max_loss_recorded = plan.max_loss
+                    is_debit_plan = not is_iron_condor and plan.structure == "debit"
                     if order.fill_credit is None:
                         logger.warning(
                             "%s %s filled but no real fill price could be parsed from the order "
                             "response -- recording the pre-trade estimate instead",
                             plan.underlying, plan.direction,
                         )
+                    elif is_debit_plan:
+                        # For a debit spread, order.fill_credit already comes
+                        # back NEGATIVE (see executor_mcp.open_spread's own
+                        # docstring: _extract_filled_avg_price sums real
+                        # sell-credits minus real buy-debits, and a debit
+                        # open buys the near-the-money leg) -- its magnitude
+                        # IS the real max_loss directly, no width re-
+                        # derivation needed (unlike the credit-spread branch
+                        # below, where max_loss = width - credit).
+                        real_debit_paid = -order.fill_credit
+                        if real_debit_paid <= 0:
+                            logger.error(
+                                "%s %s real fill implies a non-positive debit paid ($%.2f) -- "
+                                "recording the pre-trade estimate instead rather than a "
+                                "nonsensical number (position is real either way, this only "
+                                "affects what's recorded)",
+                                plan.underlying, plan.direction, real_debit_paid,
+                            )
+                        else:
+                            credit_received = order.fill_credit
+                            max_loss_recorded = real_debit_paid
                     else:
+                        # width_x100 is implicit from the plan's own already-
+                        # consistent max_loss/credit_estimate (max_loss =
+                        # width*100 - credit by construction in
+                        # spread_builder.py), so this doesn't need to
+                        # re-derive width from strikes.
                         width_x100 = plan.max_loss + plan.credit_estimate
                         real_max_loss = width_x100 - order.fill_credit
                         if real_max_loss <= 0:
@@ -1307,13 +1428,19 @@ async def run_cycle() -> None:
                                 cycle_id=cycle_id,
                                 generation=_current_generation,
                                 strategy="vertical",
+                                structure=plan.structure,
                             )
                     except Exception:
                         logger.exception("Failed to record spread open to DB (order already sent to Alpaca)")
+                    # credit_received is NEGATIVE for a debit spread (this
+                    # project's storage convention) -- labeled and shown as
+                    # its positive magnitude here so the note reads
+                    # naturally either way, rather than "credit $-336.00".
+                    premium_label = "debit paid" if is_debit_plan else "credit"
                     open_notes.append(
                         f"Opened {plan.underlying} {plan.direction} x{contracts} contract(s): "
-                        f"credit ${credit_received * contracts:.2f} total "
-                        f"(${credit_received:.2f}/contract), "
+                        f"{premium_label} ${abs(credit_received) * contracts:.2f} total "
+                        f"(${abs(credit_received):.2f}/contract), "
                         f"max loss ${max_loss_recorded * contracts:.2f} total"
                     )
                     decision = "opened"

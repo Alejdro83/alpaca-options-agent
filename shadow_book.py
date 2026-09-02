@@ -82,6 +82,19 @@ def record_open(
 
     Returns the new row id, or None on failure (non-fatal).
     """
+    # Debit-spread candidates (2026-09-02 overlay) are skipped here rather
+    # than mirrored: `shadow_positions` has no `structure` column, and
+    # manage_open below reads marks/should_close with the credit-spread
+    # convention hardcoded (mirrors_get_spread_mark's default) -- opening
+    # one here would silently mismark it (proceeds read as a cost), the
+    # same class of gap iron condors would have hit before this module's
+    # own strategy-branching was added. This module never touches the real
+    # trading path either way (see module docstring) -- a missing shadow/
+    # random/mirror row for one candidate is a small, honest gap in the
+    # comparison, not a real-money risk.
+    if getattr(plan, "structure", "credit") == "debit":
+        logger.info("Shadow book: skipping debit-spread candidate %s (not yet supported here)", plan.underlying)
+        return None
     is_iron_condor = plan.direction == "iron_condor"
 
     if is_iron_condor:

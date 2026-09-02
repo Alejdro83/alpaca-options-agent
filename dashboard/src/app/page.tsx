@@ -42,6 +42,10 @@ interface DashboardState {
     // short_strike/long_strike/short_symbol/long_symbol above are the PUT
     // side and the call_* fields below are the CALL side.
     strategy: string;
+    // 'credit' (default) | 'debit' (alpaca_hackathon_schema_debit.sql,
+    // 2026-09-02). For 'debit', credit_received is NEGATIVE (the debit
+    // paid) and short_strike/short_symbol mean the leg the bot BOUGHT.
+    structure: string;
     call_short_strike: number | null;
     call_long_strike: number | null;
     call_short_symbol: string | null;
@@ -98,20 +102,37 @@ function isIronCondor(s: SpreadRow): boolean {
   return s.strategy === 'iron_condor' || s.direction === 'iron_condor';
 }
 
+// 'debit' structure only exists for 'vertical' -- direction is 'bull_call'/
+// 'bear_put' (see spread_builder.build_debit_spread's docstring).
+function isDebit(s: SpreadRow): boolean {
+  return s.structure === 'debit';
+}
+
 function directionLabel(s: SpreadRow): string {
   if (isIronCondor(s)) return 'Iron Condor';
+  if (s.direction === 'bull_call') return 'bull call';
+  if (s.direction === 'bear_put') return 'bear put';
   return s.direction === 'bull_put' ? 'bull put' : 'bear call';
 }
 
-// Small badge so an iron condor row is unmistakable at a glance next to the
-// existing directional vertical spreads.
+// Small badge so an iron condor / debit spread row is unmistakable at a
+// glance next to the existing directional credit vertical spreads.
 function StrategyBadge({ s }: { s: SpreadRow }) {
-  if (!isIronCondor(s)) return null;
-  return (
-    <span className="inline-flex items-center rounded-full bg-violet-950 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-violet-400">
-      4-leg
-    </span>
-  );
+  if (isIronCondor(s)) {
+    return (
+      <span className="inline-flex items-center rounded-full bg-violet-950 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-violet-400">
+        4-leg
+      </span>
+    );
+  }
+  if (isDebit(s)) {
+    return (
+      <span className="inline-flex items-center rounded-full bg-amber-950 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-400">
+        debit
+      </span>
+    );
+  }
+  return null;
 }
 
 // A vertical spread has one short/long pair; an iron condor has two (put
@@ -119,10 +140,15 @@ function StrategyBadge({ s }: { s: SpreadRow }) {
 // columns, call side using the new call_* columns) — show all 4 legs.
 function SpreadLegs({ s }: { s: SpreadRow }) {
   if (!isIronCondor(s)) {
+    // credit_received is NEGATIVE for a debit spread (this project's
+    // storage convention) -- shown as its positive magnitude with a
+    // "debit paid" label instead of "credit", so the row reads naturally
+    // either way rather than "credit $-336.00".
+    const premiumLabel = isDebit(s) ? 'debit paid' : 'credit';
     return (
       <p className="text-gray-400 text-xs mt-1">
-        short ${s.short_strike} / long ${s.long_strike} × {s.contracts} — credit $
-        {Number(s.credit_received).toFixed(2)}, max loss ${Number(s.max_loss).toFixed(2)}
+        {isDebit(s) ? 'buy' : 'short'} ${s.short_strike} / {isDebit(s) ? 'sell' : 'long'} ${s.long_strike} × {s.contracts} — {premiumLabel} $
+        {Math.abs(Number(s.credit_received)).toFixed(2)}, max loss ${Number(s.max_loss).toFixed(2)}
       </p>
     );
   }

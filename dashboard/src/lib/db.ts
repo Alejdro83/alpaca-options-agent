@@ -48,6 +48,10 @@ export interface Spread {
   long_strike: number;
   short_symbol: string | null;
   long_symbol: string | null;
+  // 'credit' (default) | 'debit' (alpaca_hackathon_schema_debit.sql, 2026-09-02
+  // debit-spread overlay). For 'debit', credit_received is NEGATIVE (the
+  // debit paid) and short_strike/short_symbol mean the leg the bot BOUGHT.
+  structure: string;
   contracts: number;
   credit_received: number;
   max_loss: number;
@@ -129,7 +133,7 @@ export async function getDashboardState() {
       ),
       client.query<Spread>(
         `select id, underlying, direction, expiration, short_strike, long_strike,
-                short_symbol, long_symbol, strategy,
+                short_symbol, long_symbol, strategy, structure,
                 call_short_strike, call_long_strike, call_short_symbol, call_long_symbol,
                 contracts, credit_received, max_loss, status, realized_pnl, opened_at, closed_at
          from ${SCHEMA}.spreads order by opened_at desc limit 50`

@@ -256,36 +256,60 @@ def _make_client_order_id(underlying: str, direction: str) -> str:
 async def open_spread(
     mcp: AlpacaMCP, plan: SpreadPlan, contracts: int = 1, *, client=None,
 ) -> OrderResult:
-    """Opens the spread as one multi-leg order (sell short leg, buy long leg
-    simultaneously) — never as two independent legs, which would leave a
-    naked, undefined-risk position if only one leg filled.
+    """Opens the spread as one multi-leg order — never as two independent
+    legs, which would leave a naked, undefined-risk position if only one
+    leg filled.
 
-    Marketable limit: accepts no less than plan.credit_estimate minus
+    For a CREDIT spread (plan.structure == 'credit', the default -- see
+    SpreadPlan's own docstring): sell short leg, buy long leg. Marketable
+    limit: accepts no less than plan.credit_estimate minus
     config.risk.max_entry_slippage_pct (the pre-trade gate already rebuilt
     this from a fresh mid moments earlier).
+
+    For a DEBIT spread (plan.structure == 'debit', 2026-09-02): the roles
+    invert per SpreadPlan's docstring -- BUY short_symbol (the near-the-
+    money leg this project is actually betting on), SELL long_symbol (the
+    further-OTM leg that reduces cost). Marketable limit: pays no more than
+    the debit paid (plan.credit_estimate's magnitude) plus the same
+    slippage tolerance -- reuses limit_debit_price (already used elsewhere
+    in this file to bound a CLOSING debit) since "pay no more than X" is
+    the identical shape of bound either way.
 
     `client` (an AlpacaClient), when given, confirms the fill for real via
     polling before returning — see module docstring. Without one, this
     only confirms the order wasn't immediately rejected, same as before
     2026-08-30 (no caller in this project omits `client` at a real open).
 
-    Returns an OrderResult with the real per-contract fill credit.
+    Returns an OrderResult with the real per-contract fill credit (negative
+    for a debit spread, matching this project's storage convention --
+    _extract_filled_avg_price's sum(credits)-sum(debits) formula already
+    generalizes correctly here since it reads the real `side` sent below,
+    not an assumption about which leg is which).
     """
     short_cid = _make_client_order_id(plan.underlying, plan.direction)
     long_cid = _make_client_order_id(plan.underlying, plan.direction)
-    limit_price = limit_credit_price(plan.credit_estimate)
-    logger.info(
-        "client_order_ids for %s %s: short=%s long=%s limit_credit=%s",
-        plan.underlying, plan.direction, short_cid, long_cid, limit_price,
-    )
+    is_debit = plan.structure == "debit"
+    if is_debit:
+        limit_price = limit_debit_price(-plan.credit_estimate)
+        short_leg = {"symbol": plan.short_symbol, "side": "buy", "ratio_qty": "1", "position_intent": "buy_to_open", "client_order_id": short_cid}
+        long_leg = {"symbol": plan.long_symbol, "side": "sell", "ratio_qty": "1", "position_intent": "sell_to_open", "client_order_id": long_cid}
+        logger.info(
+            "client_order_ids for %s %s (debit): short=%s long=%s limit_debit=%s",
+            plan.underlying, plan.direction, short_cid, long_cid, limit_price,
+        )
+    else:
+        limit_price = limit_credit_price(plan.credit_estimate)
+        short_leg = {"symbol": plan.short_symbol, "side": "sell", "ratio_qty": "1", "position_intent": "sell_to_open", "client_order_id": short_cid}
+        long_leg = {"symbol": plan.long_symbol, "side": "buy", "ratio_qty": "1", "position_intent": "buy_to_open", "client_order_id": long_cid}
+        logger.info(
+            "client_order_ids for %s %s: short=%s long=%s limit_credit=%s",
+            plan.underlying, plan.direction, short_cid, long_cid, limit_price,
+        )
 
     result = await mcp.call(
         "place_option_order",
         {
-            "legs": [
-                {"symbol": plan.short_symbol, "side": "sell", "ratio_qty": "1", "position_intent": "sell_to_open", "client_order_id": short_cid},
-                {"symbol": plan.long_symbol, "side": "buy", "ratio_qty": "1", "position_intent": "buy_to_open", "client_order_id": long_cid},
-            ],
+            "legs": [short_leg, long_leg],
             "qty": str(contracts),
             "order_class": "mleg",
             "type": "limit",
@@ -306,33 +330,71 @@ async def close_spread(
     long_symbol: str,
     contracts: int,
     *,
+    structure: str = "credit",
     max_loss: float | None = None,
     current_mark: float | None = None,
 ) -> list[str]:
-    """Reverses the entry: buy back the short leg, sell the long leg — a
-    single multi-leg order for the same fill-both-or-neither reason as entry.
+    """Reverses the entry — a single multi-leg order for the same fill-both-
+    or-neither reason as entry.
 
-    Marketable limit, bounded either by a fresh mark (mark * (1 +
-    max_entry_slippage_pct), the common case) or, if no mark was available
-    (e.g. a force-close whose quote fetch failed), by the position's own
-    max_loss — a debit above max_loss is never rational since it's strictly
-    worse than just letting the spread expire at its own worst case. One of
-    the two must be given; there is no unbounded fallback.
+    For a CREDIT spread (structure='credit', default, unchanged behavior):
+    buy back the short leg, sell the long leg. Marketable limit, bounded
+    either by a fresh mark (mark * (1 + max_entry_slippage_pct), the common
+    case) or, if no mark was available (e.g. a force-close whose quote
+    fetch failed), by the position's own max_loss — a debit above max_loss
+    is never rational since it's strictly worse than just letting the
+    spread expire at its own worst case.
+
+    For a DEBIT spread (structure='debit', 2026-09-02): roles invert per
+    SpreadPlan's docstring — sell_to_close the short leg (this project
+    owned it), buy_to_close the long leg (this project was short it). This
+    is a net SELL, not a net buy — `current_mark` here means PROCEEDS
+    received from closing (see executor_mcp.get_spread_mark's structure
+    param / risk_gate.should_close's debit branch), so the marketable limit
+    must accept no LESS than current_mark (the mirror image of the credit-
+    spread bound above) — reuses limit_credit_price for exactly that
+    "accept no less than X" shape, not limit_debit_price. Without a fresh
+    mark (e.g. a force-close whose quote fetch failed), max_loss (the
+    original debit paid) is NOT a usable floor on proceeds the way it is a
+    usable ceiling on a credit spread's cost to close -- there is no
+    equivalent worst-case bound to fall back to, so this accepts a nominal
+    $0.01 instead, effectively a market sell: getting out at an uncertain
+    price beats not getting out at all when the position must close
+    regardless (force-close only fires on an unconditional deadline, not a
+    profit/loss judgment call this price could get wrong).
+
+    One of current_mark/max_loss must be given; there is no unbounded
+    fallback, for either structure.
     """
-    if current_mark is not None:
+    if structure == "debit":
+        if current_mark is not None:
+            limit_price = limit_credit_price(current_mark)
+        elif max_loss is not None:
+            limit_price = "0.01"
+        else:
+            raise ValueError("close_spread needs current_mark or max_loss to bound the limit price")
+    elif current_mark is not None:
         limit_price = limit_debit_price(current_mark)
     elif max_loss is not None:
         limit_price = limit_debit_price(max_loss, slippage_pct=0.0)
     else:
         raise ValueError("close_spread needs current_mark or max_loss to bound the limit price")
 
+    if structure == "debit":
+        legs = [
+            {"symbol": short_symbol, "side": "sell", "ratio_qty": "1", "position_intent": "sell_to_close"},
+            {"symbol": long_symbol, "side": "buy", "ratio_qty": "1", "position_intent": "buy_to_close"},
+        ]
+    else:
+        legs = [
+            {"symbol": short_symbol, "side": "buy", "ratio_qty": "1", "position_intent": "buy_to_close"},
+            {"symbol": long_symbol, "side": "sell", "ratio_qty": "1", "position_intent": "sell_to_close"},
+        ]
+
     result = await mcp.call(
         "place_option_order",
         {
-            "legs": [
-                {"symbol": short_symbol, "side": "buy", "ratio_qty": "1", "position_intent": "buy_to_close"},
-                {"symbol": long_symbol, "side": "sell", "ratio_qty": "1", "position_intent": "sell_to_close"},
-            ],
+            "legs": legs,
             "qty": str(contracts),
             "order_class": "mleg",
             "type": "limit",
@@ -476,9 +538,20 @@ async def get_iron_condor_mark(
     return round((put_side_debit + call_side_debit) * 100, 2)
 
 
-async def get_spread_mark(mcp: AlpacaMCP, short_symbol: str, long_symbol: str) -> float | None:
-    """Current cost to close (debit), for risk_gate.should_close. Real
-    response shape: `{"data": {"snapshots": {symbol: {"latestQuote": {"bp":
+async def get_spread_mark(mcp: AlpacaMCP, short_symbol: str, long_symbol: str, structure: str = "credit") -> float | None:
+    """For a CREDIT spread (structure='credit', default, unchanged
+    behavior): current COST to close it — buy back short_symbol at its ask,
+    sell long_symbol at its bid — for risk_gate.should_close's credit
+    branch.
+
+    For a DEBIT spread (structure='debit', 2026-09-02): current PROCEEDS
+    from closing it — sell short_symbol (this project owns it) at its bid,
+    buy back long_symbol (this project is short it) at its ask — the
+    mirror image, for risk_gate.should_close's debit branch. Formula is
+    literally `short_bid - long_ask` instead of `short_ask - long_bid`,
+    same two quotes, opposite sides used.
+
+    Real response shape: `{"data": {"snapshots": {symbol: {"latestQuote": {"bp":
     ..., "ap": ...}}}}}` — verified against the live account 2026-08-26,
     same camelCase/nested shape spread_builder.py's `_mid_from_snapshot` uses.
     """
@@ -491,6 +564,12 @@ async def get_spread_mark(mcp: AlpacaMCP, short_symbol: str, long_symbol: str) -
     long_q = snap_by_symbol.get(long_symbol, {}).get("latestQuote", {})
     if not short_q or not long_q:
         return None
+    if structure == "debit":
+        short_bid = short_q.get("bp")
+        long_ask = long_q.get("ap")
+        if short_bid is None or long_ask is None:
+            return None
+        return round((float(short_bid) - float(long_ask)) * 100, 2)
     short_ask = short_q.get("ap")
     long_bid = long_q.get("bp")
     if short_ask is None or long_bid is None:

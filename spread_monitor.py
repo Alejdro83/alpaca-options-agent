@@ -132,10 +132,24 @@ class SpreadMonitor:
         # target/stop between cron ticks, but correct, which matters more.
         # TODO: extend this monitor with real 4-leg support so iron condors
         # get the same sub-cron reaction time verticals do.
-        self._spreads = [s for s in all_spreads if s.get("strategy") != "iron_condor"]
+        # Same reasoning excludes debit spreads (2026-09-02, added
+        # alongside the debit-spread overlay): _compute_mark/should_close
+        # here are hardcoded to the credit-spread convention (cost to close
+        # = short_ask - long_bid, mark shrinking toward 0 = profit). A
+        # debit spread's mark means the opposite (proceeds from closing,
+        # see executor_mcp.get_spread_mark's structure param) -- treating
+        # one as the other here would misread a real position's P&L
+        # exactly like the iron-condor 4-leg gap above, just via a sign/
+        # formula mismatch instead of a missing leg. Left to bot.py's
+        # 15-min cron (manage_open_spreads, already fully structure-aware)
+        # rather than rushing debit support into this always-on service.
+        self._spreads = [
+            s for s in all_spreads
+            if s.get("strategy") != "iron_condor" and s.get("structure", "credit") != "debit"
+        ]
         skipped = len(all_spreads) - len(self._spreads)
         if skipped:
-            logger.info("Skipping %d iron condor spread(s) -- managed by the 15-min cron instead", skipped)
+            logger.info("Skipping %d iron condor/debit spread(s) -- managed by the 15-min cron instead", skipped)
 
         new_symbols = self._all_leg_symbols() - self._subscribed
         if not new_symbols:
