@@ -2445,3 +2445,84 @@ class TestDebitSpreadOverlayRouting:
         assert mock_debit.await_count == 0
         assert len(candidates) == 1
         assert candidates[0]["structure"] == "credit"
+
+
+# ===================================================================
+# 25. DYNAMIC IRON CONDOR WIDTH BY PRICE (added 2026-09-02)
+# ===================================================================
+# Real gap found analyzing production logs: 41 real iron condor
+# rejections against the 33% min-credit-to-width floor, 40 of them NVDA,
+# credit/width never exceeding 23% -- always at the flat $5 default width.
+# A real backtest (tastylive, cited via optionstradingiq.com) found a
+# fixed $5 width unprofitable long-run for underlyings $100+, recommending
+# +$5 width per +$100 of underlying price.
+
+class TestDynamicIronCondorWidth:
+    def test_formula_at_various_prices(self):
+        from spread_builder import _dynamic_iron_condor_width
+        assert _dynamic_iron_condor_width(50.0) == 5.0
+        assert _dynamic_iron_condor_width(99.99) == 5.0
+        assert _dynamic_iron_condor_width(100.0) == 10.0
+        assert _dynamic_iron_condor_width(150.0) == 10.0
+        assert _dynamic_iron_condor_width(200.0) == 15.0
+        assert _dynamic_iron_condor_width(219.0) == 15.0  # real NVDA price 2026-09-02
+        assert _dynamic_iron_condor_width(300.0) == 20.0
+
+    @pytest.mark.asyncio
+    async def test_build_iron_condor_uses_dynamic_width_for_a_high_priced_underlying(self):
+        """Spot=$219 (real NVDA) must select strikes ~$15 apart, not the
+        flat $5 default -- verified by inspecting the actual strikes
+        picked, not just that a plan was returned. target_delta=0.20 (this
+        project's real IC delta range, not 0.50) so the short put/call
+        land on opposite, clearly separated sides of spot -- a 0.50 target
+        would put both short strikes at the same at-the-money strike,
+        which a real iron condor's own inversion guard correctly rejects
+        (that's a straddle, not a condor).
+        """
+        from spread_builder import build_iron_condor, _contract_cache
+        _contract_cache.clear()
+
+        today = date.today()
+        exp = (today + timedelta(days=10)).isoformat()
+        spot = 219.0
+        # Real BS deltas at spot=219, dte=10, vol=0.30: put 210=-0.1855 (short,
+        # closest to 0.20), put 195=-0.0085 (long, exactly 15 away). Call
+        # 230=0.1743 (short), call 245=0.0136 (long, exactly 15 away).
+        put_contracts = [
+            make_option_contract("NVDA260905P00210000", 210.0, "put", exp, 500),
+            make_option_contract("NVDA260905P00195000", 195.0, "put", exp, 500),
+        ]
+        call_contracts = [
+            make_option_contract("NVDA260905C00230000", 230.0, "call", exp, 500),
+            make_option_contract("NVDA260905C00245000", 245.0, "call", exp, 500),
+        ]
+        snap_by_symbol = {
+            "NVDA260905P00210000": make_quote(bid=3.00, ask=3.10),
+            "NVDA260905P00195000": make_quote(bid=0.30, ask=0.36),
+            "NVDA260905C00230000": make_quote(bid=2.80, ask=2.90),
+            "NVDA260905C00245000": make_quote(bid=0.25, ask=0.31),
+        }
+
+        def fake_contracts(mcp, ticker, opt_type, min_exp, max_exp):
+            return put_contracts if opt_type == "put" else call_contracts
+
+        mcp = FakeMCP()
+        mcp.set_response("get_option_snapshot", make_snapshot_response(snap_by_symbol))
+
+        with patch("spread_builder._fetch_contracts", side_effect=fake_contracts):
+            result = await build_iron_condor(mcp, "NVDA", spot_price=spot, realized_vol=0.30, target_delta_override=0.20)
+
+        assert result is not None
+        assert result.short_put_strike == 210.0
+        assert result.short_call_strike == 230.0
+        assert abs(result.short_put_strike - result.long_put_strike) == 15.0
+        assert abs(result.short_call_strike - result.long_call_strike) == 15.0
+        assert result.long_put_symbol == "NVDA260905P00195000"
+        assert result.long_call_symbol == "NVDA260905C00245000"
+        # Credit collected ($529) clears the 33% floor on the WIDER $1500
+        # notional ($500 min) -- the exact real-world gap this fix targets
+        # (at the old flat $5/$500 width, the analogous 33% floor is $166.67,
+        # a bar these same option prices would still clear, but real NVDA
+        # candidates at that width never did -- this asserts the mechanism,
+        # not a specific historical case).
+        assert result.credit_estimate >= 500.0

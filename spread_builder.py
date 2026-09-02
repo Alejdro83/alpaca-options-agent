@@ -470,6 +470,37 @@ async def build_debit_spread(
     )
 
 
+def _dynamic_iron_condor_width(spot_price: float) -> float:
+    """Iron-condor wing width scaled to the underlying's own price
+    (2026-09-02, research pass — prompted by a real pattern: NVDA's real
+    iron condor candidates never once cleared the 33% min-credit-to-width
+    floor across 41 real rejections, credit/width topping out at 23%,
+    every single one at the fixed $5 default width).
+
+    A real backtest (tastylive, 2013-2024, cited via optionstradingiq.com
+    -- see README for the full citation) found a fixed $5 width was NOT
+    profitable long-run for underlyings priced $100+, and recommended
+    scaling width by +$5 per +$100 of underlying price ($100->$10,
+    $200->$15, $300->$20...) -- tastytrade's own strategy page separately
+    confirms iron condors are meant for elevated-IV entries, not a reason
+    to lower the credit/width floor in a calm market. Reuses
+    config.risk.spread_width_dollars as BOTH the <$100 baseline and the
+    per-$100 step, matching the backtest's own numbers exactly rather than
+    inventing a second, redundant config value.
+
+    Deliberately NOT applied to build_spread's directional verticals --
+    the backtest that motivated this was iron-condor-specific (wing width
+    directly sets the credit/width ratio the 33% floor checks), and
+    VOLATILE_TRENDING verticals already have their own real width override
+    (config.risk.volatile_trending_width_dollars). Not independently
+    verified against this project's own historical data (only the
+    rejection PATTERN that prompted this research was) -- watch real
+    per-generation P&L like every other new threshold in this project.
+    """
+    base = config.risk.spread_width_dollars
+    return base * (1 + int(spot_price // 100))
+
+
 async def build_iron_condor(
     mcp: AlpacaMCP,
     ticker: str,
@@ -484,7 +515,9 @@ async def build_iron_condor(
     trend strength to back a directional bet, so a neutral structure is
     offered instead of forcing one. Reuses every liquidity/delta/strike-
     width rule `build_spread` already applies, independently on each side,
-    via `_select_vertical_leg`.
+    via `_select_vertical_leg` — width itself comes from
+    `_dynamic_iron_condor_width` (scaled to the underlying's price) rather
+    than the flat default every other candidate uses.
 
     Returns None (never a half-built structure) if either side fails its
     liquidity/credit gate, if the two sides can't agree on a common
@@ -493,6 +526,7 @@ async def build_iron_condor(
     `build_spread`.
     """
     limits = config.risk
+    width_override = _dynamic_iron_condor_width(spot_price)
     today = datetime.now(timezone.utc).date()
     min_exp = today + timedelta(days=limits.min_dte)
     max_exp = today + timedelta(days=limits.max_dte)
@@ -539,6 +573,7 @@ async def build_iron_condor(
     put_leg = _select_vertical_leg(
         ticker, "put", put_exp_contracts, snap_by_symbol,
         spot_price, dte_days, realized_vol, is_lower_long=True,
+        width_override=width_override,
         target_delta_override=target_delta_override,
     )
     if put_leg is None:
@@ -546,6 +581,7 @@ async def build_iron_condor(
     call_leg = _select_vertical_leg(
         ticker, "call", call_exp_contracts, snap_by_symbol,
         spot_price, dte_days, realized_vol, is_lower_long=False,
+        width_override=width_override,
         target_delta_override=target_delta_override,
     )
     if call_leg is None:
