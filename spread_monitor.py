@@ -24,6 +24,7 @@ import time
 from datetime import datetime, date, timezone
 from pathlib import Path
 
+import msgpack
 import websockets
 
 import db
@@ -41,7 +42,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-WS_URL = "wss://stream.data.alpaca.markets/v1beta3/indicative"
+WS_URL = "wss://stream.data.alpaca.markets/v1beta1/indicative"
 REFRESH_INTERVAL = 300
 MAX_RECONNECT_DELAY = 60
 
@@ -158,7 +159,7 @@ class SpreadMonitor:
             logger.info("New symbols pending subscription (no active WS yet): %s", new_symbols)
             return
         try:
-            await self._ws.send(json.dumps({"action": "subscribe", "quotes": list(new_symbols)}))
+            await self._ws.send(msgpack.packb({"action": "subscribe", "quotes": list(new_symbols)}))
             self._subscribed.update(new_symbols)
             logger.info("Subscribed to %d new symbol(s): %s", len(new_symbols), new_symbols)
         except Exception:
@@ -202,8 +203,17 @@ class SpreadMonitor:
         long_mid = (lq["bid"] + lq["ask"]) / 2
         return round((short_mid - long_mid) * 100, 2)
 
-    async def _handle_message(self, raw: str) -> None:
-        msgs = json.loads(raw)
+    async def _handle_message(self, raw) -> None:
+        # Alpaca's v1beta1 options stream is msgpack (binary) in BOTH
+        # directions -- the old json.loads path raised UnicodeDecodeError
+        # on the very first data frame (0x91 = msgpack fixarray), and a
+        # JSON auth frame comes back as {'T':'error','code':400,
+        # 'msg':'invalid syntax'} (see _ws_session). Keep a text fallback
+        # here in case a frame ever arrives as a JSON string.
+        if isinstance(raw, (bytes, bytearray)):
+            msgs = msgpack.unpackb(raw, raw=False)
+        else:
+            msgs = json.loads(raw)
         if not isinstance(msgs, list):
             msgs = [msgs]
         for msg in msgs:
@@ -315,7 +325,10 @@ class SpreadMonitor:
             try:
                 async with websockets.connect(WS_URL) as ws:
                     self._ws = ws
-                    auth_msg = json.dumps({
+                    # Alpaca's v1beta1 options stream speaks msgpack both
+                    # ways -- a JSON auth frame comes back as
+                    # {'T':'error','code':400,'msg':'invalid syntax'}.
+                    auth_msg = msgpack.packb({
                         "action": "auth",
                         "key": config.alpaca.api_key,
                         "secret": config.alpaca.secret_key,
@@ -323,7 +336,7 @@ class SpreadMonitor:
                     await ws.send(auth_msg)
 
                     if self._subscribed:
-                        sub_msg = json.dumps({
+                        sub_msg = msgpack.packb({
                             "action": "subscribe",
                             "quotes": list(self._subscribed),
                         })
