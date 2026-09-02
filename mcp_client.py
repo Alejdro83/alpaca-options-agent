@@ -16,6 +16,7 @@ Usage:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from contextlib import AsyncExitStack
@@ -38,6 +39,15 @@ logger = logging.getLogger(__name__)
 # stdio-inheritance path this time). Redirecting it to a file closes that
 # path too.
 _MCP_STDERR_LOG = Path(__file__).resolve().parent / "state" / "mcp_server.log"
+
+# Alpaca's market-data API rate-limits (HTTP 429) under load: one screening
+# cycle fans get_option_snapshot out across dozens of candidates and trips
+# it (first seen 2026-09-02, ~19:00 UTC, on repeated SMCI snapshot calls).
+# The MCP server surfaces the 429 as a tool *error*, not an exception, so
+# retry it here with exponential backoff. Bounded — a genuine sustained
+# outage still fails the cycle cleanly rather than hanging it.
+_RATE_LIMIT_RETRIES = 4
+_RATE_LIMIT_BASE_DELAY = 1.0  # seconds; 1, 2, 4 between the 4 attempts
 
 
 class AlpacaMCP:
@@ -85,10 +95,23 @@ class AlpacaMCP:
         """
         assert self.session is not None, "call() used outside `async with`"
         logger.info("MCP call: %s(%s)", tool, arguments)
-        result = await self.session.call_tool(tool, arguments)
-        if result.is_error:
+
+        for attempt in range(_RATE_LIMIT_RETRIES):
+            result = await self.session.call_tool(tool, arguments)
+            if not result.is_error:
+                break
             text = "; ".join(getattr(c, "text", str(c)) for c in result.content)
-            raise RuntimeError(f"Alpaca MCP tool '{tool}' failed: {text}")
+            is_rate_limit = "429" in text or "rate limit" in text.lower()
+            if not is_rate_limit or attempt == _RATE_LIMIT_RETRIES - 1:
+                suffix = f" after {attempt + 1} attempts" if is_rate_limit else ""
+                raise RuntimeError(f"Alpaca MCP tool '{tool}' failed{suffix}: {text}")
+            delay = _RATE_LIMIT_BASE_DELAY * (2 ** attempt)
+            logger.warning(
+                "MCP tool '%s' rate-limited (429), retrying in %.1fs (attempt %d/%d)",
+                tool, delay, attempt + 1, _RATE_LIMIT_RETRIES - 1,
+            )
+            await asyncio.sleep(delay)
+
         texts = [c.text for c in result.content if getattr(c, "text", None)]
         if not texts:
             return None
