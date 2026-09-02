@@ -77,29 +77,45 @@ _LEG_ROLES = {
 
 def _leg_consistency_issues(spreads: list[dict[str, Any]], positions: list[dict[str, Any]]) -> list[str]:
     by_symbol = {p["symbol"]: p for p in positions}
-    issues: list[str] = []
+
+    # Aggregate the expected NET signed position per leg symbol across ALL
+    # open rows before comparing to the broker. The same structure can
+    # legitimately be opened more than once (2026-09-02: two identical
+    # 4-lot SMCI bear calls, cycles 208 and 210 -- separate fills, order
+    # ids and rows) and Alpaca nets them into one position per symbol.
+    # The old check compared each row's `contracts` against the broker's
+    # *total* for that symbol and so false-positived on every row after
+    # the first, hard-blocking new entries for hours. A signed sum (short
+    # leg = -n, long leg = +n) also still catches a leg that ended up on
+    # the wrong side, which a bare magnitude check would miss.
+    expected_signed: dict[str, float] = {}
+    rows_for_symbol: dict[str, list[str]] = {}
     for s in spreads:
-        expected_contracts = int(s.get("contracts") or 1)
-        label = s.get("id", s.get("underlying", "?"))
-        for col, expected_side in _LEG_ROLES.items():
+        n = int(s.get("contracts") or 1)
+        label = str(s.get("id", s.get("underlying", "?")))
+        for col, role in _LEG_ROLES.items():
             symbol = s.get(col)
             if not symbol:
                 continue
-            pos = by_symbol.get(symbol)
-            if pos is None:
-                continue  # already reported as a phantom leg above
-            actual_side = str(pos.get("side") or "")
-            if actual_side != expected_side:
-                issues.append(
-                    f"spread #{label} {symbol} ({col}): expected side "
-                    f"'{expected_side}', broker says '{actual_side}'"
-                )
-            actual_qty = abs(float(pos.get("qty") or 0))
-            if actual_qty != expected_contracts:
-                issues.append(
-                    f"spread #{label} {symbol} ({col}): DB says "
-                    f"{expected_contracts} contract(s), broker says {actual_qty}"
-                )
+            expected_signed[symbol] = expected_signed.get(symbol, 0.0) + (-n if role == "short" else n)
+            rows_for_symbol.setdefault(symbol, []).append(f"#{label}")
+
+    issues: list[str] = []
+    for symbol, expected in expected_signed.items():
+        pos = by_symbol.get(symbol)
+        if pos is None:
+            continue  # phantom leg, already reported above
+        actual = float(pos.get("qty") or 0)
+        # Some SDK versions hand back an unsigned qty through the wrapper;
+        # fall back to the explicit side field to restore the sign.
+        if actual > 0 and str(pos.get("side") or "") == "short":
+            actual = -actual
+        if actual != expected:
+            rows = ", ".join(rows_for_symbol[symbol])
+            issues.append(
+                f"{symbol} (spread {rows}): DB expects net {expected:+g} "
+                f"contract(s), broker holds {actual:+g}"
+            )
     return issues
 
 
