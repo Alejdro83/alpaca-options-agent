@@ -40,6 +40,7 @@ from evolution_config import (
 
 import black_scholes
 import db
+import quiet_market_report
 
 logger = logging.getLogger(__name__)
 
@@ -740,6 +741,19 @@ def run_evolution(dry_run: bool = False) -> None:
     seed = int(today.strftime("%Y%m%d"))
     logger.info("Starting overnight evolution for %s (seed=%d)%s", today, seed, " [DRY RUN]" if dry_run else "")
 
+    # Quiet-market diagnostic (2026-09-02, report-only -- see
+    # quiet_market_report.py's own module docstring): piggybacks on this
+    # same nightly dry-run cron/Discord message rather than a new one.
+    # Only computed for dry_run since that's the only path that prints to
+    # Discord at all; returns None (nothing appended below) on any real
+    # trade day.
+    quiet_market_summary: str | None = None
+    if dry_run:
+        try:
+            quiet_market_summary = quiet_market_report.check_quiet_market_day(today)
+        except Exception:
+            logger.exception("Quiet-market check failed (non-fatal, independent of evolution itself)")
+
     # 0. AUTO-REVERT CHECK (Layer 2) -- runs every night regardless of
     # whether there's anything to evolve from tonight; a promoted
     # generation's real performance can only be judged by real trades
@@ -762,7 +776,10 @@ def run_evolution(dry_run: bool = False) -> None:
     if not candidates:
         logger.warning("0 trades/candidates today — skipping evolution")
         if dry_run:
-            print(f"🌙 Evolution dry-run — {today.isoformat()}: 0 candidates today, nothing to evolve from.")
+            msg = f"🌙 Evolution dry-run — {today.isoformat()}: 0 candidates today, nothing to evolve from."
+            if quiet_market_summary:
+                msg += "\n\n" + quiet_market_summary
+            print(msg)
         return
 
     logger.info("Collected %d unique candidates from %d journal entries", len(candidates), len(data["journal"]))
@@ -850,7 +867,7 @@ def run_evolution(dry_run: bool = False) -> None:
         # into a chat message (the full report has run well past
         # Discord's 2000-char single-message limit in testing).
         best_pnl = promoted_result["simulated_pnl"] if promoted_result else incumbent_result["simulated_pnl"]
-        print(
+        msg = (
             f"🌙 Evolution dry-run — {today.isoformat()} [{decision.upper()}]\n"
             f"{reason}\n"
             f"Incumbent sim P&L: ${incumbent_result['simulated_pnl']:.2f} -> "
@@ -859,6 +876,13 @@ def run_evolution(dry_run: bool = False) -> None:
             f"{(promoted_result or incumbent_result)['would_have_opened']} would-open trades)\n"
             f"Full report: state/evolution_report_dryrun.md on MSA2"
         )
+        # Candidates existing (enough to reach this point) doesn't imply a
+        # real trade happened -- the LLM may have selected none, or a pick
+        # may have failed the final pre-trade re-check. Same quiet-market
+        # summary either way.
+        if quiet_market_summary:
+            msg += "\n\n" + quiet_market_summary
+        print(msg)
 
 
 if __name__ == "__main__":
