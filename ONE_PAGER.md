@@ -172,36 +172,53 @@ overclaiming:
 
 ## Results
 
-*Real numbers as of the last recorded snapshot (2026-09-02 23:53 UTC) plus
-a live check the morning of 2026-09-03, ahead of today's session.*
+*Real numbers as of the 2026-09-03 market-close snapshot (20:56 UTC). This
+is a handful of live paper-trading days on a freshly reset account, not a
+full week — treat it as directional, not a result.*
 
 **This submission (bot juzgado):**
 - Starting equity: $100,000 (2026-08-30 reset)
-- Equity as of 2026-09-02 23:53 UTC: $99,951.20 (-0.05%); live check
-  2026-09-03 morning: $99,950.65
-- 180 cycles run, 180 decision-journal entries
-- Spreads opened: 2 (both SMCI credit verticals, 4 contracts each) — 0
-  profitable, 2 stopped out (-$40 each, -$80 total), 0 open at last
-  snapshot
-- Root cause identified this week: the credit-to-width entry floor
-  (`MIN_VERTICAL_CREDIT_TO_WIDTH_PCT`) was calibrated too strict for the
-  current delta/width combination, throttling entries near zero; loosened
-  0.10 → 0.05 the morning of 2026-09-03, ahead of today's session (real
-  fix — delta or width — flagged as a post-hackathon question, not
-  resolved by this loosening alone)
-- Shadow-book ablation (same gate-approved candidates, several policies run
-  in parallel from cycle 1, virtual mark-to-market P&L): mechanical rule
-  baseline +$38 (31 virtual positions), LLM-no-stop +$18 (2 positions),
-  LLM-tight-stop -$20 (2 positions), random baseline unresolved (2 open).
-  Too few decision cycles for a significant read yet — presented as an
-  honest in-progress ablation, not a conclusion.
+- Equity 2026-09-03 close: **$99,319.65** — **-0.68%** since the reset,
+  **-0.63% on the day** (-$631, of which -$438 realized, ~-$193 open
+  mark-to-market)
+- 257 cycles run
+- 11 spreads opened: **1 closed for profit (+$102, AAPL bull put — the
+  first real in-market fill *and* close since the reset)**, 7 stopped out
+  (-$620 total), 3 still open (2 AAPL bull puts, 1 UBER bear call).
+  Realized to date: **-$518**
+- The -$620 of stops is concentrated: **5 of the 7 were bear-call spreads
+  on the *same* name (CRWD) on 2026-09-03**, re-entered cycle after cycle
+  as the stock kept rising against the short call (-$540). Root cause: the
+  gate had a duplicate-*position* check but nothing stopped it re-proposing
+  the same underlying+direction right after a stop. Fixed the same
+  afternoon — a post-stop re-entry cooldown (blocks that underlying+
+  direction for 240 min; iron condors keyed separately). A second fix that
+  day closed a path where a spread could get stuck failing to close.
+- Two entry-throttle fixes on 2026-09-03 (a stock-price and volume filter
+  carried over from the equities strategy, plus the vertical
+  credit-to-width floor loosened 0.10 → 0.05) took screening from ~30 to
+  ~150 candidates a cycle and got the bot actually trading — the real
+  lever for the credit floor (delta vs. width) is still a tagged,
+  post-hackathon question, not resolved by the loosening alone.
+- Shadow-book ablation (same gate-approved candidates, several policies as
+  virtual positions with real mark-to-market P&L): still mostly open and
+  too small to read. Realized so far — mechanical baseline -$189 (44
+  closed of 130), LLM-no-stop +$150 (3 of 11), LLM-tight-stop -$350 (11 of
+  11), random +$140 (5 of 11) — with large open marks against all of
+  them. Presented as an honest in-progress ablation, not a conclusion.
 
 **Paco (zeroclaw, decide-then-gate architecture):**
-- Starting equity: $100,000; equity as of 2026-09-03 morning: $99,908.76
-- 4 orders passed the risk-gate proxy (3 open, 1 closed) — two MSFT
-  verticals and one AAPL iron condor — every one accepted by the exact
-  same `risk_gate.check_new_spread` this submission uses, despite having
-  no pre-built candidate menu to select from.
+- Starting equity: $100,000; equity 2026-09-03 close: $99,908.76 (-0.09%)
+- **One** spread opened since the reset: a MSFT bull put (credit $68),
+  accepted by the exact same `risk_gate.check_new_spread` this submission
+  uses despite Paco having no pre-built candidate menu — closed at -$91 by
+  the independent reconcile job. No trades since.
+- The reason it hasn't traded more is friction, not risk: on 2026-09-03,
+  of ~69 cron ticks, 21 skipped because a previous turn's lock was still
+  held and 6 timed out — the agent was doing per-option Black-Scholes math
+  inline and running out of its cycle budget. A batch regime-classification
+  fix was deployed ~20:20 UTC that day, too late in the session to confirm;
+  it's the thing to watch in the 2026-09-04 session.
 
 **rookieriot (teammate Will, verticals-only):** a separate account and
 codebase run day-to-day by Will — not this repo's numbers to report here.
