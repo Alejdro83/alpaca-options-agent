@@ -17,9 +17,10 @@ is the variable we wanted to isolate:
 |---|---|---|---|
 | Repo | this one (`alpaca-options-agent`) | vendored under [`paco/`](../paco/) (runs on the zeroclaw agent framework, not from this repo) | [github.com/massemolle/Alpaca-Trading-rookieriot](https://github.com/massemolle/Alpaca-Trading-rookieriot) |
 | Decision layer | **deterministic `risk_gate.py` first**, then an LLM picks among the survivors and can never override the gate | **LLM runs the whole cycle end to end** — screen, classify regime, choose structure, size, place — with *no* deterministic decision layer in the agent itself | independent build by a teammate; its own reasoner (incl. a headless-Claude-Code mode) over the same signal modules |
+| LLM | `mimo-v2.5-pro` (OpenAI-compatible endpoint) — but swappable; the model only *selects* from a pre-vetted menu, so results are relatively model-robust | `mimo-v2.5-pro` — but swappable; the model does *all* the judgement, so this arm is the one whose results should track model capability most | teammate's choice (incl. headless Claude Code) |
 | Risk backstop | in-process, in `risk_gate.check_new_spread`, before any candidate reaches the model | **external** — an MCP proxy (`mcp_risk_proxy/`, not in this repo) intercepts every `place_option_order` and runs the **same** `risk_gate.check_new_spread` | its own gate, plus infra/robustness fixes shared both ways (limit orders, reconciliation, fail-closed checks) |
 | Account | `PA36EFWLOWRF` (this is the submission-form account) | its own dedicated $100k paper account | its own dedicated $100k paper account |
-| Schedule | Hermes cron, ~30 min, market hours | zeroclaw cron, ~10 min, market hours | teammate's own scheduling |
+| Schedule | Hermes cron, adaptive 2–30 min, market hours | zeroclaw cron, adaptive (~10 min base), market hours | teammate's own scheduling |
 | State / dashboard | Supabase `alpaca_hackathon` → [live dashboard](https://alpaca-agent-dashboard.vercel.app) | Supabase `zeroclaw_trading` → same dashboard | teammate's own instrumentation |
 
 **Live 3-way comparison:** the dashboard's
@@ -80,6 +81,17 @@ So Paco tests the opposite hypothesis to ours: **how far does an LLM get
 running the full loop autonomously, when the only hard rules live in a
 proxy it cannot see or edit?**
 
+Paco currently runs on **`mimo-v2.5-pro`** over an OpenAI-compatible
+endpoint, but nothing about the design is tied to that model — any
+capable model can be dropped in. Because Paco has no deterministic
+scaffold catching a weak judgement call (the proxy blocks *unsafe*
+trades, never *unwise* ones), we'd expect its performance to move with
+model capability more than either other arm's — the judged bot's LLM only
+ranks a menu the code already built, so a weaker model there degrades
+selection but not the structure, strikes, or risk. That expectation is
+part of what the comparison is set up to probe; it isn't something we've
+benchmarked across models yet.
+
 `paco/` contents:
 
 | Path | Role |
@@ -138,6 +150,11 @@ net-contracts reconcile fix, a "wrong account" guard).
 
 - It is **days** of live paper data on **one** account each — directional,
   not statistically significant, and we say so on the dashboard.
+- The judged bot's nightly parameter-evolution job runs **report-only**
+  for the judged week — it never self-modifies while being scored; a real
+  promotion is manual.
+- The "a stronger model should help the autonomous arm most" claim is an
+  expectation from the architecture, not a cross-model benchmark.
 - Only `PA36EFWLOWRF` is the judged entry. Paco and rookieriot are
   comparison arms that make the "why this decision-layer design" argument
   concrete; they are not separate contest submissions.

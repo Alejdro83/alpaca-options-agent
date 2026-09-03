@@ -108,6 +108,11 @@ cluster caps, a credit-to-width floor, a post-stop re-entry cooldown.
 > unvalidated starting point that a nightly evolution job watches — and
 > that job runs **report-only** during judging. Nothing self-modifies
 > while it's being scored.
+>
+> All three run MIMO 2.5 Pro today, but the model is swappable — and the
+> comparison itself predicts where that matters: the autonomous agent,
+> Paco, should move most with model strength, because it has the least
+> code holding its hand.
 
 ---
 
@@ -161,3 +166,5 @@ cluster caps, a credit-to-width floor, a post-stop re-entry cooldown.
 - Don't imply the evolution job tunes the bot during judging — it's
   dry-run / report-only.
 - Don't overstate the sample — say "a handful of paper-trading days".
+- "A stronger model should trade better on the autonomous arm" is an
+  expectation from the design, not a benchmark — don't say we measured it.

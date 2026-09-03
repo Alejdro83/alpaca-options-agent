@@ -71,6 +71,13 @@ Optional add (~10s) if the segment has room:
 > trade it can ask the proxy *why* something would be rejected and adjust.
 > Paco's whole strategy and discipline live in a Markdown file it re-reads
 > every cycle — not in code it can edit.
+>
+> It runs on MIMO 2.5 Pro right now, but the design is model-agnostic —
+> any capable model drops straight in. And since Paco leans on the model
+> for every judgement call, not just the final pick, we'd expect a
+> stronger model to trade better here and a weaker one worse — more than
+> on the deterministic side. That's part of what the comparison is meant
+> to show.
 
 ---
 
@@ -115,7 +122,9 @@ Optional add (~10s) if the segment has room:
 > with the identical risk code as an external veto it can't see or edit.
 > We can measure the difference — our strike selection stays inside a
 > 0.02-0.32 delta band, Paco's is allowed out to 0.45 — and each design
-> caught bugs the other never would.
+> caught bugs the other never would. Both run MIMO 2.5 Pro today, but
+> either could run any model — and Paco, doing all the judgement itself,
+> is where model strength should matter most.
 
 ---
 
@@ -132,6 +141,7 @@ Optional add (~10s) if the segment has room:
 | Paco proxy | a diagram: Paco → `mcp_risk_proxy` → `alpaca-mcp-server`, with `place_option_order` flagged |
 | Paco preview | `assess_spread_risk` output in a log |
 | What we learned | the delta-band numbers; the reconcile fix commit; the "0 trades / timeouts" metrics then the batch-regime fix |
+| Model note | the `mimo-v2.5-pro` config line + a "swap any model" caption |
 | Bridge out | `/compare` |
 
 ## Don't-say list (same rules as the ONE_PAGER)
@@ -145,3 +155,6 @@ Optional add (~10s) if the segment has room:
 - "A handful of paper-trading days", not "a week of results".
 - Paco's account and rookieriot's are comparison arms, not separate
   contest entries — only `PA36EFWLOWRF` is judged.
+- The model claim is an **expectation from the design** ("a stronger
+  model should trade better here"), not a benchmark — we haven't run
+  Paco head-to-head on different models.
