@@ -287,6 +287,8 @@ class SpreadMonitor:
                     short_symbol=spread["short_symbol"],
                     long_symbol=spread["long_symbol"],
                     contracts=spread["contracts"],
+                    current_mark=mark,
+                    max_loss=float(spread["max_loss"]) if spread.get("max_loss") is not None else None,
                 )
             except Exception:
                 logger.exception("Failed to close spread %s", spread_id)

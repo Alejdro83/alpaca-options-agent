@@ -16,7 +16,7 @@ def run_report() -> None:
             )
             journals = cur.fetchall()
     except Exception as exc:
-        print(f"Failed to read decision_journal: {exc}")
+        print(f"Failed to read decision_journal (table may not exist yet): {exc}")
         return
 
     total = len(journals)
