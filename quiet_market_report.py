@@ -25,12 +25,21 @@ message" mistake already found and fixed once in this project
 from __future__ import annotations
 
 import logging
+import os
 from datetime import date
 from pathlib import Path
 
 import db
 
 logger = logging.getLogger(__name__)
+
+# A day counts as "quiet" (worth the diagnostic) if it opened this many real
+# trades OR FEWER. Raised from the original 0 on 2026-09-03: a day that
+# opened 1-2 trades -- especially when they were near-duplicates that both
+# stopped out, as on 2026-09-02 -- is the same "the machinery barely did
+# anything" signal a zero-trade day is, and the point of this report is to
+# surface exactly those days for a human to look at. Env-overridable.
+_QUIET_MARKET_MAX_TRADES = int(os.environ.get("QUIET_MARKET_MAX_TRADES", "2"))
 
 BASE_DIR = Path(__file__).resolve().parent
 REPORT_PATH = "state/quiet_market_report.md"
@@ -75,11 +84,11 @@ def _collect_today(today: date) -> dict:
 
 
 def check_quiet_market_day(today: date) -> str | None:
-    """Returns a short (Discord-safe, a few lines) summary if TODAY
-    produced zero real trades, or None if at least one real position
-    opened today -- stay silent then, matching this project's own
-    "deliver only when something happened" convention rather than a daily
-    "all clear" message nobody needs.
+    """Returns a short (Discord-safe, a few lines) summary if TODAY was a
+    quiet day (<= _QUIET_MARKET_MAX_TRADES real trades opened), or None if
+    it was a normal active day -- stay silent then, matching this project's
+    own "deliver only when something happened" convention rather than a
+    daily "all clear" message nobody needs.
 
     Writes the full breakdown (every real rejection reason seen today,
     verbatim) to state/quiet_market_report.md regardless -- the short
@@ -91,8 +100,9 @@ def check_quiet_market_day(today: date) -> str | None:
         logger.exception("Quiet-market check failed to collect today's data (non-fatal)")
         return None
 
-    if data["spreads"]:
-        return None  # at least one real trade opened today -- nothing to report
+    n_trades = len(data["spreads"])
+    if n_trades > _QUIET_MARKET_MAX_TRADES:
+        return None  # a normal active day -- nothing to report
 
     all_candidates: list = []
     all_gate_rejections: list = []
@@ -105,12 +115,18 @@ def check_quiet_market_day(today: date) -> str | None:
     lines = [
         f"# Quiet-market report — {today.isoformat()}",
         "",
-        f"0 real trades opened today, across {len(data['journal'])} real cycle(s).",
+        f"{n_trades} real trade(s) opened today, across {len(data['journal'])} real cycle(s) "
+        f"(quiet-day threshold: <= {_QUIET_MARKET_MAX_TRADES}).",
         f"- Candidates that reached the LLM step (already passed risk_gate.check_new_spread): {len(all_candidates)}",
         f"- Rejected by the risk gate: {len(all_gate_rejections)}",
         f"- Selected by the LLM but rejected on the final pre-trade re-check: {len(all_pretrade_rejections)}",
         "",
     ]
+    if data["spreads"]:
+        lines.append("## Trades that DID open today")
+        for s in data["spreads"]:
+            lines.append(f"- {s.get('underlying')} @ {s.get('opened_at')}")
+        lines.append("")
     if all_gate_rejections:
         lines.append("## Risk gate rejections (verbatim reasons)")
         for r in all_gate_rejections:
@@ -145,6 +161,6 @@ def check_quiet_market_day(today: date) -> str | None:
         )
 
     return (
-        f"🌙 Mercado tranquilo — {today.isoformat()}: 0 operaciones reales. {detail}. "
+        f"🌙 Mercado tranquilo — {today.isoformat()}: {n_trades} operación(es) real(es). {detail}. "
         f"Detalle completo: state/quiet_market_report.md"
     )
