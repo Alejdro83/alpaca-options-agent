@@ -30,9 +30,9 @@ layer**:
 
 | | Decision layer | Repo | Paper account |
 |---|---|---|---|
-| **Ours (judged)** | deterministic `risk_gate.py` clears candidates first; an LLM picks among the survivors and can never override the gate | this one | `PA36EFWLOWRF` |
-| **Paco (research)** | the LLM runs the whole cycle end to end; its only hard rules live in an external MCP proxy it can't see or edit | vendored read-only under [`paco/`](paco/); runs on the zeroclaw agent framework, not from this repo | `PA34KZNBKA4L` |
-| **rookieriot (independent)** | a teammate's separate build, its own reasoner over the same signal modules | [github.com/massemolle/Alpaca-Trading-rookieriot](https://github.com/massemolle/Alpaca-Trading-rookieriot) | `PA34CFYP0MIZ` |
+| **Credit spreads / iron condors / debit overlay**<br>*(ours — judged)* | deterministic `risk_gate.py` clears candidates first; an LLM picks among the survivors and can never override the gate | this one | `PA36EFWLOWRF` |
+| **LLM end-to-end**<br>*(Paco — research)* | the LLM runs the whole cycle itself; its only hard rules live in an external MCP proxy it can't see or edit | vendored read-only under [`paco/`](paco/); runs on the zeroclaw agent framework, not from this repo | `PA34KZNBKA4L` |
+| **Verticals only**<br>*(rookieriot — independent)* | a teammate's separate build, its own reasoner over the same signal modules | [github.com/massemolle/Alpaca-Trading-rookieriot](https://github.com/massemolle/Alpaca-Trading-rookieriot) | `PA34CFYP0MIZ` |
 
 The dashboard's
 [`/compare`](https://alpaca-agent-dashboard.vercel.app/compare) page

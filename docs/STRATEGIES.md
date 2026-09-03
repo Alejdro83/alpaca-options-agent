@@ -13,7 +13,7 @@ differs is the **decision layer** — the part that turns "here are the
 risk-approved candidates this cycle" into "open this / open nothing". That
 is the variable we wanted to isolate:
 
-| | **Ours — judged** | **Paco — research** | **rookieriot — independent** |
+| | **Credit spreads / iron condors / debit overlay**<br>*(ours — judged)* | **LLM end-to-end**<br>*(Paco — research)* | **Verticals only**<br>*(rookieriot — independent)* |
 |---|---|---|---|
 | Repo | this one (`alpaca-options-agent`) | vendored under [`paco/`](../paco/) (runs on the zeroclaw agent framework, not from this repo) | [github.com/massemolle/Alpaca-Trading-rookieriot](https://github.com/massemolle/Alpaca-Trading-rookieriot) |
 | Decision layer | **deterministic `risk_gate.py` first**, then an LLM picks among the survivors and can never override the gate | **LLM runs the whole cycle end to end** — screen, classify regime, choose structure, size, place — with *no* deterministic decision layer in the agent itself | independent build by a teammate; its own reasoner (incl. a headless-Claude-Code mode) over the same signal modules |
