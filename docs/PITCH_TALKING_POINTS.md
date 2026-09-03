@@ -10,10 +10,11 @@ Read the blockquotes as-is or paraphrase. Durations are spoken estimates.
 Narration can be split between presenters (Alex / Will) — nothing here is
 tied to one voice.
 
-This is the **general segment** (the comparison + project overview). The
-closer look at our two agents — the deterministic bot and Paco — is in
-[`PITCH_DEEPDIVE.md`](PITCH_DEEPDIVE.md); Will's verticals-only segment is
-separate. All three get stitched together.
+This is the word-for-word for the **general segment** (comparison + project
+overview). The shot-by-shot master timeline is
+[`PITCH_VIDEO_SCRIPT.md`](PITCH_VIDEO_SCRIPT.md); the closer look at our
+two agents is [`PITCH_DEEPDIVE.md`](PITCH_DEEPDIVE.md); Will's
+verticals-only segment is separate. All get stitched together.
 
 ---
 

@@ -1,5 +1,22 @@
 # Alpaca Options Credit-Spread & Iron-Condor Agent — One-Pager
 
+> **Not one trading bot — three, run as a controlled experiment.** One shared,
+> imported `risk_gate.py`; three different answers to *"how much should the LLM
+> decide?"*; compared live on a public dashboard, with the unedited ledger below.
+
+**At a glance:** 51 Python modules · **100% of option reads and orders through
+Alpaca's official MCP server** (never the raw SDK) · a deterministic risk gate
+with **14 hard checks the LLM cannot override** · self-computed delta / IV-rank /
+VIX proxies (this data tier supplies none), each labelled a proxy in code *and*
+UI · a live Supabase-backed dashboard, web **and** Telegram Mini App · a
+~100-case chaos + unit test suite · a nightly parameter-evolution job
+(report-only during judging) · a shadow-book ablation against a mechanical rule
+and a coin-flip baseline.
+
+**Links:** [live dashboard](https://alpaca-agent-dashboard.vercel.app) ·
+[3-way `/compare`](https://alpaca-agent-dashboard.vercel.app/compare) ·
+[`docs/STRATEGIES.md`](docs/STRATEGIES.md) — the full three-implementation write-up.
+
 *lablab.ai × Alpaca "AI Trading Agents" Hackathon (28 Aug – 4 Sep 2026,
 deadline 2026-09-04 15:00 UTC). Judged on P&L, technology implementation,
 creativity/originality, and presentation. This account was reset to a
@@ -172,9 +189,12 @@ overclaiming:
 
 ## Results
 
-*Real numbers as of the 2026-09-03 market-close snapshot (20:56 UTC). This
-is a handful of live paper-trading days on a freshly reset account, not a
-full week — treat it as directional, not a result.*
+**Profitability is the open question in this experiment, not a claim we are
+making — so here is the unedited ledger.** A handful of live paper-trading
+days on a freshly reset account (2026-09-03 market-close snapshot, 20:56
+UTC): directional, not a verdict, and short enough that variance dominates.
+The comparison arms below run the *same* imported risk code, so what differs
+is decision architecture, not risk appetite.
 
 **This submission (bot juzgado):**
 - Starting equity: $100,000 (2026-08-30 reset)
