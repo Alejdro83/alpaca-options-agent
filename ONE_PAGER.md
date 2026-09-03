@@ -196,6 +196,17 @@ UTC): directional, not a verdict, and short enough that variance dominates.
 The comparison arms below run the *same* imported risk code, so what differs
 is decision architecture, not risk appetite.
 
+**Main view — 2026-09-03 market close** (a down week):
+
+![Dashboard main view at 2026-09-03 market close — realized P&L -$518, account equity $99,319 (-0.68% since the reset), the equity-vs-same-dated-SPY curve, and the shadow-book counterfactual](docs/assets/dashboard.jpg)
+
+**`/compare` — earlier the same week**, judged account +$55 over its $100k
+start, Paco flat, rookieriot down. The equity has traded on both sides of
+$100k across the week; the live dashboard is the source of truth, not
+either still frame:
+
+![The /compare 3-way view mid-week — judged account $100,006 (+$55), Paco $99,909 (flat), rookieriot $99,666 (-$182), each with its own mini equity curve and portfolio Greeks](docs/assets/compare-midweek.jpg)
+
 **This submission (bot juzgado):**
 - Starting equity: $100,000 (2026-08-30 reset)
 - Equity 2026-09-03 close: **$99,319.65** — **-0.68%** since the reset,
