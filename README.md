@@ -12,6 +12,33 @@ cannot override.
 **Live dashboard**: https://alpaca-agent-dashboard.vercel.app (also opens
 as a Telegram Mini App via [@Alpaca_alejdro_bot](https://t.me/Alpaca_alejdro_bot) — same page, same code, either way).
 
+## Three implementations, one backbone
+
+This entry runs **three** autonomous agents at the same goal — defined-risk
+options income on liquid US equities — sharing the same underlying-selection
+and risk math, differing only in the **decision layer**:
+
+- **Ours (judged)** — this repo. A deterministic `risk_gate.py` clears
+  candidates first; an LLM then picks among the survivors and can never
+  override the gate. Account `PA36EFWLOWRF` (the submission-form account).
+- **Paco (research)** — vendored read-only under [`paco/`](paco/); runs on
+  the zeroclaw agent framework, not from this repo. The LLM runs the whole
+  cycle end to end with **no deterministic decision layer** — its only hard
+  rules live in an external MCP proxy it cannot see or edit.
+- **rookieriot (independent)** — a teammate's separate build:
+  [github.com/massemolle/Alpaca-Trading-rookieriot](https://github.com/massemolle/Alpaca-Trading-rookieriot).
+
+The dashboard's
+[`/compare`](https://alpaca-agent-dashboard.vercel.app/compare) page
+overlays all three equity curves against SPY buy-and-hold. Full write-up:
+[`docs/STRATEGIES.md`](docs/STRATEGIES.md).
+
+> Note: the sections below describe the judged agent. It now also opens
+> iron condors and a directional debit-spread overlay (not only the
+> verticals the older text mentions), and `short_leg_target_delta` is
+> currently 0.13 — see `config.py` and `docs/STRATEGIES.md` for the
+> current state.
+
 ## Why this design
 
 - **Screening/signals**: vendored, unmodified, from a real trading system
