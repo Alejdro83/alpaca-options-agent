@@ -196,6 +196,27 @@ def get_open_spreads() -> list[dict[str, Any]]:
         return list(cur.fetchall())
 
 
+def get_recently_stopped(minutes: int) -> list[dict[str, Any]]:
+    """Spreads that hit their stop-loss within the last `minutes` -- feeds
+    the re-entry cooldown in bot.py's find_candidates (2026-09-03, real
+    case: CRWD bear_call got re-opened and stopped out 5 times in one
+    session, ~$540 of the day's loss, because nothing blocked the
+    screening from proposing the exact same underlying+direction again
+    the very next cycle after a stop)."""
+    from datetime import datetime, timedelta, timezone
+
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+    with _connection() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            f"""
+            select underlying, direction, closed_at from {_schema()}.spreads
+            where status = 'closed_stop' and closed_at >= %s
+            """,
+            (cutoff,),
+        )
+        return list(cur.fetchall())
+
+
 def _ensure_decision_journal_table() -> None:
     with _connection() as conn, conn.cursor() as cur:
         cur.execute(f"""

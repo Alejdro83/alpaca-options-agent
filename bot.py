@@ -518,6 +518,16 @@ async def find_candidates(
     # check then choked on. A different strike or expiration on the same
     # name is still fine (the 20%-per-underlying concentration cap in
     # risk_gate.check_new_spread governs that).
+    # Re-entry cooldown (2026-09-03, real case: CRWD bear_call re-opened
+    # and stopped out 5 times in one session, ~$540 lost, nothing blocked
+    # the screening from proposing the same underlying+direction again the
+    # very next cycle after a stop). Only same underlying+direction is
+    # blocked -- a reversed thesis or a different name is unaffected.
+    recently_stopped: set[tuple[str, str]] = {
+        (s["underlying"], s["direction"])
+        for s in db.get_recently_stopped(config.risk.stopout_cooldown_minutes)
+    }
+
     open_leg_sets: set[frozenset[str]] = set()
     for s in db.get_open_spreads():
         underlying = s["underlying"]
@@ -692,6 +702,12 @@ async def find_candidates(
             logger.info(
                 "%s: a spread with these exact legs is already open (%s) -- skipping the duplicate",
                 sig.ticker, sorted(plan_legs),
+            )
+            continue
+        if (sig.ticker, plan.direction) in recently_stopped:
+            logger.info(
+                "%s %s: stopped out within the last %d min -- skipping re-entry (cooldown)",
+                sig.ticker, plan.direction, config.risk.stopout_cooldown_minutes,
             )
             continue
         check = risk_gate.check_new_spread(

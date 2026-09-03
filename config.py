@@ -208,6 +208,23 @@ class OptionsRiskLimits:
         # this needs to move for our situation (2026-08-26 research pass).
         default_factory=lambda: _evolved_or_env_float("stop_loss_multiple", "STOP_LOSS_MULTIPLE", 2.0)
     )
+    stopout_cooldown_minutes: int = field(
+        # Real case 2026-09-03: CRWD bear_call got re-proposed and stopped
+        # out 5 times in one session (~$540 of that day's loss) because
+        # nothing blocked find_candidates from re-selecting the exact same
+        # underlying+direction the very next cycle after a stop. Blocks
+        # re-entry on the same underlying+direction for this many minutes
+        # after a closed_stop -- a different direction (thesis actually
+        # reversed) or a different underlying is unaffected.
+        #
+        # 240 (not 60): the CRWD stops that day spanned 14:35-17:32 -- a
+        # 60-min window still let the 4th and 5th re-entries through (the
+        # move that stopped the 1st was the same move still running 2h
+        # later). 240 min effectively means "done with that thesis for the
+        # session" for any stop in the first ~2/3 of the trading day, which
+        # is the actual intent, without needing session-boundary logic.
+        default_factory=lambda: _evolved_or_env_int("stopout_cooldown_minutes", "STOPOUT_COOLDOWN_MINUTES", 240)
+    )
     min_open_interest: int = field(
         # Per-contract liquidity gate, applied to BOTH legs — equity-level
         # liquidity (ScreeningFilters.min_avg_volume) is a poor proxy for
