@@ -59,14 +59,24 @@ The dashboard's
 overlays all three equity curves against SPY buy-and-hold. Full write-up:
 [`docs/STRATEGIES.md`](docs/STRATEGIES.md).
 
-![The live dashboard — realized P&L, win rate, equity vs. same-dated SPY, and a shadow-book counterfactual (mechanical rule / coin-flip / LLM) run on the same gate-approved candidates](docs/assets/dashboard.jpg)
+**Main view — 2026-09-03 market close.** Realized P&L, win rate, equity vs.
+same-dated SPY, and a shadow-book counterfactual (mechanical rule /
+coin-flip / LLM) on the same gate-approved candidates. This is a down
+week — see [`ONE_PAGER.md`](ONE_PAGER.md) §Results for the full ledger.
 
-<!-- docs/assets/compare.png — fresh capture of the /compare 3-way view, added when available -->
+![Dashboard main view at 2026-09-03 market close — realized P&L -$518, equity $99,319 (-0.68% since the reset), the equity-vs-SPY curve, and the shadow book](docs/assets/dashboard.jpg)
 
-*(Also a Telegram Mini App — same page, same code. Snapshot is a
-market-close state mid-experiment; the numbers move every session and the
-live dashboard is the source of truth. See [`ONE_PAGER.md`](ONE_PAGER.md)
-§Results for the ledger and its caveats.)*
+**`/compare` — earlier the same week.** The judged account above its
+$100k start (+$55), Paco flat, rookieriot down. The equity has traded on
+both sides of $100k across the week; the live dashboard and §Results are
+the current truth, not either still frame.
+
+![The /compare 3-way view mid-week — judged account $100,006 (+$55), Paco $99,909 (flat), rookieriot $99,666 (-$182), each with its own mini equity curve and portfolio Greeks](docs/assets/compare-midweek.jpg)
+
+<!-- docs/assets/compare.png — fresh /compare capture taken right before submission; swap in when available -->
+
+*(Both pages also run as a Telegram Mini App — same code. Every figure
+here moves each session; the live dashboard is the source of truth.)*
 
 ## How a cycle works
 
