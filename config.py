@@ -269,11 +269,17 @@ class OptionsRiskLimits:
         # because this check was iron-condor-only (see min_credit_to_width_pct).
         # A single 2-leg vertical at a ~0.13-delta short leg collects far
         # less than an iron condor's combined two spreads, so this is set
-        # well below the IC's 1/3: 0.10 blocks the degenerate near-zero-credit
-        # spreads without shutting off the strategy. NOT independently
-        # backtested -- watch real fills and tune via env; same "a human
-        # decides" discipline as every other threshold in this file.
-        default_factory=lambda: _env_float("MIN_VERTICAL_CREDIT_TO_WIDTH_PCT", 0.10)
+        # well below the IC's 1/3. Measured 2026-09-03 (after-hours quotes):
+        # at the current 0.13-delta / $5-width config, real credit/width is
+        # ~3-4% on NVDA-tier names and ~19-25% only on higher-priced / lower-
+        # vol names like AVGO. 0.05 is a deadline-pragmatic value for the
+        # judged week -- it still blocks the ~2% SMCI-tier trades that lost
+        # money on 2026-09-02 without shutting verticals off entirely on the
+        # last trading days. The real fix (0.13 delta is too far OTM for a
+        # $5 fixed width -- revisit delta or scale width to the underlying)
+        # is a post-hackathon evolution question. NOT independently
+        # backtested -- watch real fills and tune via env.
+        default_factory=lambda: _env_float("MIN_VERTICAL_CREDIT_TO_WIDTH_PCT", 0.05)
     )
     max_iron_condor_equity_pct: float = field(
         # Real equity-percentage cap on total iron condor exposure — the
