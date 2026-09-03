@@ -3,8 +3,8 @@
 **Paco is not the judged submission** and **does not run from this repo.**
 It is a second autonomous options agent chasing the same goal as the
 judged bot (defined-risk options income on liquid US equities, "win small,
-often"), on its **own dedicated $100k paper account**, built to isolate
-one variable: the decision layer.
+often"), on its **own dedicated $100k paper account** (`PA34KZNBKA4L`),
+built to isolate one variable: the decision layer.
 
 - **Judged bot** (this repo, top level): a deterministic `risk_gate.py`
   clears candidates *first*, then an LLM picks among the survivors and can

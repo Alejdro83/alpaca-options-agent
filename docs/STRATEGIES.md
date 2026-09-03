@@ -19,7 +19,7 @@ is the variable we wanted to isolate:
 | Decision layer | **deterministic `risk_gate.py` first**, then an LLM picks among the survivors and can never override the gate | **LLM runs the whole cycle end to end** — screen, classify regime, choose structure, size, place — with *no* deterministic decision layer in the agent itself | independent build by a teammate; its own reasoner (incl. a headless-Claude-Code mode) over the same signal modules |
 | LLM | `mimo-v2.5-pro` (OpenAI-compatible endpoint) — but swappable; the model only *selects* from a pre-vetted menu, so results are relatively model-robust | `mimo-v2.5-pro` — but swappable; the model does *all* the judgement, so this arm is the one whose results should track model capability most | teammate's choice (incl. headless Claude Code) |
 | Risk backstop | in-process, in `risk_gate.check_new_spread`, before any candidate reaches the model | **external** — an MCP proxy (`mcp_risk_proxy/`, not in this repo) intercepts every `place_option_order` and runs the **same** `risk_gate.check_new_spread` | its own gate, plus infra/robustness fixes shared both ways (limit orders, reconciliation, fail-closed checks) |
-| Account | `PA36EFWLOWRF` (this is the submission-form account) | its own dedicated $100k paper account | its own dedicated $100k paper account |
+| Account (paper) | `PA36EFWLOWRF` (the submission-form account) | `PA34KZNBKA4L` | `PA34CFYP0MIZ` |
 | Schedule | Hermes cron, adaptive 2–30 min, market hours | zeroclaw cron, adaptive (~10 min base), market hours | teammate's own scheduling |
 | State / dashboard | Supabase `alpaca_hackathon` → [live dashboard](https://alpaca-agent-dashboard.vercel.app) | Supabase `zeroclaw_trading` → same dashboard | teammate's own instrumentation |
 

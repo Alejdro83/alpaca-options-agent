@@ -1,9 +1,47 @@
 # Alpaca Options Credit-Spread & Iron-Condor Agent — One-Pager
 
-*lablab.ai × Alpaca "AI Trading Agents" Hackathon — submission write-up.
-Results section is a placeholder: the judged account was reset to a fresh
-$100,000 paper account on 2026-08-30 (see "Honest scope notes") and needs
-real trading days to accumulate before it can be filled with real numbers.*
+*lablab.ai × Alpaca "AI Trading Agents" Hackathon (28 Aug – 4 Sep 2026,
+deadline 2026-09-04 15:00 UTC). Judged on P&L, technology implementation,
+creativity/originality, and presentation. This account was reset to a
+fresh $100,000 paper account on 2026-08-30 (see "Honest scope notes"), so
+the Results section below reflects a handful of real trading days, not a
+full week.*
+
+## The experiment: three decision architectures, one shared risk floor
+
+Core hypothesis (falsifiable, not assumed true): *given an identical,
+risk-filtered candidate menu, can timestamped unstructured context (an LLM)
+improve option selection over a structured-only selector, without
+increasing predefined risk?* We do not claim "LLM agents produce alpha" —
+the profitability question is the open experiment, not a premise.
+
+Rather than build one bot and hope, our three-person team ran **three**
+separate live paper-trading agents in parallel, all enforcing the exact
+*same* deterministic `risk_gate.py` logic (shared/imported, never
+reimplemented per agent) — so any behavioral difference reflects how much
+decision freedom the LLM was given, not a different risk tolerance:
+
+| | **This submission** ("bot juzgado") | **rookieriot** (teammate Will) | **Paco** (zeroclaw agent) |
+|---|---|---|---|
+| Structure | credit verticals + iron condors, regime-routed | credit verticals only | whatever the agent itself decides |
+| Decision flow | code builds a pre-gated candidate menu → LLM *selects from it* | same pattern (candidate menu → LLM select) | no menu — full Alpaca MCP tool access, agent picks underlying/structure/strikes/size itself |
+| Risk enforcement | candidates that fail the gate never reach the LLM | same | every `place_option_order` call is intercepted and checked *after* the agent decides, via a dedicated MCP proxy |
+| Account (paper) | PA36EFWLOWRF | PA34CFYP0MIZ | PA34KZNBKA4L |
+
+Paco is the sharpest test of the hypothesis, architecturally: it runs as an
+autonomous zeroclaw agent (model: mimo-v2.5-pro, unbounded runtime) wired
+to Alpaca's real MCP toolset, with **no pre-built candidate menu at all**.
+A purpose-built `mcp_risk_proxy` (its own small repo, importing this
+project's `risk_gate.check_new_spread` unmodified rather than
+reimplementing it) sits transparently between the agent and the real
+`alpaca-mcp-server`: every other tool call (quotes, account info, order
+history) passes straight through, but `place_option_order` is parsed
+(2-leg → vertical, 4-leg → iron condor), priced from live mid quotes, and
+rejected outright if it would breach the same per-spread loss cap,
+concentration cap, or iron-condor exposure cap this submission enforces
+*before* generating a candidate. Same hard floor, opposite order of
+operations: **gate-then-decide** (this submission, rookieriot) vs.
+**decide-then-gate** (Paco).
 
 ## AI logic
 
@@ -12,46 +50,45 @@ real trading days to accumulate before it can be filled with real numbers.*
   filter (EMA/ADX), then a 4-regime classifier (`signals/regime.py`, ADX vs
   25 and 20d/60d realized-vol ratio vs 1.5x):
   - TRENDING / VOLATILE_TRENDING → directional **credit vertical** (bull put
-    on a long signal, bear call on a short signal).
+    on a long signal, bear call on a short signal), with a stricter debit-
+    spread overlay (ADX > 35 + a real signal-strength floor) tried first on
+    high-conviction trends.
   - RANGING → non-directional **iron condor** (put spread + call spread,
     same expiration/width) — candidates with no real trend backing them are
-    routed here instead of forced into a directional bet or discarded.
+    routed here instead of forced into a directional bet or discarded. Falls
+    back to a directional vertical on the same signal if the iron condor
+    can't clear its own credit floor.
   - VOLATILE_RANGING → skip (elevated vol with no trend — the conservative
     cell of the matrix, deliberately not traded).
-- **Entry filter.** A realized-volatility-percentile check (20-day ATR% at
-  or above the 40th percentile of its own trailing year) — an explicit
-  *proxy* for IV rank, labeled as such everywhere it's surfaced, since this
-  account has no broker-supplied implied-vol data (see infra section). A
-  VIXY-percentile overlay does the same job at the market-wide level (real
-  `^VIX` isn't available via Alpaca's data API). Scheduled macro-event
-  blackout windows (JOLTS, NFP) block new entries around known high-impact
-  releases without touching exits.
+- **Entry filter.** A realized-volatility-percentile check (proxy for IV
+  rank — see next section) plus scheduled macro-event blackout windows
+  (JOLTS, NFP) that block new entries around known high-impact releases
+  without touching exits.
 - **LLM decision layer** (mimo-v2.5-pro, OpenAI-compatible endpoint) sits
-  *on top of* the deterministic risk gate below, not instead of it — it only
-  ever sees candidates that already passed every hard check, and chooses
-  which (if any) to act on and how to size within the remaining
-  concurrent-spread budget. Every candidate carries short `fact_ids` (e.g.
-  `AAPL_CREDIT_EST`) and the model is required to cite them (`[FACT_ID]`)
-  for every number in its reasoning — uncited or unknown citations are
-  logged, making the reasoning auditable rather than trusted at face value.
+  *on top of* the deterministic risk gate, not instead of it — it only ever
+  sees candidates that already passed every hard check, and chooses which
+  (if any) to act on within the remaining concurrent-spread budget. Every
+  candidate carries short `fact_ids` (e.g. `AAPL_CREDIT_EST`) and the model
+  must cite them (`[FACT_ID]`) for every number in its reasoning —
+  uncited/unknown citations are logged, making the reasoning auditable
+  rather than trusted at face value.
 - **Shadow book.** Every real cycle also runs a mechanical rule-based
-  policy and a matched-rate random policy against the *same* gate-approved
-  candidates, tracked as virtual positions with real mark-to-market P&L —
-  so the LLM's actual value-add is measurable against a naive baseline and
-  a coin flip, not just asserted.
+  policy, a matched-rate random policy, and two LLM stop-loss variants
+  against the *same* gate-approved candidates, tracked as virtual positions
+  with real mark-to-market P&L — see Results for current numbers.
 
 ## Risk gates (hard backstop in code — the LLM cannot override any of this)
 
 - Per-spread max loss ≤ 2% of equity; daily loss circuit breaker at -3%;
-  max 5 concurrent spreads overall, max 2 concurrent iron condors with a
+  max 7 concurrent spreads overall, max 2 concurrent iron condors with a
   separate 30%-of-equity aggregate cap (4-leg structures consume more
   liquidity/concentration budget per position than a vertical).
 - DTE window enforced on every entry (currently 7-14, see scope note below
   on an unresolved internal disagreement with our own backtest).
 - Per-underlying concentration cap (20% of equity) **and** a
-  correlation-cluster cap (40%, mega-cap tech / big banks / energy majors)
-  — the cluster cap exists specifically because several "different" names
-  can still be one correlated bet in a stress move.
+  correlation-cluster cap (40%, mega-cap tech / big banks / energy majors —
+  see next section) — the cluster cap exists specifically because several
+  "different" names can still be one correlated bet in a stress move.
 - Per-leg liquidity gate (bid-ask ≤ 12% of mid, open interest ≥ 100 when the
   feed reports a value) and a fresh-quote re-check immediately before every
   order — a missing or stale quote timestamp blocks the trade rather than
@@ -66,97 +103,113 @@ real trading days to accumulate before it can be filled with real numbers.*
   entry can't end the contest open and undemonstrated.
 - Independent broker-vs-database **reconciliation** every cycle — compares
   real Alpaca option legs against the local position ledger by symbol,
-  quantity, *and* side (not just "does this symbol exist somewhere"), and
-  blocks new entries on any mismatch until a human resolves it.
+  quantity, *and* signed side (not just "does this symbol exist somewhere"),
+  aggregated across all open rows per symbol so two identical structures
+  opened separately don't false-positive against each other — and blocks
+  new entries on any mismatch until a human resolves it.
 - Manual (`emergency_flatten.py`) and automatic (`kill_switch.py`) circuit
   breakers, independent of the per-cycle gate above.
+- A hard runtime guard refuses to proceed if the credentials that resolve
+  at runtime ever point at *either* team instance's other real judged
+  account (added after a real cross-account display incident, 2026-08-30) —
+  an account-identity mistake is exactly the class of error a log line gets
+  scrolled past, so this is a hard stop, not a warning.
 
-## Design philosophy: where code decides vs. where the LLM decides — measured, not asserted
+## Data Alpaca doesn't provide — computed in-process
 
-The hard question behind any "AI trading agent" is how much of the actual
-decision gets made by the model versus by deterministic code around it.
-This project answers it explicitly, in both directions, and then measures
-whether the answer was right with real money-shaped data instead of just
-arguing for it.
+This account's data tier (free/indicative feed, no Algo Trader Plus
+subscription) is missing several inputs a fully-provisioned options bot
+would just read from the broker. Rather than skip the checks or fake the
+number, each is computed from data Alpaca *does* provide, and labeled as a
+proxy everywhere it's surfaced (code, dashboard, this doc) rather than
+overclaiming:
 
-- **Two different architectures, same risk backbone.** This judged bot is a
-  deterministic pipeline (screening → regime → liquidity/vol filters →
-  strike selection, all code) with the LLM scoped narrowly to the *final
-  pick* among candidates that already passed every check. In parallel, we
-  built **Paco** — a separate, genuinely autonomous agent (the zeroclaw
-  framework) that reasons through the *entire* cycle itself: which name to
-  look at, which strikes to build, when to act. Paco imports this same
-  repo's `risk_gate.py` and `signals/regime.py` directly (never
-  reimplemented) as a hard veto layer, so both share one risk backbone
-  while differing completely in how a trade idea gets proposed in the
-  first place. Paco's account isn't eligible for judging (it's a
-  repurposed account, not brand-new) — it exists purely as a live research
-  comparison, shown on this project's own dashboard (`/compare`) alongside
-  a third, independently-built sibling implementation (verticals-only,
-  narrower universe) for a genuine three-way read on decision architecture.
-- **The backstops are ceilings, not a recipe — and we can tell you exactly
-  how wide each one is.** Portfolio-level limits (2% max loss/trade, 20%/
-  40% concentration caps, the -3% circuit breaker) are identical for both
-  architectures by construction — same imported code, no daylight between
-  them. But the *trade-quality* sanity checks are deliberately looser than
-  this bot's own targeting: the judged bot only ever builds a candidate
-  with short-leg delta in [0.02, 0.32] (target 0.17 ± 0.15); Paco's
-  backstop allows up to 0.45 — real, quantified headroom to select a
-  meaningfully more aggressive strike than this bot's own code would ever
-  propose, while still being provably incapable of blowing through the
-  portfolio-level caps. That gap is deliberate, not an oversight: it's
-  the actual surface area the comparison is measuring.
-- **Every threshold is classified, not just chosen.** Some parameters here
-  are backed by published research (16-17 delta *below* the textbook
-  25-30, chosen specifically because a ~5-day judged window is dominated by
-  variance, not long-run expected value; 50%/2x profit-target/stop, inside
-  the commonly-cited professional range). Others are explicitly flagged in
-  code as unvalidated starting points (the 40% cluster cap, the DTE
-  window). A nightly dry-run evolution job already separates these two
-  classes for real: performance dials (DTE, target delta, width) are
-  eligible for data-driven tuning against real per-generation P&L; safety
-  floors (max loss %, liquidity minimum, stop multiple) are hard-excluded
-  from ever being auto-tuned, on purpose. It logs what it *would* change
-  and why, every night, months before it's ever allowed to touch anything
-  for real.
+- **Delta** — confirmed live that the options snapshot has no `greeks`
+  field on this feed (OPRA/real Greeks require a paid plan).
+  `black_scholes.py` computes delta in closed form, using realized
+  volatility (below) as the IV input.
+- **IV rank proxy** — no real implied-vol history on this tier either.
+  The entry filter ranks the *current* 20-day ATR% against its own trailing
+  year — a realized-vol percentile, an explicit proxy for IV rank, not the
+  real thing.
+- **VIX proxy** — Alpaca's data API has no `^VIX`. A VIXY-percentile
+  overlay stands in for a market-wide vol-of-vol regime signal, used to
+  widen or tighten iron-condor strike selection.
+- **Portfolio beta-weighted delta** — "this book moves like N shares of
+  SPY" isn't broker-supplied. `portfolio_greeks.py` computes it from the
+  in-process Black-Scholes deltas on currently-held legs and a real
+  trailing-return beta per underlying computed from daily bars — never a
+  hardcoded beta table — shown on the dashboard for monitoring only (never
+  gates a decision).
+- **Correlation clusters** — Alpaca has no sector/correlation API.
+  `screening/correlation_clusters.py` hand-curates three well-documented
+  correlated groups (mega-cap tech, big banks, energy majors) from public
+  market-structure knowledge — deliberately not a full sector taxonomy,
+  scoped to the names this project's own screening universe actually
+  surfaces — feeding a concentration cap the per-underlying cap alone
+  can't catch.
 
 ## Alpaca infrastructure
 
 - **100% of options reads and writes go through Alpaca's official MCP
   server** (`get_option_contracts`, `get_option_snapshot`,
   `place_option_order`) — the raw SDK is never used for anything
-  options-related.
-- No broker-supplied Greeks or IV rank are available on this account
-  without a paid Algo Trader Plus subscription (confirmed live: OPRA feed
-  403s, the free indicative feed has no `greeks` field) — delta is computed
-  in-process via closed-form Black-Scholes using realized volatility as the
-  IV proxy; portfolio-level Greeks (incl. beta-weighted delta, using a real
-  beta computed from daily returns, not a hardcoded table) are aggregated
-  the same way for open positions and shown on the dashboard.
+  options-related. The zeroclaw/Paco variant reuses the *same* upstream MCP
+  server, just behind our own validating proxy (see above).
 - Orchestration via a cron job on an adaptive schedule (2-30 minutes,
   tightening automatically near a stop-loss and backing off when idle and
   quiet, rather than a fixed interval) plus a real-time WebSocket monitor
-  for open verticals (iron condors are deliberately excluded from that
-  always-on monitor and handled by the cron instead, to avoid a partial-fill/
-  partial-close failure mode on a 4-leg structure).
-- Supabase/Postgres backing store in its own isolated schema.
+  for open verticals, started/stopped daily around market hours (iron
+  condors are deliberately excluded from the always-on monitor and handled
+  by the cron instead, to avoid a partial-fill/partial-close failure mode
+  on a 4-leg structure).
+- Supabase/Postgres backing store in its own isolated schema
+  (`alpaca_hackathon`), reached via direct Postgres (not the REST API — the
+  schema isn't in this Supabase project's exposed-schema list).
 - Public dashboard (Next.js, dual web + Telegram Mini App) reading that
   store live: equity curve, open positions, per-cycle reasoning with cited
-  facts, the shadow-book comparison, and portfolio Greeks — plus a
-  dedicated `/compare` page showing this bot, Paco, and the third sibling
-  implementation side by side (see design philosophy above).
+  facts, the shadow-book comparison, and portfolio Greeks.
 
 ## Results
 
-*Placeholder — real numbers go here before the 2026-09-04 15:00 UTC
-deadline, once the reset account (see below) has accumulated live trading
-days.*
+*Real numbers as of the last recorded snapshot (2026-09-02 23:53 UTC) plus
+a live check the morning of 2026-09-03, ahead of today's session.*
 
-- Starting equity: $100,000 (2026-08-30, reset — see scope note)
-- Ending equity: $[X]
-- Spreads/iron condors opened: [N] — [N] profitable, [N] loss, [N] still
-  open at submission time
-- Alpaca paper account ID: `PA36EFWLOWRF`
+**This submission (bot juzgado):**
+- Starting equity: $100,000 (2026-08-30 reset)
+- Equity as of 2026-09-02 23:53 UTC: $99,951.20 (-0.05%); live check
+  2026-09-03 morning: $99,950.65
+- 180 cycles run, 180 decision-journal entries
+- Spreads opened: 2 (both SMCI credit verticals, 4 contracts each) — 0
+  profitable, 2 stopped out (-$40 each, -$80 total), 0 open at last
+  snapshot
+- Root cause identified this week: the credit-to-width entry floor
+  (`MIN_VERTICAL_CREDIT_TO_WIDTH_PCT`) was calibrated too strict for the
+  current delta/width combination, throttling entries near zero; loosened
+  0.10 → 0.05 the morning of 2026-09-03, ahead of today's session (real
+  fix — delta or width — flagged as a post-hackathon question, not
+  resolved by this loosening alone)
+- Shadow-book ablation (same gate-approved candidates, several policies run
+  in parallel from cycle 1, virtual mark-to-market P&L): mechanical rule
+  baseline +$38 (31 virtual positions), LLM-no-stop +$18 (2 positions),
+  LLM-tight-stop -$20 (2 positions), random baseline unresolved (2 open).
+  Too few decision cycles for a significant read yet — presented as an
+  honest in-progress ablation, not a conclusion.
+
+**Paco (zeroclaw, decide-then-gate architecture):**
+- Starting equity: $100,000; equity as of 2026-09-03 morning: $99,908.76
+- 4 orders passed the risk-gate proxy (3 open, 1 closed) — two MSFT
+  verticals and one AAPL iron condor — every one accepted by the exact
+  same `risk_gate.check_new_spread` this submission uses, despite having
+  no pre-built candidate menu to select from.
+
+**rookieriot (teammate Will, verticals-only):** a separate account and
+codebase run day-to-day by Will — not this repo's numbers to report here.
+Notable from their side: an equivalent activity-throttling issue (an
+overly strict volatility/liquidity floor producing near-zero entries) was
+independently diagnosed and recalibrated on their universe on 2026-09-01,
+one day before we found and fixed our own version of the same failure
+mode.
 
 ## Honest scope notes
 
@@ -173,10 +226,11 @@ days.*
   relabeled as the real thing.
 - Several thresholds are starting values, not independently backtested
   (correlation-cluster cap, the wider iron-condor width in high-vol-trending
-  regimes, the 10% entry-slippage tolerance) — flagged as such in code and
-  watched via a nightly dry-run parameter-evolution report (logs what it
-  *would* have changed and why, never applies anything automatically) before
-  any of them are allowed to move for real.
+  regimes, the 10% entry-slippage tolerance, the 2026-09-03 credit-to-width
+  loosening) — flagged as such in code and watched via a nightly dry-run
+  parameter-evolution report (logs what it *would* have changed and why,
+  never applies anything automatically) before any of them are allowed to
+  move for real.
 - The DTE window (7-14) follows an external 3-strategy research spec; our
   own walk-forward backtest found 10-21 outperforms with a large,
   sign-changing difference. Deliberately left as a live, tagged comparison
@@ -185,3 +239,7 @@ days.*
 - Screening universe skews toward large/mid-cap liquid names; the
   correlation-cluster gate mitigates but doesn't eliminate the resulting
   concentration risk.
+- The two SMCI losing trades (Results, above) were opened ~10 minutes apart
+  with near-identical strikes/expiration — a real duplicate-candidate gap
+  since closed (an exact-leg-set check now drops a plan that duplicates an
+  already-open position).
