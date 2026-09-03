@@ -1,5 +1,11 @@
 # Alpaca Options Agent — credit spreads, iron condors, debit overlay
 
+[![lablab.ai — Alpaca AI Trading Agents](https://img.shields.io/badge/lablab.ai-Alpaca%20AI%20Trading%20Agents-6C5CE7)](https://lablab.ai/event/alpaca-ai-trading-agents-hackathon)
+[![Python 3.12](https://img.shields.io/badge/python-3.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![options I/O: 100% Alpaca MCP](https://img.shields.io/badge/options%20I%2FO-100%25%20Alpaca%20MCP-00C805)](https://github.com/alpacahq/alpaca-mcp-server)
+[![dashboard: live](https://img.shields.io/badge/dashboard-live-00C805)](https://alpaca-agent-dashboard.vercel.app)
+[![paper account: PA36EFWLOWRF](https://img.shields.io/badge/paper%20account-PA36EFWLOWRF-FF9F1C)](https://alpaca.markets)
+
 Submission for lablab.ai's **Alpaca AI Trading Agents Hackathon**
 (28 Aug – 4 Sep 2026).
 
@@ -28,6 +34,20 @@ This entry runs **three** autonomous agents at the same goal, sharing the
 same underlying-selection and risk math, differing only in the **decision
 layer**:
 
+```mermaid
+flowchart TD
+    U["S&P 500 + Nasdaq-100 universe"] --> S["screening + signals<br>EMA/ADX trend · 4-regime classifier · liquidity filters"]
+    S --> G{{"risk_gate.check_new_spread<br>14 hard checks the LLM cannot override<br>imported by every arm, never reimplemented"}}
+    G -->|"gate → decide"| O["<b>Ours (judged)</b><br>LLM picks from the pre-vetted menu"]
+    G -->|"gate → decide"| R["<b>rookieriot</b><br>teammate's own reasoner · verticals only"]
+    U -->|"own screening, no menu"| K["<b>Paco (research)</b><br>LLM reasons the whole cycle on zeroclaw"]
+    K -->|"decide → gate"| PX["mcp_risk_proxy<br>same risk_gate, as an external veto"]
+    O --> M[["Alpaca MCP server<br>100% of option reads and orders"]]
+    R --> M
+    PX --> M
+    M --> BR[("$100k paper account — one per arm")]
+```
+
 | | Decision layer | Repo | Paper account |
 |---|---|---|---|
 | **Credit spreads / iron condors / debit overlay**<br>*(ours — judged)* | deterministic `risk_gate.py` clears candidates first; an LLM picks among the survivors and can never override the gate | this one | `PA36EFWLOWRF` |
@@ -38,6 +58,15 @@ The dashboard's
 [`/compare`](https://alpaca-agent-dashboard.vercel.app/compare) page
 overlays all three equity curves against SPY buy-and-hold. Full write-up:
 [`docs/STRATEGIES.md`](docs/STRATEGIES.md).
+
+![The live dashboard — realized P&L, win rate, equity vs. same-dated SPY, and a shadow-book counterfactual (mechanical rule / coin-flip / LLM) run on the same gate-approved candidates](docs/assets/dashboard.jpg)
+
+<!-- docs/assets/compare.png — fresh capture of the /compare 3-way view, added when available -->
+
+*(Also a Telegram Mini App — same page, same code. Snapshot is a
+market-close state mid-experiment; the numbers move every session and the
+live dashboard is the source of truth. See [`ONE_PAGER.md`](ONE_PAGER.md)
+§Results for the ledger and its caveats.)*
 
 ## How a cycle works
 
