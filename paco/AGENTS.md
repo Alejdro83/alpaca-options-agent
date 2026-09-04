@@ -23,11 +23,20 @@ bot later.
    `notify.sh` (TOOLS.md) that the circuit breaker tripped.
 3. 7 positions already open → manage existing only, skip screening.
 4. Run `next_watchlist_batch.py` (TOOLS.md) to get THIS cycle's 3 tickers
-   — never screen the full Watchlist in one cycle (2026-09-01: measured
-   live, each tool call costs ~25-40s with this model regardless of what
-   it does; 19 tickers x >=2 calls each structurally can't fit the 300s
-   budget — this was already fragile before today, not a one-off). The
-   script rotates deterministically so the full Watchlist still gets
+   — never screen the full Watchlist in one cycle. (2026-09-01's original
+   note here blamed "~25-40s per tool call regardless of what it does" —
+   corrected 2026-09-04: tool calls were never the bottleneck
+   (`classify_regime_batch.py` itself, timed directly, ran in 1.15s for
+   3 symbols). The real cause was the `mimo-v2.5-pro` model tier being
+   saturated — up to 198s for a bare 1-word LLM completion with zero
+   tools involved, regardless of which wire adapter (anthropic.xiaomi or
+   openai.xiaomi) reached it. Fixed by switching to
+   `openai.xiaomi_ultraspeed`, a separate faster tier — see
+   KNOWN_ISSUES.md Bug #12 in the shared repo. The batching itself is
+   still worth keeping regardless — fewer,
+   smaller LLM turns per cycle is good practice independent of why it
+   was first added.) The script rotates deterministically so the full
+   Watchlist still gets
    covered over ~7 cycles (~70 min) — you never track or compute the
    rotation yourself. Screen ONLY the tickers it returns: `get_stock_bars`
    on those, never `get_most_active_stocks`/`get_market_movers` for this
