@@ -262,7 +262,7 @@ future deadline. Proper fix: poll/confirm the fill (or record a
 
 ---
 
-## Bug #12: Paco — trading cycles 100% timing out on a wrong-endpoint decode failure (found + fixed 2026-09-04)
+## Bug #12: Paco — trading cycles 100% timing out (wrong endpoint, then a saturated model tier) (found + fixed 2026-09-04)
 **Severity:** Critical (research arm produced zero data all day)
 **Estimated Loss:** $0 direct (paper account never traded), but zero comparison data for the entire session
 
@@ -278,15 +278,24 @@ model_provider=anthropic model=mimo-v2.5-pro attempt 1/3: retryable; error=error
 
 `agents.trading.model_provider` was `anthropic.xiaomi`, pointed at the `/anthropic`-shaped path of the same backend the judged bot uses. The judged bot talks to the *same underlying model* via the OpenAI-compatible `/v1` path instead (`llm_reasoner.py`) and has worked reliably all day — pointing to a decode/format incompatibility specific to the `/anthropic` shim under zeroclaw's Anthropic client, not a general model outage.
 
-### Fix
+### Fix, part 1 (switched wire format)
 - Added `providers.models.openai.xiaomi` (same `mimo-v2.5-pro` backend, `/v1` path, `wire_api=chat_completions` — NOT the OpenAI-provider default `responses` API, which this endpoint doesn't speak).
 - Switched `agents.trading.model_provider` from `anthropic.xiaomi` → `openai.xiaomi`.
-- Raised `_AGENT_TIMEOUT` 300s → 480s (real headroom within the 600s cron interval, now that cycles aren't burning most of the budget on failed retries).
+- Raised `_AGENT_TIMEOUT` 300s → 480s.
 
-### Status
-Fix applied ~20:00 UTC 2026-09-04, right at market close. A timeout-free `completed` row in `zeroclaw_trading.cycles` is the confirmation to watch for next session.
+This changed the failure mode from a decode error to a clean per-request timeout (`kind=timeout; phase=request`) — real progress, but cycles were still failing.
 
-GitHub issue: see repo Issues, "Paco: trading cycles 100% timing out".
+### Fix, part 2 (real root cause: the `pro` tier was saturated)
+Direct test against the backend, minimal single-word completion, no tools, no agent overhead: **198.58 seconds** for one word on `mimo-v2.5-pro`. Not a request-shape issue — the model tier itself was saturated.
+
+Switched to `mimo-v2.5-pro-ultraspeed` (a different, faster tier on `api.xiaomimimo.com` — a separate host from the `token-plan-ams.xiaomimimo.com` relay used before, with its own API key). Same test: **1.89s** for one word, **1.8s** for a real 3-sentence completion — over 100x faster.
+
+Configured as `providers.models.openai.xiaomi_ultraspeed` (`wire_api=chat_completions`, `timeout_secs=60`) and switched `agents.trading.model_provider` to it.
+
+### Status: ✅ Resolved and verified live
+Ran a full trading cycle manually: **35.6s total, exit code 0**, cycle #495 logged with a real decision (`skip — market closed`, correctly read 0 open positions, $99,868.66 equity). First cycle to actually complete since the cron was created — every prior attempt, on either provider, had timed out or errored.
+
+GitHub issue: repo Issues #13 (closed).
 
 ---
 
