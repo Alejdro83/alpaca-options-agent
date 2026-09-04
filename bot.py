@@ -1275,6 +1275,23 @@ async def run_cycle() -> None:
             logger.exception("Failed to check market clock, assuming closed (fail safe, not fail open)")
             market_open = False
 
+        # Deadline gate (2026-09-04 fix, real incident -- KNOWN_ISSUES.md
+        # Bug #10): should_force_close already stops MANAGING a position
+        # once the contest deadline is within 2h, but nothing on the ENTRY
+        # side mirrored that. Result: the bot kept opening brand-new spreads
+        # for hours after the deadline passed, each one force-closed within
+        # minutes by spread_monitor.py's WS tick -- a guaranteed loss (the
+        # bid-ask spread crossed twice) for a position that could never be
+        # demonstrated to judges anyway. Same contest_end_utc + 2h buffer as
+        # risk_gate.should_force_close, kept in sync deliberately.
+        contest_end = datetime.fromisoformat(config.risk.contest_end_utc)
+        deadline_ok = datetime.now(timezone.utc) < contest_end - timedelta(hours=2)
+        if not deadline_ok:
+            logger.error(
+                "Contest deadline (%s) is within 2h or has passed -- not screening for new candidates this cycle",
+                contest_end.isoformat(),
+            )
+
         # Options approval level (2026-08-29, from cross-checking Alpaca's own
         # OpenAPI spec): 3 = "Spreads/Straddles", required for every multi-leg
         # order this bot places -- gate on options_trading_level (the
@@ -1313,7 +1330,9 @@ async def run_cycle() -> None:
         candidates = []
         slim_candidates: list[dict] = []
         decision = "skipped"
-        if not options_level_ok:
+        if not deadline_ok:
+            reasoning = f"Contest deadline ({contest_end.isoformat()}) is within 2h or has passed — not screening for new candidates this cycle."
+        elif not options_level_ok:
             reasoning = f"Options trading level is {options_level!r}, need >=3 for spreads — not screening this cycle."
         elif not reconcile_result.ok:
             reasoning = f"Broker/local book reconciliation mismatch — not screening for new candidates this cycle: {reconcile_result.reason}"
@@ -1327,7 +1346,7 @@ async def run_cycle() -> None:
         llm_selected: list[str] = []
         cycle_id: int | None = None
 
-        if remaining_budget > 0 and market_open and options_level_ok and reconcile_result.ok:
+        if remaining_budget > 0 and deadline_ok and market_open and options_level_ok and reconcile_result.ok:
             candidates, gate_rejections = await find_candidates(mcp, client, account, len(open_spreads))
             slim_candidates = [{k: v for k, v in c.items() if k != "_plan"} for c in candidates]
 
