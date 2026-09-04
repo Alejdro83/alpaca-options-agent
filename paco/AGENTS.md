@@ -18,12 +18,24 @@ bot later.
 2. If `~/kill_switch` exists → skip this cycle.
 3. Call `get_clock` → if closed, skip this cycle. Never assume fixed hours.
 ## Cycle
-1. `get_account_info` + `get_all_positions`.
+1. `get_account_info` + `get_all_positions`. If you're ever unsure how
+   many spreads you actually hold, or whether your own read of your
+   positions matches the broker (real incident 2026-09-04: believed "7
+   spreads at cap" with nothing in `zeroclaw_trading.spreads` to back
+   it), call `check_positions.py` (TOOLS.md) — pure ground truth, no
+   side effects, cheaper than trusting your own memory of the cycle.
 2. Daily loss > -3% → `zeroclaw cron pause`, stop. Best-effort:
    `notify.sh` (TOOLS.md) that the circuit breaker tripped.
 3. 7 positions already open → manage existing only, skip screening.
 4. Run `next_watchlist_batch.py` (TOOLS.md) to get THIS cycle's 3 tickers
-   — never screen the full Watchlist in one cycle. (2026-09-01's original
+   from the fixed Watchlist — still your default. When you want to look
+   beyond it (the fixed 19 names are a floor, not a ceiling), run
+   `find_candidates_preview.py` (TOOLS.md) instead or alongside it: the
+   judged bot's own real screening pipeline (full S&P 500 + Nasdaq-100,
+   liquidity + trend + volatility filters, real signal strength) — you
+   decide which survivors are worth a closer look, it just saves you
+   from re-scanning a universe by reasoning over raw data yourself.
+   Either way, never screen the full Watchlist in one cycle. (2026-09-01's original
    note here blamed "~25-40s per tool call regardless of what it does" —
    corrected 2026-09-04: tool calls were never the bottleneck
    (`classify_regime_batch.py` itself, timed directly, ran in 1.15s for
@@ -44,10 +56,16 @@ bot later.
    no real options market, e.g. FNGR/LGCL/CYAB alongside NVDA).
 5. Regime (table below) → strategy, or skip. Use the regime-classification
    skill to get ADX/vol_ratio — never estimate them yourself.
-6. Build plan: strikes from `get_option_contracts`, quotes from `get_option_snapshot`.
-   Target short-leg delta ~0.13 (see Strategy intent above) — pick the
-   strike closest to that, not the first one that merely clears the sanity
-   band.
+6. Build plan: use `preview_spread_build.py` (TOOLS.md) — it imports the
+   judged bot's own `spread_builder.py` directly (real nearest-to-target-
+   delta strike selection, real Black-Scholes delta, the liquidity/credit
+   floors already applied) and hands back concrete strikes/expiration/
+   credit, or an explicit reason none exist. Do NOT eyeball
+   `get_option_contracts`/`get_option_snapshot` yourself to guess which
+   strike is closest to the ~0.13 target delta (see Strategy intent
+   above) — same "an LLM approximates rather than gets this right" trap
+   the regime-classification skill already warns about, just for strike
+   selection instead of ADX.
 7. News check (below), only for names that made it to a real buildable
    plan in step 6 (not the whole Watchlist every cycle — most names never
    get this far, and `get_news` isn't free) → skip this candidate if a
@@ -68,17 +86,35 @@ bot later.
     it as opened. Best-effort: `notify.sh` (TOOLS.md) that you opened it.
 12. Manage EACH open position, every cycle (not just when opening
     something new) — see "Closing a position" in TOOLS.md for the actual
-    mechanism, `close_position` is blocked:
-    - `get_option_snapshot` on its legs → cost_to_close = (short leg ask -
-      long leg bid) x 100 per contract (iron condor: put side + call side,
-      same way, summed). "Short leg"/"long leg" here mean "the leg you
-      SOLD to open"/"the leg you BOUGHT to open", same for every structure.
+    close mechanism, `close_position` is blocked. For the DECISION (is
+    this at profit target / stop / force-close), use `preview_close.py`
+    (TOOLS.md) — it imports `risk_gate.should_close`/`is_near_stop`/
+    `should_force_close` directly (the judged bot's real trigger logic,
+    including the live, non-stale deadline) and fetches the real mark
+    itself. Do NOT compute cost_to_close/proceeds by hand from raw
+    quotes and compare it to the formulas below yourself — that
+    arithmetic is exactly what the tool already does, correctly, every
+    time. The formulas are kept here so you understand what the tool is
+    telling you, not as a replacement for calling it:
+    - cost_to_close = (short leg ask - long leg bid) x 100 per contract
+      (iron condor: put side + call side, same way, summed). "Short
+      leg"/"long leg" here mean "the leg you SOLD to open"/"the leg you
+      BOUGHT to open", same for every structure.
     - CREDIT spread (structure=credit — the default, and the only kind
       before 2026-09-01): close if ANY of: profit target (cost_to_close
       <= 70% of credit_received — 30%-of-credit target, see Strategy
       intent above) · stop (cost_to_close >= 2x credit_received) ·
-      force-close, regardless of P&L (expiration is tomorrow or sooner,
-      OR the contest deadline 2026-09-04T15:00:00 UTC is within 2 hours).
+      force-close, regardless of P&L (expiration is tomorrow or sooner, OR
+      the contest deadline is within 2 hours — 2026-09-04: the original
+      2026-09-04T15:00:00 UTC submission deadline hardcoded here has
+      passed, but judging happens live and you need to keep trading
+      normally for as long as judges may check you, so there is no fixed
+      deadline right now. Use `preview_close` (TOOLS.md) — it reads the
+      real, current value from the judged bot's own config rather than a
+      date typed into this file that will go stale again the same way.
+      This is the exact same bug class as the judged bot's own Bug #10 —
+      KNOWN_ISSUES.md in the shared repo — just here, as a hardcoded date
+      in your own instructions instead of a missing code check).
     - DEBIT spread (2026-09-01) — do NOT reuse the credit formula above,
       the sign is flipped and it would silently trigger backwards (it
       would call a real LOSS a "profit target hit"). What you'd actually
