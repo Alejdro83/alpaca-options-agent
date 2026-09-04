@@ -295,6 +295,8 @@ Configured as `providers.models.openai.xiaomi_ultraspeed` (`wire_api=chat_comple
 ### Status: ✅ Resolved and verified live
 Ran a full trading cycle manually: **35.6s total, exit code 0**, cycle #495 logged with a real decision (`skip — market closed`, correctly read 0 open positions, $99,868.66 equity). First cycle to actually complete since the cron was created — every prior attempt, on either provider, had timed out or errored.
 
+**Why the judged bot never had this problem**: it and Paco were sharing the same `mimo-v2.5-pro` capacity on the same relay (`token-plan-ams.xiaomimimo.com`) — the judged bot's own cron calling that endpoint at the same time Paco did compounds the load on shared capacity. Moving Paco to `mimo-v2.5-pro-ultraspeed` on a separate host and account (`api.xiaomimimo.com`) removes that contention entirely, rather than just picking a faster model. The judged bot is left exactly as-is — it has worked reliably all day and isn't part of this fix.
+
 GitHub issue: repo Issues #13 (closed).
 
 ---
