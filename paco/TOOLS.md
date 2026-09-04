@@ -149,10 +149,17 @@ No arguments. Prints 3 comma-separated tickers — screen ONLY those this
 cycle, not the full Watchlist. Deterministically rotates through the
 full 19-name list over ~7 cycles and persists its own position, so you
 never track or compute which tickers come next yourself. Real problem
-this fixes (2026-09-01): each tool call costs ~25-40s with this model
-regardless of what it does (measured live) — screening all 19 names
-every cycle needs 38+ calls, ~19-25 minutes, which cannot fit the 300s
-cycle budget no matter how the model is performing that day. Skip this
+this fixes (2026-09-01): fewer, smaller LLM turns per cycle is just good
+practice under a fixed cycle budget — screening all 19 names would mean
+far more turns than 3 does. (2026-09-01's original note here blamed
+"~25-40s per tool call regardless of what it does"; corrected
+2026-09-04 — that was never the tool calls, `classify_regime_batch.py`
+itself runs in 1.15s for 3 symbols timed directly. The real, separate
+problem it happened to coincide with was the `mimo-v2.5-pro` model tier
+being saturated — up to 198s for a bare 1-word completion, zero tools
+involved. Fixed by switching to `openai.xiaomi_ultraspeed` — see
+KNOWN_ISSUES.md Bug #12 in the shared repo. Keep this batching regardless
+of that fix; it's sound on its own merits.) Skip this
 call entirely when step 3 already sent you straight to managing existing
 positions (nothing to screen that cycle). Same reasoning is why the
 regime-classification skill batches all 3 candidates into ONE call now
