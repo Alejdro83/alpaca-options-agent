@@ -6,7 +6,7 @@
 
 **At a glance:** 51 Python modules · **100% of option reads and orders through
 Alpaca's official MCP server** (never the raw SDK) · a deterministic risk gate
-with **14 hard checks the LLM cannot override** · self-computed delta / IV-rank /
+with **a dozen-plus hard checks the LLM cannot override** · self-computed delta / IV-rank /
 VIX proxies (this data tier supplies none), each labelled a proxy in code *and*
 UI · a live Supabase-backed dashboard, web **and** Telegram Mini App · a
 ~100-case chaos + unit test suite · a nightly parameter-evolution job

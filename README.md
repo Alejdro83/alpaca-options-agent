@@ -37,7 +37,7 @@ layer**:
 ```mermaid
 flowchart TD
     U["S&P 500 + Nasdaq-100 universe"] --> S["screening + signals<br>EMA/ADX trend · 4-regime classifier · liquidity filters"]
-    S --> G{{"risk_gate.check_new_spread<br>14 hard checks the LLM cannot override<br>imported by every arm, never reimplemented"}}
+    S --> G{{"risk_gate.check_new_spread + pre-trade re-check<br>hard checks the LLM cannot override<br>imported by every arm, never reimplemented"}}
     G -->|"gate → decide"| O["<b>Ours (judged)</b><br>LLM picks from the pre-vetted menu"]
     G -->|"gate → decide"| R["<b>rookieriot</b><br>teammate's own reasoner · verticals only"]
     U -->|"own screening, no menu"| K["<b>Paco (research)</b><br>LLM reasons the whole cycle on zeroclaw"]
