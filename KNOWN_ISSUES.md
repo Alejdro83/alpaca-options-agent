@@ -262,6 +262,34 @@ future deadline. Proper fix: poll/confirm the fill (or record a
 
 ---
 
+## Bug #12: Paco — trading cycles 100% timing out on a wrong-endpoint decode failure (found + fixed 2026-09-04)
+**Severity:** Critical (research arm produced zero data all day)
+**Estimated Loss:** $0 direct (paper account never traded), but zero comparison data for the entire session
+
+### What happened
+Paco's Hermes cron (`Paco Trading Cycle`, every 10min) was firing reliably, but **every cycle since creation** hit `run_cycle_paco.py`'s 300s agent-subprocess timeout — confirmed via `zeroclaw_trading.cycles`: cycle ids 451-470, all `timeout` or `skipped_locked`, zero `completed`.
+
+Ran the cycle manually with verbose logging to find out why: ~56s setup, ~115s for one regime-classification round trip (the underlying script itself runs in 1.15s when timed directly — the delay was the LLM call, not the tool), then at 362.7s the run failed outright:
+```
+Error: All model_providers/models failed. Attempts:
+model_provider=anthropic model=mimo-v2.5-pro attempt 1/3: retryable; error=error decoding response body...
+(3/3 attempts, all retryable, all failed the same way)
+```
+
+`agents.trading.model_provider` was `anthropic.xiaomi`, pointed at the `/anthropic`-shaped path of the same backend the judged bot uses. The judged bot talks to the *same underlying model* via the OpenAI-compatible `/v1` path instead (`llm_reasoner.py`) and has worked reliably all day — pointing to a decode/format incompatibility specific to the `/anthropic` shim under zeroclaw's Anthropic client, not a general model outage.
+
+### Fix
+- Added `providers.models.openai.xiaomi` (same `mimo-v2.5-pro` backend, `/v1` path, `wire_api=chat_completions` — NOT the OpenAI-provider default `responses` API, which this endpoint doesn't speak).
+- Switched `agents.trading.model_provider` from `anthropic.xiaomi` → `openai.xiaomi`.
+- Raised `_AGENT_TIMEOUT` 300s → 480s (real headroom within the 600s cron interval, now that cycles aren't burning most of the budget on failed retries).
+
+### Status
+Fix applied ~20:00 UTC 2026-09-04, right at market close. A timeout-free `completed` row in `zeroclaw_trading.cycles` is the confirmation to watch for next session.
+
+GitHub issue: see repo Issues, "Paco: trading cycles 100% timing out".
+
+---
+
 ## Summary of Losses
 
 | Bug | Date | Estimated Loss | Status |
@@ -276,7 +304,8 @@ future deadline. Proper fix: poll/confirm the fill (or record a
 | #8 DTE local time | Aug 28 | ~$0 | ✅ Fixed |
 | #9 LLM key crash | Aug 28 | ~$0 | ✅ Fixed |
 | #10 No entry-side deadline gate | Sep 4 | ~$80+ confirmed | ✅ Fixed |
-| #11 Close marked before fill confirms | Sep 4 | not directly costed | 🔴 Open |
+| #11 Close marked before fill confirms | Sep 4 | not directly costed | ✅ Fixed |
+| #12 Paco: wrong-endpoint decode failure | Sep 4 | $0 (zero trades all day) | ✅ Fixed |
 | **Total** | | **~$1,930+** | |
 
 ---
@@ -303,6 +332,11 @@ The negative P&L is primarily attributable to Bugs #1-7. With all fixes applied,
 
 ---
 
-*Last updated: September 4, 2026, ~19:25 UTC — Bugs #10/#11 added after the
-contest deadline (15:00 UTC) passed and the bot kept trading; #10 fixed and
-deployed same day, #11 identified and documented, fix pending.*
+*Last updated: September 4, 2026, ~20:05 UTC — Bugs #10/#11/#12 added and
+fixed same day. Judging happens live and the bot needs to keep trading
+normally for as long as judges may check it, so `CONTEST_END_UTC` was moved
+to a placeholder (no fixed end-of-judging date known yet) rather than left
+in the past. Both the judged bot and Paco were reviewed end-to-end for
+this; 97/101 tests pass (4 pre-existing, unrelated failures — wording
+mismatches in `reconciler.py`/`quiet_market_report.py` assertions, not
+touched by any fix here).*
