@@ -326,8 +326,18 @@ class OptionsRiskLimits:
         # specifically because should_close() previously only fired on
         # profit-target/stop-loss, so a spread opened late in the week could
         # still be open and undemonstrated at judging time. See
-        # risk_gate.should_force_close().
-        default_factory=lambda: _env("CONTEST_END_UTC", "2026-09-04T15:00:00+00:00")
+        # risk_gate.should_force_close() (exit side) and bot.py's
+        # `deadline_ok` gate in run_cycle (entry side, added 2026-09-04
+        # after a real incident — KNOWN_ISSUES.md Bug #10).
+        #
+        # 2026-09-04: the original 15:00 UTC submission deadline passed,
+        # but judging happens live and the bot needs to keep trading
+        # normally for as long as judges may check it — no fixed
+        # end-of-judging date is known yet. Placeholder pushed out to
+        # end-of-year; update this the moment a real judging-end date is
+        # known, and set it via the CONTEST_END_UTC env var in production
+        # rather than editing this default again.
+        default_factory=lambda: _env("CONTEST_END_UTC", "2026-12-31T23:59:59+00:00")
     )
     max_entry_slippage_pct: float = field(
         # Real gap found 2026-08-29 comparing against a competing team's
