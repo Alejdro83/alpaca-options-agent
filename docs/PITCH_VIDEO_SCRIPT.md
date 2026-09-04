@@ -1,8 +1,10 @@
 # Pitch video — visual shooting script
 
 **Master timeline for the submission video. Target 4:30 (hard cap 5:00).**
-This is the shot list + voice-over; the word-for-word longer versions live
-in [`PITCH_TALKING_POINTS.md`](PITCH_TALKING_POINTS.md) (general) and
+This is the shot list + voice-over. The **TTS-ready narration, the Canva
+card list, and the cut list** are in [`PITCH_VO.md`](PITCH_VO.md) — that's
+the file to hand to the TTS engine. Word-for-word longer versions:
+[`PITCH_TALKING_POINTS.md`](PITCH_TALKING_POINTS.md) (general) and
 [`PITCH_DEEPDIVE.md`](PITCH_DEEPDIVE.md) (our two agents). Will records his
 verticals-only segment separately; it stitches in at beat 3.
 
