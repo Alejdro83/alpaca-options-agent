@@ -5,6 +5,7 @@
 [![options I/O: 100% Alpaca MCP](https://img.shields.io/badge/options%20I%2FO-100%25%20Alpaca%20MCP-00C805)](https://github.com/alpacahq/alpaca-mcp-server)
 [![dashboard: live](https://img.shields.io/badge/dashboard-live-00C805)](https://alpaca-agent-dashboard.vercel.app)
 [![paper account: PA36EFWLOWRF](https://img.shields.io/badge/paper%20account-PA36EFWLOWRF-FF9F1C)](https://alpaca.markets)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Submission for lablab.ai's **Alpaca AI Trading Agents Hackathon**
 (28 Aug – 4 Sep 2026).
