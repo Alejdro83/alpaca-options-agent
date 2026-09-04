@@ -369,7 +369,7 @@ def _optimal_contracts(equity: float, max_loss_per_contract: float, max_risk_pct
     return max(contracts, 1)
 
 
-async def manage_open_spreads(mcp: AlpacaMCP) -> tuple[list[str], bool]:
+async def manage_open_spreads(mcp: AlpacaMCP, client: AlpacaClient) -> tuple[list[str], bool]:
     """Returns (notes, near_stop) -- near_stop is True if ANY still-open
     spread (after this pass' closes) is within risk_gate.is_near_stop's
     80% threshold of its stop. Feeds the adaptive cron frequency at the
@@ -439,7 +439,7 @@ async def manage_open_spreads(mcp: AlpacaMCP) -> tuple[list[str], bool]:
             continue
         try:
             if is_iron_condor:
-                await executor_mcp.close_iron_condor(
+                close_result = await executor_mcp.close_iron_condor(
                     mcp,
                     short_put_symbol=spread["short_symbol"],
                     long_put_symbol=spread["long_symbol"],
@@ -448,9 +448,10 @@ async def manage_open_spreads(mcp: AlpacaMCP) -> tuple[list[str], bool]:
                     contracts=spread["contracts"],
                     current_mark=mark,
                     max_loss=float(spread["max_loss"]),
+                    client=client,
                 )
             else:
-                await executor_mcp.close_spread(
+                close_result = await executor_mcp.close_spread(
                     mcp,
                     short_symbol=spread["short_symbol"],
                     long_symbol=spread["long_symbol"],
@@ -458,36 +459,48 @@ async def manage_open_spreads(mcp: AlpacaMCP) -> tuple[list[str], bool]:
                     structure="credit" if is_credit_spread else "debit",
                     current_mark=mark,
                     max_loss=float(spread["max_loss"]),
+                    client=client,
                 )
-            if mark is None:
-                # Force-closed without ever getting a fresh mark (quote fetch
-                # failed) — still worth closing out ahead of expiration/the
-                # contest deadline, but the realized P&L is genuinely unknown
-                # until the fill confirms, not silently reported as $0.
+            # confirmed_close (Bug #11 fix, 2026-09-04): the REAL per-share
+            # close value from the actual fill, not the pre-submission
+            # `mark` guess -- close_spread/close_iron_condor now poll for a
+            # confirmed fill and raise (caught below, row stays open for
+            # next cycle's retry) rather than ever returning without one,
+            # so this is never None on a successful return here. Also
+            # recovers P&L for the force-close-with-no-quote case (mark is
+            # None above) that previously stayed permanently "unknown".
+            confirmed_close = close_result.fill_credit
+            if confirmed_close is None:
                 realized_pnl = None
                 status = "closed_expiry"
-                notes.append(f"Force-closed {spread['underlying']} {spread['direction']}: {reason} (P&L unknown, mark unavailable)")
+                notes.append(f"Closed {spread['underlying']} {spread['direction']}: {reason} (P&L unknown, fill value unavailable)")
             else:
-                # credit_received/mark are both per-contract (get_spread_mark
-                # never multiplies by position size) — multiply by the real
-                # contracts held or P&L is understated whenever contracts>1,
-                # the same class of bug fixed in the entry path above.
+                # credit_received/confirmed_close are both per-contract
+                # (matching get_spread_mark's convention) -- multiply by the
+                # real contracts held or P&L is understated whenever
+                # contracts>1, the same class of bug fixed in the entry path
+                # above.
                 #
                 # For a debit spread, credit_received is NEGATIVE (the
-                # debit paid) and `mark` means PROCEEDS from closing (see
-                # get_spread_mark's structure param) -- real P&L is
-                # proceeds minus debit paid = mark - (-credit_received) =
-                # mark + credit_received, the mirror image of the credit
-                # formula below.
+                # debit paid) and confirmed_close means PROCEEDS from
+                # closing -- real P&L is proceeds minus debit paid =
+                # confirmed_close - (-credit_received) = confirmed_close +
+                # credit_received, the mirror image of the credit formula
+                # below.
                 contracts_held = int(spread.get("contracts") or 1)
                 if is_credit_spread:
-                    realized_pnl = (float(spread["credit_received"]) - mark) * contracts_held
+                    realized_pnl = (float(spread["credit_received"]) - confirmed_close) * contracts_held
                 else:
-                    realized_pnl = (mark + float(spread["credit_received"])) * contracts_held
+                    realized_pnl = (confirmed_close + float(spread["credit_received"])) * contracts_held
                 status = "closed_expiry" if force_close else ("closed_profit" if realized_pnl > 0 else "closed_stop")
                 notes.append(f"Closed {spread['underlying']} {spread['direction']}: {reason} (P&L ${realized_pnl:+.2f})")
             db.record_spread_close(spread["id"], status, realized_pnl)
         except Exception as exc:
+            # Includes close_spread/close_iron_condor raising because the
+            # close order never filled (Bug #11 fix): deliberately NOT
+            # calling db.record_spread_close here leaves the row open, so
+            # the next cycle re-fetches a fresh mark and retries -- never a
+            # phantom "closed" row for a position the broker still holds.
             logger.exception("Failed to close spread %s", spread["id"])
             notes.append(f"ERROR closing {spread['underlying']}: {exc}")
     return notes, near_stop
@@ -1200,7 +1213,7 @@ async def run_cycle() -> None:
     account["daily_pl_pct"] = daily_pl_pct
 
     async with AlpacaMCP() as mcp:
-        close_notes, near_stop = await manage_open_spreads(mcp)
+        close_notes, near_stop = await manage_open_spreads(mcp, client)
 
         # Mark/close yesterday's still-open shadow positions before this
         # cycle's new ones open -- same sequencing as the real book. Never
