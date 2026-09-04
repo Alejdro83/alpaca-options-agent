@@ -30,6 +30,7 @@ import websockets
 import db
 import executor_mcp
 import risk_gate
+from alpaca_client import AlpacaClient
 from config import config
 from mcp_client import AlpacaMCP
 
@@ -79,6 +80,10 @@ class SpreadMonitor:
         self._running = True
         self._mcp: AlpacaMCP | None = None
         self._ws: websockets.ClientConnection | None = None
+        # REST client for close-fill confirmation (Bug #11 fix, 2026-09-04)
+        # -- executor_mcp.close_spread polls order status through this, the
+        # same client bot.py's manage_open_spreads now also passes in.
+        self._client = AlpacaClient()
         # Real bug fixed 2026-08-31: _shutdown() used to only flip
         # self._running, which _wait_for_spreads/_refresh_loop only recheck
         # after a plain asyncio.sleep(REFRESH_INTERVAL) (up to 300s), and
@@ -282,28 +287,41 @@ class SpreadMonitor:
 
         try:
             try:
-                await executor_mcp.close_spread(
+                close_result = await executor_mcp.close_spread(
                     self._mcp,
                     short_symbol=spread["short_symbol"],
                     long_symbol=spread["long_symbol"],
                     contracts=spread["contracts"],
                     current_mark=mark,
                     max_loss=float(spread["max_loss"]) if spread.get("max_loss") is not None else None,
+                    client=self._client,
                 )
             except Exception:
+                # Includes the close order never filling (Bug #11 fix,
+                # 2026-09-04): close_spread now polls for a confirmed fill
+                # and raises rather than returning early -- deliberately
+                # NOT calling db.record_spread_close here leaves the row
+                # open, so the next quote tick (or bot.py's cron) retries
+                # with a fresh mark instead of a phantom "closed" row for a
+                # position the broker still holds. See KNOWN_ISSUES.md.
                 logger.exception("Failed to close spread %s", spread_id)
                 print(f"spread_monitor: ERROR closing {underlying} {direction}", file=sys.stderr)
                 return
 
             contracts_held = int(spread.get("contracts") or 1)
-            if mark is None:
+            # confirmed_close: the REAL per-share close value from the
+            # actual fill (Bug #11 fix), not the pre-submission `mark`
+            # guess -- also recovers P&L for the force-close-with-no-quote
+            # case (mark is None) that previously stayed "unknown".
+            confirmed_close = close_result.fill_credit
+            if confirmed_close is None:
                 realized_pnl = None
                 status = "closed_expiry"
-                note = f"Force-closed {underlying} {direction}: {reason} (P&L unknown)"
+                note = f"Closed {underlying} {direction}: {reason} (P&L unknown, fill value unavailable)"
             else:
-                # credit_received/mark are per-contract — same fix as bot.py's
-                # manage_open_spreads, applied here too.
-                realized_pnl = (float(spread["credit_received"]) - mark) * contracts_held
+                # credit_received/confirmed_close are per-contract — same
+                # fix as bot.py's manage_open_spreads, applied here too.
+                realized_pnl = (float(spread["credit_received"]) - confirmed_close) * contracts_held
                 status = "closed_expiry" if "force" in (reason or "") else (
                     "closed_profit" if realized_pnl > 0 else "closed_stop"
                 )
