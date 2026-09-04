@@ -75,6 +75,14 @@ the current truth, not either still frame.
 
 <!-- docs/assets/compare.png — fresh /compare capture taken right before submission; swap in when available -->
 
+**Exit-rule comparison and portfolio Greeks — 2026-09-03.** The shadow
+book's real-vs-tight-vs-no-stop equity paths on the same gate-approved
+picks, plus real broker-computed Greeks (Alpaca's indicative feed) for
+every open spread — the realized-vol Black-Scholes proxy is only used to
+screen new candidates, never to report what's already held.
+
+![Exit-rule comparison chart (Real 2x stop -$1,440, Tight 1x -$644, No stop -$696) and a portfolio Greeks panel (Δ 0.178, Γ -0.235, Θ 0.673, V -0.416, ρ 0.046, beta-weighted delta 4.67 SPY-eq shares) broken out per open spread](docs/assets/dashboard-greeks.jpg)
+
 *(Both pages also run as a Telegram Mini App — same code. Every figure
 here moves each session; the live dashboard is the source of truth.)*
 
