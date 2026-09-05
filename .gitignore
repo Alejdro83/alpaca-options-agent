@@ -6,3 +6,21 @@ __pycache__/
 logs/
 *.log
 .cache/
+
+# Scripts sueltos de generacion (ComfyUI/RunningHub) - herramientas de Hermes/MSA2,
+# no pertenecen a ningun repo de codigo; no deben trackearse por accidente con git add -A
+/comfy_gen.py
+/comfy_gen.py.bak*
+/comfy_face_restore.py
+/comfy_inpaint.py
+/comfy_upscale.py
+/comfy_utils.py
+/comfy_watcher.py
+/music_gen.py
+/runninghub_gen.py
+/caption_gen.py
+
+# Todo lo relacionado con Hermes/Loki (skills, scripts de ComfyUI, config del agente)
+# vive en este mismo $HOME por comodidad pero NO es parte de este repo de trading.
+# Nunca debe entrar en un commit/stash de este proyecto.
+/.hermes/

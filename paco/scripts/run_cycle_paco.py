@@ -54,14 +54,35 @@ _SCHEMA = "zeroclaw_trading"
 # discovery path than Paco just managing a known position next cycle.
 # Halved to 300s so a normal cycle has real headroom before the cron's own
 # next tick, not a photo finish with SIGKILL.
-_AGENT_TIMEOUT = 300
+#
+# 2026-09-04: raised back to 480s after finding the REAL reason every
+# single cycle was timing out at 300s wasn't cycle length -- it was
+# agents.trading.model_provider (anthropic.xiaomi, the /anthropic-shaped
+# endpoint) failing to decode responses and burning ~350s on 3 retries
+# before erroring out. Switched to openai.xiaomi (the same backend's
+# proven-reliable /v1 chat-completions endpoint, already used by the
+# judged bot's llm_reasoner.py) -- see GitHub issue "Paco: trading cycles
+# 100% timing out". 480s (vs the 600s cron interval) keeps real headroom
+# for a legitimately multi-step cycle (iron condor + iron condor +
+# vertical, each its own tool-call round trip) without reverting to the
+# 8-seconds-from-SIGKILL situation the original 600s caused.
+_AGENT_TIMEOUT = 480
 _MAX_RESULT_CHARS = 4000
 _AGENT_BIN = Path.home() / ".cargo" / "bin" / "zeroclaw"
 _LOCK_PATH = Path(__file__).resolve().parent / "run_cycle_paco.lock"
+# 2026-09-04 tightened: the old generic phrasing left every fresh cycle
+# (no memory of the last one) re-deriving "what do I do now" from
+# AGENTS.md's prose before its first real tool call. Pointing straight at
+# the cycle-checklist skill (paco_trading bundle, `always: true`) skips
+# that -- same steps, same order, just handed over instead of rediscovered.
+# A pure prompt/reasoning-overhead optimization: it was NOT what fixed the
+# 100% timeout rate (that was the model tier, see KNOWN_ISSUES.md Bug #12)
+# and shouldn't be expected to on its own.
 _AGENT_PROMPT = (
-    "Run one trading cycle. Check current market conditions, review open "
-    "positions, evaluate entry/exit signals, and execute trades if warranted. "
-    "Report what you did."
+    "Run one trading cycle. Follow the cycle-checklist skill step by "
+    "step, in the order it gives -- don't re-derive the plan from "
+    "AGENTS.md's prose first, it's already been turned into that "
+    "checklist for you. Report what you did."
 )
 
 

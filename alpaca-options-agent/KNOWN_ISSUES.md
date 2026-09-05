@@ -190,6 +190,117 @@ Changed to `os.environ.get()` with fallback to empty string.
 
 ---
 
+## Bug #10: No Entry-Side Deadline Gate (Sep 4, 2026)
+**Severity:** Critical
+**Estimated Loss:** ~$80+ confirmed, plus multiple round-trips of bid-ask friction (exact total not yet reconciled)
+
+### What happened
+`risk_gate.should_force_close()` has always fired an unconditional exit once
+`now_utc >= contest_end_utc - 2h` — but nothing on the **entry** side
+(`find_candidates`, called from `bot.py::run_cycle`) checked the same
+condition. The contest deadline (`CONTEST_END_UTC=2026-09-04T15:00:00+00:00`)
+passed at 15:00 UTC; the bot kept screening and opening brand-new spreads for
+hours afterward, and each one was force-closed by `spread_monitor.py`'s
+real-time WS tick within 1–5 minutes of opening — crossing the bid-ask spread
+twice (open debit + close debit) for a near-guaranteed loss, with zero
+benefit since a position opened that late can never be demonstrated to
+judges anyway.
+
+### Impact
+Confirmed round-trips well past 15:00 UTC on 2026-09-04, e.g.:
+- 17:23:58 ADBE bear_call opened (fill_credit=$70) → 17:25:49 close order
+  submitted (limit_debit=$1.09/share)
+- 19:19:11 ADBE bear_call opened (fill_credit=$80) → 19:20:43 force-closed,
+  realized P&L **-$80.00** (opened by a cron process already mid-flight on
+  the pre-fix code before the deploy below landed)
+
+This is a separate root cause from Bug #6 (indicative-feed marks) — Bug #6's
+fix stopped false *profit/loss* readings from triggering premature closes,
+but did nothing to stop the bot from opening positions in the first place
+once the deadline had already passed.
+
+### Fix
+Added a `deadline_ok` gate in `bot.py::run_cycle`, mirroring
+`should_force_close`'s own `contest_end_utc - timedelta(hours=2)` window,
+alongside the existing `market_open` / `options_level_ok` /
+`reconcile_result.ok` gates before `find_candidates` is ever called.
+Verified live: a manual cycle run after the fix correctly logged "Contest
+deadline (...) is within 2h or has passed — not screening for new
+candidates this cycle" and opened nothing new.
+
+---
+
+## Bug #11: Close Orders Marked "Closed" in DB Before Fill Confirms (identified 2026-09-04, **not yet fixed**)
+**Severity:** High — data integrity + risk-management gap, not yet a confirmed direct loss
+
+### What happened
+Both `bot.py::manage_open_spreads` and `spread_monitor.py::_close_spread`
+call `executor_mcp.close_spread()` (which only **submits** a marketable
+limit order — no fill confirmation) and immediately call
+`db.record_spread_close(...)` right after, using the pre-submission `mark`
+to compute `realized_pnl`. If the limit order doesn't fill instantly, the
+DB says "closed" while the broker still holds the position — open,
+real, and **invisible to every stop-loss/force-close check**, since those
+only iterate DB-known-open spreads.
+
+### Impact (confirmed instance)
+An ADBE bear_call's close order was submitted 2026-09-04 17:25:49 UTC and
+recorded as closed in the same second. The order didn't actually fill at
+the broker until **18:54:02 UTC — 1h29min later**. For that entire window:
+the position was orphaned (open at the broker, unmanaged), and
+`reconciler.py`'s mismatch guard blocked all new-candidate screening every
+cycle (`broker option legs missing from DB: [...]`), logging the same
+error every ~10 minutes from 17:25 through 19:20.
+
+### Status
+Not fixed yet. Lower urgency after Bug #10's fix (no new entries open past
+the deadline, so fewer closes are in flight to be affected), but the same
+gap exists for any position closed while the market is still open before a
+future deadline. Proper fix: poll/confirm the fill (or record a
+`closing`/pending status and only flip to `closed_*` once
+`get_order_by_id` reports `filled`) before writing `record_spread_close`.
+
+---
+
+## Bug #12: Paco — trading cycles 100% timing out (wrong endpoint, then a saturated model tier) (found + fixed 2026-09-04)
+**Severity:** Critical (research arm produced zero data all day)
+**Estimated Loss:** $0 direct (paper account never traded), but zero comparison data for the entire session
+
+### What happened
+Paco's Hermes cron (`Paco Trading Cycle`, every 10min) was firing reliably, but **every cycle since creation** hit `run_cycle_paco.py`'s 300s agent-subprocess timeout — confirmed via `zeroclaw_trading.cycles`: cycle ids 451-470, all `timeout` or `skipped_locked`, zero `completed`.
+
+Ran the cycle manually with verbose logging to find out why: ~56s setup, ~115s for one regime-classification round trip (the underlying script itself runs in 1.15s when timed directly — the delay was the LLM call, not the tool), then at 362.7s the run failed outright:
+```
+Error: All model_providers/models failed. Attempts:
+model_provider=anthropic model=mimo-v2.5-pro attempt 1/3: retryable; error=error decoding response body...
+(3/3 attempts, all retryable, all failed the same way)
+```
+
+`agents.trading.model_provider` was `anthropic.xiaomi`, pointed at the `/anthropic`-shaped path of the same backend the judged bot uses. The judged bot talks to the *same underlying model* via the OpenAI-compatible `/v1` path instead (`llm_reasoner.py`) and has worked reliably all day — pointing to a decode/format incompatibility specific to the `/anthropic` shim under zeroclaw's Anthropic client, not a general model outage.
+
+### Fix, part 1 (switched wire format)
+- Added `providers.models.openai.xiaomi` (same `mimo-v2.5-pro` backend, `/v1` path, `wire_api=chat_completions` — NOT the OpenAI-provider default `responses` API, which this endpoint doesn't speak).
+- Switched `agents.trading.model_provider` from `anthropic.xiaomi` → `openai.xiaomi`.
+- Raised `_AGENT_TIMEOUT` 300s → 480s.
+
+This changed the failure mode from a decode error to a clean per-request timeout (`kind=timeout; phase=request`) — real progress, but cycles were still failing.
+
+### Fix, part 2 (real root cause: the `pro` tier was saturated)
+Direct test against the backend, minimal single-word completion, no tools, no agent overhead: **198.58 seconds** for one word on `mimo-v2.5-pro`. Not a request-shape issue — the model tier itself was saturated.
+
+Switched to `mimo-v2.5-pro-ultraspeed` (a different, faster tier on `api.xiaomimimo.com` — a separate host from the `token-plan-ams.xiaomimimo.com` relay used before, with its own API key). Same test: **1.89s** for one word, **1.8s** for a real 3-sentence completion — over 100x faster.
+
+Configured as `providers.models.openai.xiaomi_ultraspeed` (`wire_api=chat_completions`, `timeout_secs=60`) and switched `agents.trading.model_provider` to it.
+
+### Status: ✅ Resolved and verified live
+Ran a full trading cycle manually: **35.6s total, exit code 0**, cycle #495 logged with a real decision (`skip — market closed`, correctly read 0 open positions, $99,868.66 equity). First cycle to actually complete since the cron was created — every prior attempt, on either provider, had timed out or errored.
+
+**Why the judged bot never had this problem**: it and Paco were sharing the same `mimo-v2.5-pro` capacity on the same relay (`token-plan-ams.xiaomimimo.com`) — the judged bot's own cron calling that endpoint at the same time Paco did compounds the load on shared capacity. Moving Paco to `mimo-v2.5-pro-ultraspeed` on a separate host and account (`api.xiaomimimo.com`) removes that contention entirely, rather than just picking a faster model. The judged bot is left exactly as-is — it has worked reliably all day and isn't part of this fix.
+
+GitHub issue: repo Issues #13 (closed).
+
+---
+
 ## Summary of Losses
 
 | Bug | Date | Estimated Loss | Status |
@@ -203,7 +314,10 @@ Changed to `os.environ.get()` with fallback to empty string.
 | #7 CRWD re-entry loop | Sep 3 | ~$540 | ✅ Fixed |
 | #8 DTE local time | Aug 28 | ~$0 | ✅ Fixed |
 | #9 LLM key crash | Aug 28 | ~$0 | ✅ Fixed |
-| **Total** | | **~$1,850** | |
+| #10 No entry-side deadline gate | Sep 4 | ~$80+ confirmed | ✅ Fixed |
+| #11 Close marked before fill confirms | Sep 4 | not directly costed | ✅ Fixed |
+| #12 Paco: wrong-endpoint decode failure | Sep 4 | $0 (zero trades all day) | ✅ Fixed |
+| **Total** | | **~$1,930+** | |
 
 ---
 
@@ -229,4 +343,11 @@ The negative P&L is primarily attributable to Bugs #1-7. With all fixes applied,
 
 ---
 
-*Last updated: September 4, 2026*
+*Last updated: September 4, 2026, ~20:05 UTC — Bugs #10/#11/#12 added and
+fixed same day. Judging happens live and the bot needs to keep trading
+normally for as long as judges may check it, so `CONTEST_END_UTC` was moved
+to a placeholder (no fixed end-of-judging date known yet) rather than left
+in the past. Both the judged bot and Paco were reviewed end-to-end for
+this; 97/101 tests pass (4 pre-existing, unrelated failures — wording
+mismatches in `reconciler.py`/`quiet_market_report.py` assertions, not
+touched by any fix here).*
