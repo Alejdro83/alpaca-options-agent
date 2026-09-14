@@ -24,3 +24,19 @@ logs/
 # vive en este mismo $HOME por comodidad pero NO es parte de este repo de trading.
 # Nunca debe entrar en un commit/stash de este proyecto.
 /.hermes/
+
+# Credenciales del sistema — este repo tiene su .git en $HOME, así que cualquier
+# `git add -A`/`git add .` ejecutado desde aquí intentaría stagear estos ficheros
+# si no estuvieran explícitamente excluidos. Nunca deben entrar en un commit.
+/.ssh/
+/.gnupg/
+/.git-credentials
+/.gitconfig
+/.aws/
+/.netrc
+/.npmrc
+/.docker/
+/.config/gcloud/
+/.kube/
+/.claude.json
+/.claude/
