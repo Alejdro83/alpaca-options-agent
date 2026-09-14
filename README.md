@@ -5,6 +5,7 @@
 [![options I/O: 100% Alpaca MCP](https://img.shields.io/badge/options%20I%2FO-100%25%20Alpaca%20MCP-00C805)](https://github.com/alpacahq/alpaca-mcp-server)
 [![dashboard: live](https://img.shields.io/badge/dashboard-live-00C805)](https://alpaca-agent-dashboard.vercel.app)
 [![paper account: PA36EFWLOWRF](https://img.shields.io/badge/paper%20account-PA36EFWLOWRF-FF9F1C)](https://alpaca.markets)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Submission for lablab.ai's **Alpaca AI Trading Agents Hackathon**
 (28 Aug – 4 Sep 2026).
@@ -74,6 +75,14 @@ the current truth, not either still frame.
 ![The /compare 3-way view mid-week — judged account $100,006 (+$55), Paco $99,909 (flat), rookieriot $99,666 (-$182), each with its own mini equity curve and portfolio Greeks](docs/assets/compare-midweek.jpg)
 
 <!-- docs/assets/compare.png — fresh /compare capture taken right before submission; swap in when available -->
+
+**Exit-rule comparison and portfolio Greeks — 2026-09-03.** The shadow
+book's real-vs-tight-vs-no-stop equity paths on the same gate-approved
+picks, plus real broker-computed Greeks (Alpaca's indicative feed) for
+every open spread — the realized-vol Black-Scholes proxy is only used to
+screen new candidates, never to report what's already held.
+
+![Exit-rule comparison chart (Real 2x stop -$1,440, Tight 1x -$644, No stop -$696) and a portfolio Greeks panel (Δ 0.178, Γ -0.235, Θ 0.673, V -0.416, ρ 0.046, beta-weighted delta 4.67 SPY-eq shares) broken out per open spread](docs/assets/dashboard-greeks.jpg)
 
 *(Both pages also run as a Telegram Mini App — same code. Every figure
 here moves each session; the live dashboard is the source of truth.)*

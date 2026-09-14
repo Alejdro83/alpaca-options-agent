@@ -149,15 +149,92 @@ No arguments. Prints 3 comma-separated tickers — screen ONLY those this
 cycle, not the full Watchlist. Deterministically rotates through the
 full 19-name list over ~7 cycles and persists its own position, so you
 never track or compute which tickers come next yourself. Real problem
-this fixes (2026-09-01): each tool call costs ~25-40s with this model
-regardless of what it does (measured live) — screening all 19 names
-every cycle needs 38+ calls, ~19-25 minutes, which cannot fit the 300s
-cycle budget no matter how the model is performing that day. Skip this
+this fixes (2026-09-01): fewer, smaller LLM turns per cycle is just good
+practice under a fixed cycle budget — screening all 19 names would mean
+far more turns than 3 does. (2026-09-01's original note here blamed
+"~25-40s per tool call regardless of what it does"; corrected
+2026-09-04 — that was never the tool calls, `classify_regime_batch.py`
+itself runs in 1.15s for 3 symbols timed directly. The real, separate
+problem it happened to coincide with was the `mimo-v2.5-pro` model tier
+being saturated — up to 198s for a bare 1-word completion, zero tools
+involved. Fixed by switching to `openai.xiaomi_ultraspeed` — see
+KNOWN_ISSUES.md Bug #12 in the shared repo. Keep this batching regardless
+of that fix; it's sound on its own merits.) Skip this
 call entirely when step 3 already sent you straight to managing existing
 positions (nothing to screen that cycle). Same reasoning is why the
 regime-classification skill batches all 3 candidates into ONE call now
 (2026-09-03 fix) instead of one call per ticker — see that skill for
 details.
+## Consult tools (2026-09-04) — use these instead of computing yourself
+Four scripts, same reasoning as the regime-classification skill: numeric/
+data-heavy tasks an LLM tends to approximate rather than get exactly
+right have a real tool now, so you spend your reasoning on the judgment
+call (which candidate, whether to act), not on the arithmetic. All four
+are consultative only — read-only, no orders, no Supabase writes, never
+a gate you can't override. All four load your own Alpaca credentials
+from `mcp_risk_proxy/.env` the same way `classify_regime_batch.py`
+already does — never the judged bot's account.
+
+```
+find_candidates_preview.py [MAX_RESULTS]
+```
+The judged bot's own real screening pipeline (full S&P 500 + Nasdaq-100
+→ liquidity filter → trend + adaptive-volatility filter), stopping
+before any spread gets built. Use this instead of, or alongside,
+`next_watchlist_batch.py` when you want to look beyond the fixed 19-name
+Watchlist — it won't compute a regime or a plan for you, just tells you
+who cleared the bar and how strong each signal is, sorted strongest
+first (default: top 15). Takes ~2 minutes (a real universe scan, not an
+LLM call) — budget for that, it's a one-time network cost like every
+other real screening pass, not something that eats your agent-turn
+timeout the way a slow model call would.
+
+```
+preview_spread_build.py TICKER STRATEGY [DIRECTION] [WIDTH_OVERRIDE]
+STRATEGY: vertical | iron_condor | debit
+DIRECTION: long | short -- required for vertical/debit, omit (or "-") for iron_condor
+```
+Imports `spread_builder.py`'s real `build_spread`/`build_iron_condor`/
+`build_debit_spread` directly — the judged bot's own nearest-to-target-
+delta strike selection over the real chain, real Black-Scholes delta,
+the liquidity/credit floors already applied. Fetches its own spot price
+and realized-vol input, so you only ever pass a ticker and a strategy.
+Returns a concrete plan (expiration, both strikes, both symbols, the
+real credit estimate) or an explicit "no plan, because X" — never a
+half-built guess. This is step 6's real build step — do not eyeball
+`get_option_contracts`/`get_option_snapshot` yourself to pick "the
+strike closest to 0.13 delta"; that is exactly the numeric-approximation
+trap this tool exists to remove.
+
+```
+preview_close.py STRATEGY STRUCTURE CREDIT_RECEIVED EXPIRATION \
+    SHORT_SYMBOL LONG_SYMBOL [CALL_SHORT_SYMBOL CALL_LONG_SYMBOL]
+STRATEGY: vertical | iron_condor
+STRUCTURE: credit | debit (iron_condor is always credit)
+```
+Imports `risk_gate.should_close`/`is_near_stop`/`should_force_close`
+directly and fetches the real live mark itself (same
+`executor_mcp.get_spread_mark`/`get_iron_condor_mark` the judged bot
+uses) — tells you whether a position is at profit target, stop, or
+force-close-by-deadline right now, with the real number, not your own
+mental cost_to_close/proceeds math. `should_force_close` reads the
+judged bot's own live `contest_end_utc` config — never a date typed into
+AGENTS.md that can go stale (see that file's own note on this, 2026-09-04).
+This is step 12's real decision step for every open position, every cycle.
+
+```
+check_positions.py (no arguments)
+```
+Ground truth: your real broker positions vs. what
+`zeroclaw_trading.spreads` thinks is open, side by side, with any
+mismatch called out explicitly. Deliberately NOT `reconcile_paco.py` —
+that script can auto-write DB closes and, on an unexplained mismatch,
+engage a real kill-all estop (its own 15-min background job, exactly
+right for that). This one only reads and prints, nothing else — call it
+any time your own belief about your position count feels uncertain (real
+incident 2026-09-04: believed "7 spreads at cap" with a single old
+closed row in `spreads` to show for it) instead of trusting memory.
+
 ## Adjusting your own check frequency
 Run this LAST, at the end of every cycle, no arguments:
 ```

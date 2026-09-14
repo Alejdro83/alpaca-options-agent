@@ -1475,11 +1475,17 @@ class TestBoundedLimitOrders:
         import executor_mcp
 
         mcp = FakeMCP()
-        mcp.set_response("place_option_order", {"data": {"id": "order-2"}})
+        # Bug #11 fix (2026-09-04): close_spread now confirms a real fill
+        # before returning -- status="filled" + per-leg prices needed here
+        # even though this test only cares about the submitted limit_price.
+        mcp.set_response("place_option_order", {"data": {"id": "order-2", "status": "filled", "legs": [
+            {"symbol": "SHORT_SYM", "side": "buy", "filled_avg_price": "1.10"},
+            {"symbol": "LONG_SYM", "side": "sell", "filled_avg_price": "0.00"},
+        ]}})
 
         await executor_mcp.close_spread(
             mcp, "SHORT_SYM", "LONG_SYM", contracts=1,
-            current_mark=100.0, max_loss=500.0,
+            current_mark=100.0, max_loss=500.0, client=FakeClient(),
         )
 
         calls = mcp.calls_for("place_option_order")
@@ -1495,11 +1501,14 @@ class TestBoundedLimitOrders:
         import executor_mcp
 
         mcp = FakeMCP()
-        mcp.set_response("place_option_order", {"data": {"id": "order-3"}})
+        mcp.set_response("place_option_order", {"data": {"id": "order-3", "status": "filled", "legs": [
+            {"symbol": "SHORT_SYM", "side": "buy", "filled_avg_price": "5.00"},
+            {"symbol": "LONG_SYM", "side": "sell", "filled_avg_price": "0.00"},
+        ]}})
 
         await executor_mcp.close_spread(
             mcp, "SHORT_SYM", "LONG_SYM", contracts=1,
-            current_mark=None, max_loss=500.0,
+            current_mark=None, max_loss=500.0, client=FakeClient(),
         )
 
         calls = mcp.calls_for("place_option_order")
@@ -2059,7 +2068,15 @@ class TestEmergencyFlattenBoundedClose:
             "SHORT_SYM": make_quote(bid=1.00, ask=1.10),
             "LONG_SYM": make_quote(bid=0.40, ask=0.50),
         }))
-        mcp.set_response("place_option_order", {"data": {"id": "order-1"}})
+        # Bug #11 fix (2026-09-04): close_spread now confirms a real fill
+        # via `client` before returning -- status="filled" + per-leg prices
+        # needed so this test's close doesn't hang on a poll it can't do
+        # (FakeClient has no matching get_order, and this test only cares
+        # that the order was submitted and the DB row closed).
+        mcp.set_response("place_option_order", {"data": {"id": "order-1", "status": "filled", "legs": [
+            {"symbol": "SHORT_SYM", "side": "buy", "filled_avg_price": "1.00"},
+            {"symbol": "LONG_SYM", "side": "sell", "filled_avg_price": "0.40"},
+        ]}})
 
         with patch.object(emergency_flatten, "db") as mock_db, \
              patch.object(emergency_flatten, "reconciler") as mock_reconciler, \
@@ -2072,7 +2089,7 @@ class TestEmergencyFlattenBoundedClose:
             mock_reconciler.reconcile.return_value = SimpleNamespace(
                 ok=True, reason=None, broker_option_symbols=set(),
             )
-            MockClient.return_value = SimpleNamespace()
+            MockClient.return_value = FakeClient()
             MockMCP.return_value.__aenter__ = AsyncMock(return_value=mcp)
             MockMCP.return_value.__aexit__ = AsyncMock(return_value=False)
 
@@ -2097,7 +2114,12 @@ class TestEmergencyFlattenBoundedClose:
 
         mcp = FakeMCP()
         mcp.set_response("get_option_snapshot", RuntimeError("quote feed down"))
-        mcp.set_response("place_option_order", {"data": {"id": "order-2"}})
+        # Bug #11 fix: see comment on test_flatten_closes_vertical_with_a_
+        # bounded_price above -- needs a confirmed fill to return normally.
+        mcp.set_response("place_option_order", {"data": {"id": "order-2", "status": "filled", "legs": [
+            {"symbol": "SHORT_SYM", "side": "buy", "filled_avg_price": "3.50"},
+            {"symbol": "LONG_SYM", "side": "sell", "filled_avg_price": "0.00"},
+        ]}})
 
         with patch.object(emergency_flatten, "db") as mock_db, \
              patch.object(emergency_flatten, "reconciler") as mock_reconciler, \
@@ -2110,7 +2132,7 @@ class TestEmergencyFlattenBoundedClose:
             mock_reconciler.reconcile.return_value = SimpleNamespace(
                 ok=True, reason=None, broker_option_symbols=set(),
             )
-            MockClient.return_value = SimpleNamespace()
+            MockClient.return_value = FakeClient()
             MockMCP.return_value.__aenter__ = AsyncMock(return_value=mcp)
             MockMCP.return_value.__aexit__ = AsyncMock(return_value=False)
 
@@ -2329,9 +2351,12 @@ class TestDebitSpreadExecutor:
 
     @pytest.mark.asyncio
     async def test_get_spread_mark_debit_formula(self):
-        """Debit mark = short_bid - long_ask (proceeds from closing), the
-        mirror image of the credit formula (short_ask - long_bid, cost to
-        close)."""
+        """Debit mark = short_mid - long_mid (proceeds from closing), same
+        mid-price convention the credit branch uses since Bug #6's fix
+        (2026-09-04, KNOWN_ISSUES.md) -- both branches read the exact same
+        formula post-fix, deliberately: mid-price removes the
+        indicative-feed worst-case bias that caused Bug #6's phantom
+        losses for either structure equally, not just credit spreads."""
         import executor_mcp
         mcp = FakeMCP()
         mcp.set_response("get_option_snapshot", make_snapshot_response({
@@ -2339,8 +2364,8 @@ class TestDebitSpreadExecutor:
             "SELL_SYM": make_quote(bid=3.20, ask=3.40),
         }))
         mark = await executor_mcp.get_spread_mark(mcp, "BUY_SYM", "SELL_SYM", structure="debit")
-        # (6.50 - 3.40) * 100 = 310.00
-        assert mark == 310.0
+        # short_mid=(6.50+6.70)/2=6.60, long_mid=(3.20+3.40)/2=3.30 -> (6.60-3.30)*100 = 330.00
+        assert mark == 330.0
 
 
 class TestDebitSpreadOverlayRouting:

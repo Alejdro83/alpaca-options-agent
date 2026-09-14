@@ -173,6 +173,92 @@ def _extract_filled_avg_price(result) -> float | None:
     return None
 
 
+def _extract_close_fill_value(result, structure: str = "credit") -> float | None:
+    """Per-share real cost-to-close (credit structure) or real proceeds
+    (debit structure) from a CLOSING multi-leg order's actual fills --
+    the close-side counterpart to `_extract_filled_avg_price`, which its
+    own docstring explicitly warns is open-only (the credit/debit sign
+    flips on a close). Deliberately a separate function rather than a
+    branch inside that one, to keep the open-side sign logic (already
+    verified live once, 2026-08-30) untouched.
+
+    Reads the real `side` sent on each leg rather than assuming which one
+    is short/long: `raw = sum(buy leg fills) - sum(sell leg fills)`. For a
+    credit-structure close (buy_to_close short, sell_to_close long) this
+    IS the debit paid -- same sign `close_spread`'s `current_mark` already
+    uses. For a debit-structure close (sell_to_close short, buy_to_close
+    long) this is the NEGATIVE of proceeds received, so the debit-branch
+    below flips it back -- proceeds = -raw, matching `get_spread_mark`'s
+    debit-branch semantics that `risk_gate.should_close`'s debit branch
+    and bot.py's `mark + credit_received` P&L formula both already assume.
+    """
+    payload = result.get("data", result) if isinstance(result, dict) else result
+    orders = payload if isinstance(payload, list) else [payload]
+    for order in orders:
+        if not isinstance(order, dict):
+            continue
+        buys: list[float] = []
+        sells: list[float] = []
+        for leg in order.get("legs") or []:
+            if not isinstance(leg, dict):
+                continue
+            px = leg.get("filled_avg_price")
+            if px is None:
+                continue
+            try:
+                price = float(px)
+            except (TypeError, ValueError):
+                continue
+            side = (leg.get("side") or "").lower()
+            (buys if side == "buy" else sells).append(price)
+        if buys or sells:
+            raw = sum(buys) - sum(sells)
+            return raw if structure != "debit" else -raw
+    return None
+
+
+async def _confirm_close_fill(
+    mcp: AlpacaMCP, result, order_ids: list[str], client, *, structure: str, action: str,
+) -> float | None:
+    """Close-side counterpart to `_confirm_fill`: polls to a terminal
+    status and returns the REAL per-share close value (see
+    `_extract_close_fill_value`), or raises if the order goes terminal-bad
+    or is still resting past `config.risk.order_poll_timeout_s` (canceled
+    first, same as the open-side path -- never leave a resting order that
+    could fill later at an unvalidated price, and never let the caller
+    record a close based on a guess).
+
+    Unlike `_confirm_fill`, there is no `client is None` legacy branch --
+    every real close site in this project has an AlpacaClient on hand, and
+    a close silently "succeeding" without fill confirmation is exactly
+    Bug #11 (see KNOWN_ISSUES.md): the DB marked closed while the broker
+    still held the position, unmanaged, for 1h29min on 2026-09-04.
+    """
+    status = _extract_status(result)
+    raw = result
+    if status not in FILLED_STATUSES and status not in TERMINAL_BAD_STATUSES:
+        polled = await _poll_order_status(client, order_ids[0])
+        if polled is not None:
+            raw = polled
+            status = str(polled.get("status") or status).lower()
+
+    if status in TERMINAL_BAD_STATUSES:
+        raise RuntimeError(f"{action} order terminal without fill: status={status} ids={order_ids}")
+
+    if status not in FILLED_STATUSES:
+        for oid in order_ids:
+            try:
+                client.cancel_order(oid)
+            except Exception:
+                logger.exception("Failed to cancel unfilled %s order %s", action, oid)
+        raise RuntimeError(
+            f"{action} order not filled within {config.risk.order_poll_timeout_s:.0f}s "
+            f"(status={status}) — canceled, position remains open, will retry next cycle: ids={order_ids}"
+        )
+
+    return _extract_close_fill_value(raw, structure)
+
+
 async def _poll_order_status(client, order_id: str) -> dict[str, Any] | None:
     """Poll REST for a single order until a terminal status or timeout.
     Returns the last known order dict, or None if it was never reachable
@@ -333,7 +419,8 @@ async def close_spread(
     structure: str = "credit",
     max_loss: float | None = None,
     current_mark: float | None = None,
-) -> list[str]:
+    client=None,
+) -> OrderResult:
     """Reverses the entry — a single multi-leg order for the same fill-both-
     or-neither reason as entry.
 
@@ -365,6 +452,14 @@ async def close_spread(
 
     One of current_mark/max_loss must be given; there is no unbounded
     fallback, for either structure.
+
+    `client` (an AlpacaClient) confirms the real fill before returning --
+    see `_confirm_close_fill` / KNOWN_ISSUES.md Bug #11. Raises if the
+    order goes terminal without a fill or sits unfilled past
+    config.risk.order_poll_timeout_s (canceled first); callers must catch
+    that and leave the spread's DB row untouched (still open) so the next
+    cycle retries with a fresh mark, exactly like every other error path
+    in `manage_open_spreads` / `spread_monitor._close_spread` already does.
     """
     if structure == "debit":
         if current_mark is not None:
@@ -403,8 +498,12 @@ async def close_spread(
         },
     )
     order_ids = _extract_order_ids(result)
-    logger.info("Closed spread (%s / %s): orders %s limit_debit=%s", short_symbol, long_symbol, order_ids, limit_price)
-    return order_ids
+    confirmed_value = await _confirm_close_fill(mcp, result, order_ids, client, structure=structure, action="close")
+    logger.info(
+        "Closed spread (%s / %s): orders %s limit_debit=%s confirmed=%s",
+        short_symbol, long_symbol, order_ids, limit_price, confirmed_value,
+    )
+    return OrderResult(order_ids=order_ids, status="filled", fill_credit=confirmed_value, raw=result)
 
 
 async def open_iron_condor(
@@ -463,11 +562,16 @@ async def close_iron_condor(
     *,
     max_loss: float | None = None,
     current_mark: float | None = None,
-) -> list[str]:
+    client=None,
+) -> OrderResult:
     """Reverses all 4 legs in one multi-leg order — same fill-together
     reasoning as `close_spread`, just twice as many legs. Same bounded-limit
     rule as `close_spread`: mark-based when a fresh mark exists, otherwise
     the position's own max_loss as the absolute ceiling.
+
+    Same real-fill-confirmation contract as `close_spread` (always credit
+    structure — iron condors have no debit variant here) — see there and
+    KNOWN_ISSUES.md Bug #11.
     """
     if current_mark is not None:
         limit_price = limit_debit_price(current_mark)
@@ -493,11 +597,12 @@ async def close_iron_condor(
         },
     )
     order_ids = _extract_order_ids(result)
+    confirmed_value = await _confirm_close_fill(mcp, result, order_ids, client, structure="credit", action="close")
     logger.info(
-        "Closed iron condor (%s / %s / %s / %s): orders %s limit_debit=%s",
-        short_put_symbol, long_put_symbol, short_call_symbol, long_call_symbol, order_ids, limit_price,
+        "Closed iron condor (%s / %s / %s / %s): orders %s limit_debit=%s confirmed=%s",
+        short_put_symbol, long_put_symbol, short_call_symbol, long_call_symbol, order_ids, limit_price, confirmed_value,
     )
-    return order_ids
+    return OrderResult(order_ids=order_ids, status="filled", fill_credit=confirmed_value, raw=result)
 
 
 async def get_iron_condor_mark(
@@ -539,17 +644,23 @@ async def get_iron_condor_mark(
 
 
 async def get_spread_mark(mcp: AlpacaMCP, short_symbol: str, long_symbol: str, structure: str = "credit") -> float | None:
-    """For a CREDIT spread (structure='credit', default, unchanged
-    behavior): current COST to close it — buy back short_symbol at its ask,
-    sell long_symbol at its bid — for risk_gate.should_close's credit
-    branch.
+    """For a CREDIT spread (structure='credit', default): current COST to
+    close it, for risk_gate.should_close's credit branch.
 
     For a DEBIT spread (structure='debit', 2026-09-02): current PROCEEDS
-    from closing it — sell short_symbol (this project owns it) at its bid,
-    buy back long_symbol (this project is short it) at its ask — the
-    mirror image, for risk_gate.should_close's debit branch. Formula is
-    literally `short_bid - long_ask` instead of `short_ask - long_bid`,
-    same two quotes, opposite sides used.
+    from closing it, for risk_gate.should_close's debit branch.
+
+    Both branches use the identical `short_mid - long_mid` formula
+    (2026-09-04 fix, KNOWN_ISSUES.md Bug #6): originally the debit branch
+    used worst-case `short_bid - long_ask` while credit used worst-case
+    `short_ask - long_bid` -- Bug #6's fix moved the credit branch to
+    mid-prices to kill phantom losses from the indicative feed's wide
+    spreads, and the debit branch was updated the same way rather than
+    left on the old worst-case formula it would have been just as exposed
+    to. The two branches now happen to compute the same expression; kept
+    as separate branches (not collapsed into one return) so a future
+    change to only one structure's formula doesn't have to first split
+    them back apart.
 
     Real response shape: `{"data": {"snapshots": {symbol: {"latestQuote": {"bp":
     ..., "ap": ...}}}}}` — verified against the live account 2026-08-26,
@@ -564,14 +675,28 @@ async def get_spread_mark(mcp: AlpacaMCP, short_symbol: str, long_symbol: str, s
     long_q = snap_by_symbol.get(long_symbol, {}).get("latestQuote", {})
     if not short_q or not long_q:
         return None
-    if structure == "debit":
-        short_bid = short_q.get("bp")
-        long_ask = long_q.get("ap")
-        if short_bid is None or long_ask is None:
-            return None
-        return round((float(short_bid) - float(long_ask)) * 100, 2)
+
+    # Use mid-prices instead of worst-case bid/ask to avoid inflated marks
+    # from the indicative feed's wide spreads (2026-09-04 fix: bot was
+    # opening and closing positions every 2 minutes due to phantom losses).
+    short_bid = short_q.get("bp")
     short_ask = short_q.get("ap")
     long_bid = long_q.get("bp")
-    if short_ask is None or long_bid is None:
+    long_ask = long_q.get("ap")
+
+    def _mid(bid, ask):
+        if bid is not None and ask is not None:
+            return (float(bid) + float(ask)) / 2
+        return float(bid) if bid is not None else float(ask) if ask is not None else None
+
+    if structure == "debit":
+        short_mid = _mid(short_bid, short_ask)
+        long_mid = _mid(long_bid, long_ask)
+        if short_mid is None or long_mid is None:
+            return None
+        return round((short_mid - long_mid) * 100, 2)
+    short_mid = _mid(short_bid, short_ask)
+    long_mid = _mid(long_bid, long_ask)
+    if short_mid is None or long_mid is None:
         return None
-    return round((float(short_ask) - float(long_bid)) * 100, 2)
+    return round((short_mid - long_mid) * 100, 2)

@@ -53,7 +53,15 @@ export function Shell({ children }: { children: ReactNode }) {
           })}
         </nav>
       </header>
-      <main className="max-w-3xl mx-auto px-4 py-4">{children}</main>
+      {/* max-w-3xl (768px) is the right width for the Telegram Mini App
+          surface this shell also serves, but on a plain desktop browser
+          (the hackathon's "Application URL", viewed at 1280px+) it leaves
+          the whole dashboard stranded in a narrow column with wasted
+          space on both sides. Widening progressively at larger
+          breakpoints keeps mobile/Telegram pixel-identical (that layout
+          only ever sees the base max-w-3xl) while desktop web gets a
+          layout that actually uses the screen. */}
+      <main className="max-w-3xl md:max-w-4xl lg:max-w-6xl mx-auto px-4 py-4">{children}</main>
     </div>
   );
 }

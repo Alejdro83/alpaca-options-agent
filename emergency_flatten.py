@@ -137,6 +137,7 @@ async def _flatten_all() -> None:
                         contracts=contracts,
                         current_mark=mark,
                         max_loss=max_loss,
+                        client=client,
                     )
                 else:
                     await executor_mcp.close_spread(
@@ -146,6 +147,7 @@ async def _flatten_all() -> None:
                         contracts=contracts,
                         current_mark=mark,
                         max_loss=max_loss,
+                        client=client,
                     )
                 db.record_spread_close(spread_id, "closed_emergency", None)
                 print(f"  CLOSED  id={spread_id}  {underlying}")
